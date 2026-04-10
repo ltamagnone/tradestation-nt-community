@@ -1,17 +1,3 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
 """
 Tests for the parsing sub-package (parsing/data.py, parsing/execution.py,
 parsing/instruments.py).
@@ -64,7 +50,7 @@ from tests.test_kit import (
 
 
 _RESOURCES = Path(__file__).parent / "resources"
-_ACCOUNT_ID = AccountId("TRADESTATION-SIM2736556F")
+_ACCOUNT_ID = AccountId("TRADESTATION-SIM0000001F")
 _TS_NOW = 1_000_000_000
 
 
@@ -73,9 +59,6 @@ def _make_bar_type(instrument, step: int, agg: BarAggregation = BarAggregation.M
     return BarType(instrument_id=instrument.id, bar_spec=spec, aggregation_source=AggregationSource.EXTERNAL)
 
 
-# ---------------------------------------------------------------------------
-# parsing/data.py
-# ---------------------------------------------------------------------------
 
 class TestParsingDataModule:
     """Tests for parsing.data — bar spec conversion and bar parsing."""
@@ -130,9 +113,6 @@ class TestParsingDataModule:
         assert len(bars) == 1
 
 
-# ---------------------------------------------------------------------------
-# parsing/execution.py
-# ---------------------------------------------------------------------------
 
 class TestParsingExecutionModule:
     """Tests for parsing.execution — order status, type, TIF, and report parsing."""
@@ -267,8 +247,8 @@ class TestParsingExecutionModule:
             quantity=Quantity.from_int(2), time_in_force=TimeInForce.DAY,
             init_id=UUID4(), ts_init=0,
         )
-        params = convert_order_to_ts_format(order, "SIM2736556F")
-        assert params["account_id"] == "SIM2736556F"
+        params = convert_order_to_ts_format(order, "SIM0000001F")
+        assert params["account_id"] == "SIM0000001F"
         assert params["symbol"] == "GCJ26"
         assert params["order_type"] == "Market"
         assert params["trade_action"] == "Buy"
@@ -287,7 +267,7 @@ class TestParsingExecutionModule:
             quantity=Quantity.from_int(1), price=Price(3400.0, 1),
             time_in_force=TimeInForce.GTC, init_id=UUID4(), ts_init=0,
         )
-        params = convert_order_to_ts_format(order, "SIM2736556F")
+        params = convert_order_to_ts_format(order, "SIM0000001F")
         assert params["order_type"] == "Limit"
         assert params["trade_action"] == "Sell"
         assert params["time_in_force"] == "GTC"
@@ -308,15 +288,12 @@ class TestParsingExecutionModule:
             trigger_type=TriggerType.DEFAULT,
             time_in_force=TimeInForce.DAY, init_id=UUID4(), ts_init=0,
         )
-        params = convert_order_to_ts_format(order, "SIM2736556F")
+        params = convert_order_to_ts_format(order, "SIM0000001F")
         assert params["order_type"] == "StopMarket"
         assert "stop_price" in params
         assert float(params["stop_price"]) == pytest.approx(3200.0, rel=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# parsing/instruments.py
-# ---------------------------------------------------------------------------
 
 class TestParsingInstrumentsModule:
     """Tests for parsing.instruments — instrument parsing from TS symbol data."""
@@ -371,9 +348,6 @@ class TestParsingInstrumentsModule:
         assert determine_price_precision({}) == 2
 
 
-# ---------------------------------------------------------------------------
-# parsing/data.py — quote/trade tick parsing (Phase 3)
-# ---------------------------------------------------------------------------
 
 class TestParsingQuoteTradeTicks:
     """Tests for parse_quote_tick() and parse_trade_tick()."""
@@ -449,9 +423,6 @@ class TestParsingQuoteTradeTicks:
         assert tick.aggressor_side == AggressorSide.NO_AGGRESSOR
 
 
-# ---------------------------------------------------------------------------
-# parsing/execution.py — fill report parsing (Phase 4)
-# ---------------------------------------------------------------------------
 
 class TestParseFillReport:
     """Tests for parse_fill_report()."""
@@ -542,9 +513,6 @@ class TestParseFillReport:
         assert str(report.client_order_id) == "MY-ORDER-42"
 
 
-# ---------------------------------------------------------------------------
-# parsing/instruments.py — option contract parsing (Phase 7)
-# ---------------------------------------------------------------------------
 
 class TestParseOptionInstrument:
     """Tests for parse_instrument() with OPTION asset type."""

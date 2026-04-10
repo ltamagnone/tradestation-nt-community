@@ -1,17 +1,3 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
 """
 Tests for the streaming package (streaming/client.py).
 
@@ -37,9 +23,6 @@ def _make_client(base_url: str = "https://mock.tradestation.com/v3") -> TradeSta
     )
 
 
-# ---------------------------------------------------------------------------
-# Unit tests — pure logic, no network
-# ---------------------------------------------------------------------------
 
 class TestHeartbeatFiltering:
     """Heartbeat keys are defined and cover expected values."""
@@ -133,10 +116,10 @@ class TestStreamUrlConstruction:
             yield
 
         client._stream = fake_stream  # type: ignore
-        async for _ in client.stream_orders("SIM2736556F"):
+        async for _ in client.stream_orders("SIM0000001F"):
             pass
         assert len(urls) == 1
-        assert "stream/accounts/SIM2736556F/orders" in urls[0]
+        assert "stream/accounts/SIM0000001F/orders" in urls[0]
 
     @pytest.mark.asyncio
     async def test_stream_market_depth_url(self):

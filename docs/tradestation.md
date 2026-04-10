@@ -81,7 +81,7 @@ config = TradeStationDataClientConfig(
 from nautilus_tradestation.config import TradeStationExecClientConfig
 
 config = TradeStationExecClientConfig(
-    account_id="SIM2736556F",           # Required — your TradeStation account ID
+    account_id="SIM0000001F",           # Required — your TradeStation account ID
     client_id="YOUR_CLIENT_ID",
     client_secret="YOUR_SECRET",
     refresh_token="YOUR_REFRESH_TOKEN",

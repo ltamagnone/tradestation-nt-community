@@ -1,17 +1,3 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
 """
 Tests for TradeStationHttpClient (async, Phase 6).
 
@@ -65,9 +51,6 @@ def http_client():
     return client
 
 
-# ---------------------------------------------------------------------------
-# Initialisation
-# ---------------------------------------------------------------------------
 
 def test_client_initialization_with_sandbox():
     """Sandbox URL contains 'sim-api'."""
@@ -86,9 +69,6 @@ def test_client_initialization_with_production():
     assert "sim-api" not in client.base_url
 
 
-# ---------------------------------------------------------------------------
-# get_symbol_details
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_symbol_details_returns_parsed_data(http_client):
@@ -112,9 +92,6 @@ async def test_get_symbol_details_handles_empty_response(http_client):
     assert result == {}
 
 
-# ---------------------------------------------------------------------------
-# get_bars
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_bars_returns_bar_data(http_client):
@@ -153,9 +130,6 @@ async def test_get_bars_with_date_range(http_client):
     assert "lastdate" in captured["params"]
 
 
-# ---------------------------------------------------------------------------
-# get_quotes
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_get_quotes_returns_parsed_data(http_client):
@@ -192,9 +166,6 @@ async def test_get_quotes_raises_on_error(http_client):
         await http_client.get_quotes("GCJ26")
 
 
-# ---------------------------------------------------------------------------
-# Error handling
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_http_error_handling_401(http_client):
@@ -220,9 +191,6 @@ async def test_http_error_handling_500(http_client):
         await http_client.get_symbol_details("GCG25")
 
 
-# ---------------------------------------------------------------------------
-# Authentication headers
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_authentication_headers_included(http_client):
@@ -232,9 +200,6 @@ async def test_authentication_headers_included(http_client):
     assert "Bearer" in headers["Authorization"]
 
 
-# ---------------------------------------------------------------------------
-# place_order_group (Phase 8)
-# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_place_order_group_returns_response(http_client):

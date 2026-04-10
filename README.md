@@ -77,6 +77,16 @@ See `examples/` for complete runnable scripts.
 | `TRADESTATION_CLIENT_ID` | TradeStation API client ID |
 | `TRADESTATION_CLIENT_SECRET` | TradeStation API client secret |
 | `TRADESTATION_REFRESH_TOKEN` | OAuth refresh token |
+| `TRADESTATION_ACCOUNT_ID` | Account ID for trading (e.g. `SIM0000001F` for sim futures) |
+
+Create a `.env` file (git-ignored) or export these in your shell:
+
+```bash
+export TRADESTATION_CLIENT_ID="your_client_id"
+export TRADESTATION_CLIENT_SECRET="your_client_secret"
+export TRADESTATION_REFRESH_TOKEN="your_refresh_token"
+export TRADESTATION_ACCOUNT_ID="your_account_id"
+```
 
 ## Configuration Options
 

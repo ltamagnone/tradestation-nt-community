@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
 """
 Minimal TradeStation live-trading example.
 
@@ -50,9 +36,6 @@ from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
 
-# ---------------------------------------------------------------------------
-# Strategy
-# ---------------------------------------------------------------------------
 
 class PrintBarsStrategy(Strategy):
     """Minimal strategy — subscribes to bars and prints them."""
@@ -75,9 +58,6 @@ class PrintBarsStrategy(Strategy):
         self.unsubscribe_bars(self.bar_type)
 
 
-# ---------------------------------------------------------------------------
-# Node configuration
-# ---------------------------------------------------------------------------
 
 def build_config(account_id: str) -> TradingNodeConfig:
     instrument_id = "GCJ26.TRADESTATION"
@@ -104,14 +84,13 @@ def build_config(account_id: str) -> TradingNodeConfig:
     )
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import os
 
-    account_id = os.getenv("TRADESTATION_ACCOUNT_ID", "SIM2736556F")
+    account_id = os.getenv("TRADESTATION_ACCOUNT_ID")
+    if not account_id:
+        raise RuntimeError("Set TRADESTATION_ACCOUNT_ID environment variable")
     instrument_id = InstrumentId.from_str("GCJ26.TRADESTATION")
     bar_type = BarType.from_str("GCJ26.TRADESTATION-15-MINUTE-LAST-EXTERNAL")
 
