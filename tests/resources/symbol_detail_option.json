@@ -1,0 +1,21 @@
+{
+  "Symbol": "AAPL 250321C00175000",
+  "Description": "AAPL Mar 21 2025 175 Call",
+  "AssetType": "OPTION",
+  "Currency": "USD",
+  "Underlying": "AAPL",
+  "ExpirationDate": "2025-03-21T00:00:00Z",
+  "StrikePrice": "175.00",
+  "OptionType": "Call",
+  "PriceFormat": {
+    "Decimals": 2,
+    "Increment": "0.01",
+    "PointValue": 100
+  },
+  "QuantityFormat": {
+    "Decimals": 0,
+    "Increment": "1"
+  },
+  "MinimumQuantity": 1,
+  "MaximumQuantity": 250
+}

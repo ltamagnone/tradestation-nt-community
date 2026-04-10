@@ -1,0 +1,17 @@
+{
+  "Symbol": "AAPL",
+  "Description": "Apple Inc",
+  "AssetType": "STOCK",
+  "Currency": "USD",
+  "PriceFormat": {
+    "Decimals": 2,
+    "Increment": "0.01",
+    "PointValue": 1
+  },
+  "QuantityFormat": {
+    "Decimals": 0,
+    "Increment": "1"
+  },
+  "MinimumQuantity": 1,
+  "MaximumQuantity": 10000
+}

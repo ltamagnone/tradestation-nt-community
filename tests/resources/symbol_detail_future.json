@@ -1,0 +1,19 @@
+{
+  "Symbol": "GCG25",
+  "Description": "Gold Feb 25",
+  "AssetType": "FUTURE",
+  "Currency": "USD",
+  "ContractExpireDate": "2025-02-26T00:00:00Z",
+  "PriceFormat": {
+    "Decimals": 1,
+    "Increment": "0.1",
+    "PointValue": 100
+  },
+  "QuantityFormat": {
+    "Decimals": 0,
+    "Increment": "1"
+  },
+  "MinimumQuantity": 1,
+  "MaximumQuantity": 1000,
+  "Underlying": "GC"
+}

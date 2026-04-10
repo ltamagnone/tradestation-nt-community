@@ -1,0 +1,17 @@
+{
+  "OrderID": "TS-ORDER-002",
+  "Status": "OPN",
+  "StatusDescription": "Open",
+  "AccountID": "SIM2736556F",
+  "Symbol": "",
+  "Legs": [{"Symbol": "GCJ26", "AssetType": "FUTURE", "BuyOrSell": "Sell", "QuantityOrdered": "1", "ExecQuantity": "0", "ExecutionPrice": "0"}],
+  "OrderType": "Limit",
+  "LimitPrice": "3400.0",
+  "TradeAction": "Sell",
+  "TimeInForce": {"Duration": "DAY"},
+  "Quantity": "1",
+  "FilledQuantity": "0",
+  "AveragePrice": "0",
+  "UnfilledQuantity": "1",
+  "OpenedDateTime": "2026-04-08T14:35:00Z"
+}

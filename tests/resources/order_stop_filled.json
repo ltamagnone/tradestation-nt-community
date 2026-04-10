@@ -1,0 +1,18 @@
+{
+  "OrderID": "TS-ORDER-003",
+  "Status": "FLL",
+  "StatusDescription": "Filled",
+  "AccountID": "SIM2736556F",
+  "Symbol": "",
+  "Legs": [{"Symbol": "ESM26", "AssetType": "FUTURE", "BuyOrSell": "Sell", "QuantityOrdered": "1", "ExecQuantity": "1", "ExecutionPrice": "5200.0"}],
+  "OrderType": "StopMarket",
+  "StopPrice": "5200.0",
+  "TradeAction": "Sell",
+  "TimeInForce": {"Duration": "DAY"},
+  "Quantity": "1",
+  "FilledQuantity": "1",
+  "AveragePrice": "5200.0",
+  "UnfilledQuantity": "0",
+  "OpenedDateTime": "2026-04-08T15:00:00Z",
+  "ClosedDateTime": "2026-04-08T15:00:02Z"
+}

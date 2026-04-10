@@ -1,0 +1,4 @@
+[
+  {"AccountID": "SIM2736556F", "Symbol": "GCJ26", "Quantity": "1", "AveragePrice": "3350.0", "MarketValue": "335000.0", "UnrealizedProfitLoss": "500.0", "AssetType": "FUTURE"},
+  {"AccountID": "SIM2736556F", "Symbol": "ESM26", "Quantity": "-1", "AveragePrice": "5250.0", "MarketValue": "-262500.0", "UnrealizedProfitLoss": "-250.0", "AssetType": "FUTURE"}
+]

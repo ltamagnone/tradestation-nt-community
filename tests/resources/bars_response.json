@@ -1,0 +1,28 @@
+{
+  "Bars": [
+    {
+      "TimeStamp": "2025-01-30T14:30:00Z",
+      "Open": 2050.5,
+      "High": 2051.0,
+      "Low": 2050.0,
+      "Close": 2050.8,
+      "TotalVolume": 1500
+    },
+    {
+      "TimeStamp": "2025-01-30T14:31:00Z",
+      "Open": 2050.8,
+      "High": 2051.5,
+      "Low": 2050.5,
+      "Close": 2051.2,
+      "TotalVolume": 1200
+    },
+    {
+      "TimeStamp": "2025-01-30T14:32:00Z",
+      "Open": 2051.2,
+      "High": 2051.8,
+      "Low": 2051.0,
+      "Close": 2051.5,
+      "TotalVolume": 1800
+    }
+  ]
+}

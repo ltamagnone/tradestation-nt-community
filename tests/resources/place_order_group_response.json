@@ -1,0 +1,8 @@
+{
+  "OrderGroupId": "GRP-001",
+  "Type": "OCO",
+  "Orders": [
+    {"OrderID": "TS-ORDER-010", "Status": "OPN"},
+    {"OrderID": "TS-ORDER-011", "Status": "OPN"}
+  ]
+}
