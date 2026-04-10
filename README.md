@@ -22,7 +22,7 @@ pip install nautilus-tradestation
 Or from source:
 
 ```bash
-git clone https://github.com/ltamagno/nautilus-tradestation.git
+git clone https://github.com/ltamagnone/nautilus-tradestation.git
 cd nautilus-tradestation
 pip install -e .
 ```
