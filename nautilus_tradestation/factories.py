@@ -164,6 +164,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             instrument_ids=config.instrument_ids,
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
+            extended_hours=config.extended_hours,
         )
 
 
@@ -234,4 +235,5 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             base_url_ws=config.base_url_ws,
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
+            extended_hours=config.extended_hours,
         )

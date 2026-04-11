@@ -107,6 +107,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         base_url_ws: str | None = None,
         use_streaming: bool = False,
         streaming_reconnect_delay_secs: float = 5.0,
+        extended_hours: bool = False,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -136,6 +137,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         # Streaming configuration
         self._use_streaming = use_streaming
+        self._extended_hours = extended_hours
         self._stream_client: "TradeStationStreamClient | None" = None
         if use_streaming:
             from nautilus_tradestation.streaming.client import (
@@ -1078,8 +1080,49 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to update account state: {e}")
 
     def _convert_order_to_ts_format(self, order: Order) -> dict[str, Any]:
-        """Convert Nautilus order to TradeStation format."""
-        return convert_order_to_ts_format(order, self._account_id)
+        """Convert Nautilus order to TradeStation format.
+
+        For futures: always Buy/Sell (TS rejects SellShort/BuyToCover on futures).
+        For equities: use SellShort when opening a short, BuyToCover when closing a short.
+        """
+        params = convert_order_to_ts_format(order, self._account_id)
+
+        # Check if this is an equity instrument — if so, adjust TradeAction
+        instrument = self._cache.instrument(order.instrument_id)
+        if instrument is not None:
+            from nautilus_trader.model.instruments import Equity
+            if isinstance(instrument, Equity):
+                # For equities, TS requires SellShort/BuyToCover for short positions
+                # Calculate net position from open positions in cache
+                open_positions = self._cache.positions_open(
+                    instrument_id=order.instrument_id,
+                )
+                net_pos = sum(
+                    p.signed_qty for p in open_positions
+                ) if open_positions else 0
+
+                if order.side == OrderSide.SELL:
+                    if net_pos <= 0:
+                        # No long position to close — this is opening a short
+                        params["trade_action"] = "SellShort"
+                    else:
+                        # Closing an existing long
+                        params["trade_action"] = "Sell"
+                elif order.side == OrderSide.BUY:
+                    if net_pos < 0:
+                        # Closing an existing short
+                        params["trade_action"] = "BuyToCover"
+                    else:
+                        # Opening a new long
+                        params["trade_action"] = "Buy"
+
+                # When extended_hours is enabled, use DYP (Day Plus) so equity
+                # limit orders can fill during pre-market and after-hours sessions.
+                # TS rejects Market orders with DYP — use Limit orders instead.
+                if self._extended_hours:
+                    params["time_in_force"] = "DYP"
+
+        return params
 
     def _convert_order_type(self, order: Order) -> str:
         """Convert Nautilus order type to TradeStation format."""

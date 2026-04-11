@@ -50,8 +50,9 @@ class TradeStationDataClientConfig(LiveDataClientConfig, frozen=True):
     retry_delay_initial_ms: int = 1000
     retry_delay_max_ms: int = 60000
     instrument_ids: tuple[str, ...] = ()  # Pre-load these instruments during _connect()
-    use_streaming: bool = False  # If True, use SSE streaming for quotes/ticks instead of polling
+    use_streaming: bool = True  # Use SSE streaming for bars (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay (doubles on failure)
+    extended_hours: bool = False  # If True, use USEQPreAndPost session template for equity bar streams
 
 
 class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
@@ -100,5 +101,6 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     max_retries: int | None = None
     retry_delay_initial_ms: int = 1000
     retry_delay_max_ms: int = 60000
-    use_streaming: bool = False  # If True, use SSE order stream instead of polling fills
+    use_streaming: bool = True  # Use SSE order stream for fill notifications (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay
+    extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)

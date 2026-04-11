@@ -72,6 +72,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         instrument_ids: tuple[str, ...] = (),
         use_streaming: bool = False,
         streaming_reconnect_delay_secs: float = 5.0,
+        extended_hours: bool = False,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -90,6 +91,7 @@ class TradeStationDataClient(LiveMarketDataClient):
 
         # Streaming configuration
         self._use_streaming = use_streaming
+        self._extended_hours = extended_hours
         self._stream_client: "TradeStationStreamClient | None" = None
         if use_streaming:
             from nautilus_tradestation.streaming.client import (
@@ -293,10 +295,20 @@ class TradeStationDataClient(LiveMarketDataClient):
         initialized = False  # True after first RealTime event processed
 
         try:
+            # When extended_hours is enabled and the instrument is an equity,
+            # use USEQPreAndPost to receive pre-market and after-hours bars.
+            from nautilus_trader.model.instruments import Equity
+            session_tpl = (
+                "USEQPreAndPost"
+                if self._extended_hours and isinstance(instrument, Equity)
+                else None
+            )
+
             async for event in self._stream_client.stream_bars(
                 symbol=symbol,
                 interval=interval,
                 unit=unit.value,
+                session_template=session_tpl,
             ):
                 event_ts = event.get("TimeStamp", "")
                 if not event_ts:

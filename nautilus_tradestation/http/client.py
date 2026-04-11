@@ -68,7 +68,12 @@ class TradeStationHttpClient:
 
         # Persistent async HTTP client — reuses TCP connections across requests.
         # Closed in close(); callers should not share instances across event loops.
-        self._httpx = httpx.AsyncClient(timeout=30.0)
+        # pool_keepalive=1200 keeps connections warm for 20 min (matches token
+        # refresh cycle), so orders never pay a TCP+TLS cold-start penalty.
+        self._httpx = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(keepalive_expiry=1200),
+        )
 
     async def _ensure_authenticated(self) -> None:
         if not self.access_token or not self.token_expiry:
