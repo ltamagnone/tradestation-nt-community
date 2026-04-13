@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from nautilus_tradestation.constants import TRADESTATION_VENUE
+from tradestation_nt_community.constants import TRADESTATION_VENUE
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
 

@@ -8,16 +8,16 @@ from typing import Any
 
 import pandas as pd
 
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.parsing.execution import convert_order_to_ts_format
-from nautilus_tradestation.parsing.execution import convert_order_type
-from nautilus_tradestation.parsing.execution import convert_time_in_force
-from nautilus_tradestation.parsing.execution import convert_order_list_to_ts_group
-from nautilus_tradestation.parsing.execution import parse_fill_report
-from nautilus_tradestation.parsing.execution import parse_order_status
-from nautilus_tradestation.parsing.execution import parse_order_status_report
-from nautilus_tradestation.parsing.execution import parse_ts_order_type
-from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
+from tradestation_nt_community.parsing.execution import convert_order_type
+from tradestation_nt_community.parsing.execution import convert_time_in_force
+from tradestation_nt_community.parsing.execution import convert_order_list_to_ts_group
+from tradestation_nt_community.parsing.execution import parse_fill_report
+from tradestation_nt_community.parsing.execution import parse_order_status
+from tradestation_nt_community.parsing.execution import parse_order_status_report
+from tradestation_nt_community.parsing.execution import parse_ts_order_type
+from tradestation_nt_community.providers import TradeStationInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -138,7 +138,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._use_streaming = use_streaming
         self._stream_client: "TradeStationStreamClient | None" = None
         if use_streaming:
-            from nautilus_tradestation.streaming.client import (
+            from tradestation_nt_community.streaming.client import (
                 TradeStationStreamClient,
             )
             self._stream_client = TradeStationStreamClient(

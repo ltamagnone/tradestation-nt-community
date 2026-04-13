@@ -2,9 +2,9 @@
 TradeStation instrument provider implementation.
 """
 
-from nautilus_tradestation.constants import TRADESTATION_VENUE
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.parsing.instruments import parse_instrument
+from tradestation_nt_community.constants import TRADESTATION_VENUE
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.parsing.instruments import parse_instrument
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Equity

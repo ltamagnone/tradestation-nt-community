@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from nautilus_tradestation.streaming.client import (
+from tradestation_nt_community.streaming.client import (
     TradeStationStreamClient,
     _HEARTBEAT_KEYS,
 )
@@ -245,21 +245,21 @@ class TestStreamClientConfig:
 
     def test_use_streaming_false_by_default(self):
         """The config default keeps streaming off."""
-        from nautilus_tradestation.config import TradeStationDataClientConfig
+        from tradestation_nt_community.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
         assert cfg.use_streaming is False
 
     def test_use_streaming_can_be_enabled(self):
-        from nautilus_tradestation.config import TradeStationDataClientConfig
+        from tradestation_nt_community.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig(use_streaming=True)
         assert cfg.use_streaming is True
 
     def test_streaming_reconnect_delay_default(self):
-        from nautilus_tradestation.config import TradeStationDataClientConfig
+        from tradestation_nt_community.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
         assert cfg.streaming_reconnect_delay_secs == pytest.approx(5.0)
 
     def test_exec_config_use_streaming(self):
-        from nautilus_tradestation.config import TradeStationExecClientConfig
+        from tradestation_nt_community.config import TradeStationExecClientConfig
         cfg = TradeStationExecClientConfig(account_id="SIM001", use_streaming=True)
         assert cfg.use_streaming is True

@@ -10,13 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from nautilus_tradestation.parsing.data import (
+from tradestation_nt_community.parsing.data import (
     bar_spec_to_ts_params,
     parse_bars,
     parse_quote_tick,
     parse_trade_tick,
 )
-from nautilus_tradestation.parsing.execution import (
+from tradestation_nt_community.parsing.execution import (
     convert_order_to_ts_format,
     convert_order_type,
     convert_time_in_force,
@@ -25,12 +25,12 @@ from nautilus_tradestation.parsing.execution import (
     parse_order_status_report,
     parse_ts_order_type,
 )
-from nautilus_tradestation.parsing.instruments import (
+from tradestation_nt_community.parsing.instruments import (
     determine_price_precision,
     parse_instrument,
 )
-from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.constants import TRADESTATION_VENUE
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.constants import TRADESTATION_VENUE
 from nautilus_trader.model.data import BarSpecification, BarType
 from nautilus_trader.model.enums import (
     AggregationSource,
@@ -541,7 +541,7 @@ class TestParseOptionInstrument:
 
     def test_parse_option_kind_put(self):
         from nautilus_trader.model.enums import OptionKind
-        from nautilus_tradestation.parsing.instruments import _parse_option_kind
+        from tradestation_nt_community.parsing.instruments import _parse_option_kind
         assert _parse_option_kind("Put") == OptionKind.PUT
         assert _parse_option_kind("P") == OptionKind.PUT
         assert _parse_option_kind("Call") == OptionKind.CALL

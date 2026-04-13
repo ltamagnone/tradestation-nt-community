@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nautilus-tradestation"
+name = "tradestation-nt-community"
 version = "0.1.0"
 description = "TradeStation adapter for NautilusTrader — community-contributed integration"
 readme = "README.md"
@@ -37,12 +37,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ltamagnone/nautilus-tradestation"
-Repository = "https://github.com/ltamagnone/nautilus-tradestation"
-Issues = "https://github.com/ltamagnone/nautilus-tradestation/issues"
+Homepage = "https://github.com/ltamagnone/tradestation-nt-community"
+Repository = "https://github.com/ltamagnone/tradestation-nt-community"
+Issues = "https://github.com/ltamagnone/tradestation-nt-community/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nautilus_tradestation"]
+packages = ["tradestation_nt_community"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

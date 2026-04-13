@@ -5,7 +5,7 @@ import logging
 
 import pandas as pd
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
+from tradestation_nt_community.common.enums import TradeStationBarUnit
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.data import Bar, BarSpecification, BarType, QuoteTick, TradeTick

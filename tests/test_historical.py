@@ -6,7 +6,7 @@ All tests use MockTradeStationHttpClient — no network calls.
 import pytest
 import pandas as pd
 
-from nautilus_tradestation.historical.client import (
+from tradestation_nt_community.historical.client import (
     TradeStationHistoricalClient,
     estimate_barsback,
     _MIN_BARS,

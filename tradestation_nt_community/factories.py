@@ -5,12 +5,12 @@ TradeStation client factory implementations.
 import asyncio
 from functools import lru_cache
 
-from nautilus_tradestation.config import TradeStationDataClientConfig
-from nautilus_tradestation.config import TradeStationExecClientConfig
-from nautilus_tradestation.data import TradeStationDataClient
-from nautilus_tradestation.execution import TradeStationExecutionClient
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.config import TradeStationDataClientConfig
+from tradestation_nt_community.config import TradeStationExecClientConfig
+from tradestation_nt_community.data import TradeStationDataClient
+from tradestation_nt_community.execution import TradeStationExecutionClient
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.providers import TradeStationInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus

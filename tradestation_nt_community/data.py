@@ -7,16 +7,16 @@ from datetime import datetime
 
 import pandas as pd
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.constants import TRADESTATION_CLIENT_ID
-from nautilus_tradestation.constants import TRADESTATION_VENUE
-from nautilus_tradestation.historical.client import TradeStationHistoricalClient
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.parsing.data import bar_spec_to_ts_params  # noqa: F401
-from nautilus_tradestation.parsing.data import parse_bars  # noqa: F401
-from nautilus_tradestation.parsing.data import parse_quote_tick
-from nautilus_tradestation.parsing.data import parse_trade_tick
-from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.constants import TRADESTATION_CLIENT_ID
+from tradestation_nt_community.constants import TRADESTATION_VENUE
+from tradestation_nt_community.historical.client import TradeStationHistoricalClient
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.parsing.data import bar_spec_to_ts_params  # noqa: F401
+from tradestation_nt_community.parsing.data import parse_bars  # noqa: F401
+from tradestation_nt_community.parsing.data import parse_quote_tick
+from tradestation_nt_community.parsing.data import parse_trade_tick
+from tradestation_nt_community.providers import TradeStationInstrumentProvider
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -92,7 +92,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         self._use_streaming = use_streaming
         self._stream_client: "TradeStationStreamClient | None" = None
         if use_streaming:
-            from nautilus_tradestation.streaming.client import (
+            from tradestation_nt_community.streaming.client import (
                 TradeStationStreamClient,
             )
             self._stream_client = TradeStationStreamClient(

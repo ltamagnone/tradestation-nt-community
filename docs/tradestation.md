@@ -59,7 +59,7 @@ Set `use_sandbox=True` for paper trading (recommended for strategy development).
 ### Data Client
 
 ```python
-from nautilus_tradestation.config import TradeStationDataClientConfig
+from tradestation_nt_community.config import TradeStationDataClientConfig
 
 config = TradeStationDataClientConfig(
     client_id="YOUR_CLIENT_ID",        # or env var TRADESTATION_CLIENT_ID
@@ -78,7 +78,7 @@ config = TradeStationDataClientConfig(
 ### Execution Client
 
 ```python
-from nautilus_tradestation.config import TradeStationExecClientConfig
+from tradestation_nt_community.config import TradeStationExecClientConfig
 
 config = TradeStationExecClientConfig(
     account_id="SIM0000001F",           # Required — your TradeStation account ID

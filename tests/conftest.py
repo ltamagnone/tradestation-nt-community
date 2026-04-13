@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nautilus_tradestation.constants import TRADESTATION_VENUE
-from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.constants import TRADESTATION_VENUE
+from tradestation_nt_community.providers import TradeStationInstrumentProvider
 from nautilus_trader.model.identifiers import Venue
 from tests.mock_http_client import MockTradeStationHttpClient
 from tests.test_kit import TSTestInstrumentStubs

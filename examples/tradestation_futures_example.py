@@ -23,11 +23,11 @@ Run:
 import os
 from decimal import Decimal
 
-from nautilus_tradestation.config import (
+from tradestation_nt_community.config import (
     TradeStationDataClientConfig,
     TradeStationExecClientConfig,
 )
-from nautilus_tradestation.factories import (
+from tradestation_nt_community.factories import (
     TradeStationLiveDataClientFactory,
     TradeStationLiveExecClientFactory,
 )

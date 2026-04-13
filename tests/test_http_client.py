@@ -11,8 +11,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.http.client import TradeStationHttpClient
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.http.client import TradeStationHttpClient
 
 
 RESOURCES_DIR = Path(__file__).parent / "resources"

@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.http.client import TradeStationHttpClient
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.http.client import TradeStationHttpClient
 
 
 _RESOURCES = Path(__file__).parent / "resources"

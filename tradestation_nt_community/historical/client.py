@@ -9,8 +9,8 @@ import logging
 
 import pandas as pd
 
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.parsing.data import (
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.parsing.data import (
     bar_spec_to_ts_params,
     parse_bars,
 )

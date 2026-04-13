@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
+from tradestation_nt_community.common.enums import TradeStationBarUnit
 
 
 class TradeStationHttpClient:

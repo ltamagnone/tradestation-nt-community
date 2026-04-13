@@ -1,8 +1,12 @@
-# nautilus-tradestation
+# tradestation-nt-community
 
 Community-contributed [TradeStation](https://www.tradestation.com/) adapter for [NautilusTrader](https://github.com/nautechsystems/nautilus_trader).
 
 Production-tested with 20+ concurrent futures strategies in paper trading.
+
+> **Disclaimer:** This is an independent community project. It is not affiliated
+> with, endorsed by, or supported by Nautech Systems Pty Ltd or the official
+> NautilusTrader project.
 
 ## Features
 
@@ -16,14 +20,14 @@ Production-tested with 20+ concurrent futures strategies in paper trading.
 ## Installation
 
 ```bash
-pip install nautilus-tradestation
+pip install tradestation-nt-community
 ```
 
 Or from source:
 
 ```bash
-git clone https://github.com/ltamagnone/nautilus-tradestation.git
-cd nautilus-tradestation
+git clone https://github.com/ltamagnone/tradestation-nt-community.git
+cd tradestation-nt-community
 pip install -e .
 ```
 
@@ -32,10 +36,10 @@ Requires `nautilus_trader >= 1.200` and Python 3.11+.
 ## Quick Start
 
 ```python
-from nautilus_tradestation.config import TradeStationDataClientConfig
-from nautilus_tradestation.config import TradeStationExecClientConfig
-from nautilus_tradestation.factories import TradeStationLiveDataClientFactory
-from nautilus_tradestation.factories import TradeStationLiveExecClientFactory
+from tradestation_nt_community.config import TradeStationDataClientConfig
+from tradestation_nt_community.config import TradeStationExecClientConfig
+from tradestation_nt_community.factories import TradeStationLiveDataClientFactory
+from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
 
 data_config = TradeStationDataClientConfig(
     client_id="YOUR_CLIENT_ID",       # or set TRADESTATION_CLIENT_ID env var
@@ -126,7 +130,7 @@ export TRADESTATION_ACCOUNT_ID="your_account_id"
 ## Architecture
 
 ```
-nautilus_tradestation/
+tradestation_nt_community/
   config.py          -- Data + Execution client configs
   constants.py       -- TRADESTATION venue and client ID constants
   data.py            -- LiveMarketDataClient (bar polling/streaming, quote/trade ticks)

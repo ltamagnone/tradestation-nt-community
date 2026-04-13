@@ -6,8 +6,8 @@ module-level functions in data.py, requiring no live client or network calls.
 """
 import pytest
 
-from nautilus_tradestation.common.enums import TradeStationBarUnit
-from nautilus_tradestation.data import bar_spec_to_ts_params, parse_bars
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.data import bar_spec_to_ts_params, parse_bars
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
 from tests.test_kit import (

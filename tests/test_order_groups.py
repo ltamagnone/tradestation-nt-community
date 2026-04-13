@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from nautilus_tradestation.parsing.execution import (
+from tradestation_nt_community.parsing.execution import (
     _group_type_for_order_list,
     convert_order_list_to_ts_group,
 )

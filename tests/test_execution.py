@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import pytest
 
-from nautilus_tradestation.execution import (
+from tradestation_nt_community.execution import (
     convert_time_in_force,
     parse_order_status,
     parse_order_status_report,

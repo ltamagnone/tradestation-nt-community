@@ -16,17 +16,17 @@ Supported:
 - OAuth 2.0 with automatic token refresh
 """
 
-from nautilus_tradestation.config import TradeStationDataClientConfig
-from nautilus_tradestation.historical.client import TradeStationHistoricalClient
-from nautilus_tradestation.config import TradeStationExecClientConfig
-from nautilus_tradestation.constants import TRADESTATION
-from nautilus_tradestation.constants import TRADESTATION_CLIENT_ID
-from nautilus_tradestation.constants import TRADESTATION_VENUE
-from nautilus_tradestation.data import TradeStationDataClient
-from nautilus_tradestation.factories import TradeStationLiveDataClientFactory
-from nautilus_tradestation.factories import TradeStationLiveExecClientFactory
-from nautilus_tradestation.http.client import TradeStationHttpClient
-from nautilus_tradestation.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.config import TradeStationDataClientConfig
+from tradestation_nt_community.historical.client import TradeStationHistoricalClient
+from tradestation_nt_community.config import TradeStationExecClientConfig
+from tradestation_nt_community.constants import TRADESTATION
+from tradestation_nt_community.constants import TRADESTATION_CLIENT_ID
+from tradestation_nt_community.constants import TRADESTATION_VENUE
+from tradestation_nt_community.data import TradeStationDataClient
+from tradestation_nt_community.factories import TradeStationLiveDataClientFactory
+from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
+from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.providers import TradeStationInstrumentProvider
 
 
 __all__ = [
