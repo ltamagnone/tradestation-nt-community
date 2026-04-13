@@ -243,16 +243,16 @@ class TestStreamEventParsing:
 class TestStreamClientConfig:
     """Config fields propagate to the streaming layer correctly."""
 
-    def test_use_streaming_false_by_default(self):
-        """The config default keeps streaming off."""
+    def test_use_streaming_true_by_default(self):
+        """The config default enables streaming (lower latency than polling)."""
         from tradestation_nt_community.config import TradeStationDataClientConfig
         cfg = TradeStationDataClientConfig()
-        assert cfg.use_streaming is False
-
-    def test_use_streaming_can_be_enabled(self):
-        from tradestation_nt_community.config import TradeStationDataClientConfig
-        cfg = TradeStationDataClientConfig(use_streaming=True)
         assert cfg.use_streaming is True
+
+    def test_use_streaming_can_be_disabled(self):
+        from tradestation_nt_community.config import TradeStationDataClientConfig
+        cfg = TradeStationDataClientConfig(use_streaming=False)
+        assert cfg.use_streaming is False
 
     def test_streaming_reconnect_delay_default(self):
         from tradestation_nt_community.config import TradeStationDataClientConfig

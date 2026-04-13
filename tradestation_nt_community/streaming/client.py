@@ -152,6 +152,7 @@ class TradeStationStreamClient:
         symbol: str,
         interval: str,
         unit: str,
+        session_template: str | None = None,
     ) -> AsyncIterator[dict]:
         """
         Stream real-time bar updates for a symbol.
@@ -164,6 +165,9 @@ class TradeStationStreamClient:
             Bar interval string (e.g. ``"1"``, ``"5"``, ``"15"``).
         unit : str
             Bar unit: ``"Minute"`` or ``"Daily"``.
+        session_template : str, optional
+            TS session template. Use ``"USEQPreAndPost"`` for extended hours
+            equity bars. Default ``None`` uses TS default (RTH only for equities).
 
         Yields
         ------
@@ -174,6 +178,8 @@ class TradeStationStreamClient:
         """
         url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
         params = f"?interval={interval}&unit={unit}&barsback=1"
+        if session_template:
+            params += f"&sessiontemplate={session_template}"
         async for event in self._stream(url + params):
             # Pass all events through — including Historical seed bars.
             # The caller (_stream_bars) uses them for reconnection gap recovery.
