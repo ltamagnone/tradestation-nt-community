@@ -607,7 +607,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             return
 
-        order = self.cache.order(client_order_id)
+        order = self._cache.order(client_order_id)
         if order is None:
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
