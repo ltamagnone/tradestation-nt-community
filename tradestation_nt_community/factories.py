@@ -25,6 +25,7 @@ def get_cached_tradestation_http_client(
     refresh_token: str | None = None,
     use_sandbox: bool = False,
     base_url: str | None = None,
+    allow_custom_base_url: bool = False,
 ) -> TradeStationHttpClient:
     """
     Create or return a cached TradeStation HTTP client.
@@ -43,6 +44,8 @@ def get_cached_tradestation_http_client(
         If True, use sandbox API.
     base_url : str, optional
         Override base URL.
+    allow_custom_base_url : bool, default False
+        If True, skip hostname validation on base_url.
 
     Return -------
     TradeStationHttpClient
@@ -55,6 +58,7 @@ def get_cached_tradestation_http_client(
         refresh_token=refresh_token,
         use_sandbox=use_sandbox,
         base_url=base_url,
+        allow_custom_base_url=allow_custom_base_url,
     )
 
 
@@ -65,6 +69,7 @@ def get_cached_tradestation_instrument_provider(
     refresh_token: str | None = None,
     use_sandbox: bool = False,
     base_url: str | None = None,
+    allow_custom_base_url: bool = False,
 ) -> TradeStationInstrumentProvider:
     """
     Create or return a cached TradeStation instrument provider.
@@ -81,6 +86,8 @@ def get_cached_tradestation_instrument_provider(
         If True, use sandbox API.
     base_url : str, optional
         Override base URL.
+    allow_custom_base_url : bool, default False
+        If True, skip hostname validation on base_url.
 
     Return -------
     TradeStationInstrumentProvider
@@ -93,6 +100,7 @@ def get_cached_tradestation_instrument_provider(
         refresh_token=refresh_token,
         use_sandbox=use_sandbox,
         base_url=base_url,
+        allow_custom_base_url=allow_custom_base_url,
     )
 
     return TradeStationInstrumentProvider(client=http_client)
@@ -142,6 +150,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Get or create instrument provider (cached)
@@ -151,6 +160,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Create and return data client
@@ -212,6 +222,7 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Get or create instrument provider (cached)
@@ -221,6 +232,7 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             refresh_token=config.refresh_token,
             use_sandbox=config.use_sandbox,
             base_url=config.base_url_http,
+            allow_custom_base_url=config.allow_custom_base_url,
         )
 
         # Create and return execution client

@@ -69,6 +69,48 @@ def test_client_initialization_with_production():
     assert "sim-api" not in client.base_url
 
 
+def test_base_url_rejects_non_tradestation_host():
+    """Custom base_url to unknown host is rejected by default."""
+    with pytest.raises(ValueError, match="base_url must be HTTPS"):
+        TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="r",
+            base_url="https://evil.example.com/v3",
+        )
+
+
+def test_base_url_rejects_http_scheme():
+    """Plain HTTP is rejected even for a valid TradeStation host."""
+    with pytest.raises(ValueError, match="base_url must be HTTPS"):
+        TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="r",
+            base_url="http://api.tradestation.com/v3",
+        )
+
+
+def test_base_url_accepts_tradestation_hosts():
+    """Known TradeStation HTTPS hosts are accepted."""
+    client = TradeStationHttpClient(
+        client_id="c", client_secret="s", refresh_token="r",
+        base_url="https://api.tradestation.com/v3",
+    )
+    assert client.base_url == "https://api.tradestation.com/v3"
+
+    client2 = TradeStationHttpClient(
+        client_id="c", client_secret="s", refresh_token="r",
+        base_url="https://sim-api.tradestation.com/v3",
+    )
+    assert client2.base_url == "https://sim-api.tradestation.com/v3"
+
+
+def test_base_url_allow_custom_bypasses_validation():
+    """allow_custom_base_url=True skips hostname check."""
+    client = TradeStationHttpClient(
+        client_id="c", client_secret="s", refresh_token="r",
+        base_url="http://localhost:8080/mock",
+        allow_custom_base_url=True,
+    )
+    assert client.base_url == "http://localhost:8080/mock"
+
 
 @pytest.mark.asyncio
 async def test_get_symbol_details_returns_parsed_data(http_client):

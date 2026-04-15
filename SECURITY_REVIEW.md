@@ -30,34 +30,13 @@ Order-execution endpoints (place, replace, cancel, place_group) additionally inc
 
 ---
 
-### 3. Unvalidated `base_url` override enables credential theft
+### 3. Unvalidated `base_url` override enables credential theft -- FIXED
 
-**Files:** `config.py:47,98`, `http/client.py:59-60`, `factories.py:144,214`
+**Status:** Resolved.
 
-```python
-# config.py
-base_url_http: str | None = None  # lines 47, 98
+`http/client.py` now validates that `base_url` uses HTTPS and points to a known TradeStation domain (`api.tradestation.com`, `sim-api.tradestation.com`). Rejects plain HTTP and unknown hosts with a `ValueError`.
 
-# http/client.py
-if base_url:
-    self.base_url = base_url  # line 60 -- no validation
-```
-
-Any string is accepted. The OAuth token, `client_id`, and `client_secret` are then sent to whatever URL is provided -- including `http://` (unencrypted), localhost, or attacker-controlled servers.
-
-**Risk:** If config is loaded from a file that can be tampered with, or if the value is sourced from an environment variable that an attacker controls, all credentials and trading operations are redirected.
-
-**Fix:** Validate the scheme is HTTPS and the hostname matches a known TradeStation domain:
-
-```python
-_ALLOWED_HOSTS = {"api.tradestation.com", "sim-api.tradestation.com", "signin.tradestation.com"}
-
-if base_url:
-    parsed = urllib.parse.urlparse(base_url)
-    if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_HOSTS:
-        raise ValueError(f"base_url must be HTTPS to a TradeStation domain, got: {base_url}")
-    self.base_url = base_url
-```
+An `allow_custom_base_url=True` flag (available in both config classes and the HTTP client) bypasses the check for local proxies or mock servers. Defaults to `False`.
 
 ---
 

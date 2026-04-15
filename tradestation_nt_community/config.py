@@ -45,6 +45,7 @@ class TradeStationDataClientConfig(LiveDataClientConfig, frozen=True):
     use_sandbox: bool = False
     account_id: str | None = None
     base_url_http: str | None = None
+    allow_custom_base_url: bool = False  # Skip hostname validation on base_url_http
     recv_window_ms: int = 5000
     max_retries: int | None = None
     retry_delay_initial_ms: int = 1000
@@ -96,6 +97,7 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     refresh_token: str | None = None
     use_sandbox: bool = False
     base_url_http: str | None = None
+    allow_custom_base_url: bool = False  # Skip hostname validation on base_url_http
     base_url_ws: str | None = None
     recv_window_ms: int = 5000
     max_retries: int | None = None
