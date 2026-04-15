@@ -46,7 +46,7 @@ def http_client():
     )
     # Pre-authenticate so _ensure_authenticated is a no-op
     from datetime import datetime, timedelta
-    client.access_token = "test_access_token"
+    client._access_token = "test_access_token"
     client.token_expiry = datetime.utcnow() + timedelta(hours=1)
     return client
 

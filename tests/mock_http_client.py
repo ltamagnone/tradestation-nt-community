@@ -28,11 +28,11 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
 
     def __init__(self) -> None:
         self.client_id = "mock_client_id"
-        self.client_secret = "mock_secret"
-        self.refresh_token = "mock_refresh"
+        self._client_secret = "mock_secret"
+        self._refresh_token = "mock_refresh"
         self.auth_url = "https://mock.tradestation.com/oauth/token"
         self.base_url = "https://mock.tradestation.com/v3"
-        self.access_token = "mock_access_token"
+        self._access_token = "mock_access_token"
         self.token_expiry = datetime.max
         # No real httpx client — tests never touch the network
         self._httpx = None  # type: ignore[assignment]

@@ -17,38 +17,16 @@ Order-execution endpoints (place, replace, cancel, place_group) additionally inc
 
 ---
 
-### 2. Credentials stored as public attributes with no cleanup
+### 2. Credentials stored as public attributes with no cleanup -- FIXED
 
-**File:** `http/client.py` lines 47-49, 66-67
+**Status:** Resolved.
 
-```python
-self.client_id = client_id or os.getenv("TRADESTATION_CLIENT_ID")
-self.client_secret = client_secret or os.getenv("TRADESTATION_CLIENT_SECRET")
-self.refresh_token = refresh_token or os.getenv("TRADESTATION_REFRESH_TOKEN")
-...
-self.access_token: str | None = None
-```
+- `client_secret` and `refresh_token` are now private (`self._client_secret`, `self._refresh_token`).
+- `access_token` is now a read-only property backed by `self._access_token`.
+- `client_id` remains public (app identifier, not a secret).
+- `close()` clears all credentials (`_access_token`, `_client_secret`, `_refresh_token`, `token_expiry`) before closing the HTTP client.
 
-All five credential fields are public instance attributes. They persist for the entire process lifetime. The `close()` method (line 506-508) only closes the httpx client -- it does not clear credentials.
-
-Additionally, `factories.py:21-58` caches these credentials in `@lru_cache(1)` function arguments, creating a second copy that is never clearable.
-
-**Risk:** Any code with a reference to the client object (or any heap dump / core file) exposes all credentials in plaintext. The `lru_cache` makes them immune to garbage collection.
-
-**Fix:**
-
-- Use underscore-prefixed private attributes (`self._client_secret`).
-- Clear credentials in `close()`:
-
-```python
-async def close(self) -> None:
-    self.access_token = None
-    self._client_secret = None
-    self._refresh_token = None
-    await self._httpx.aclose()
-```
-
-- Consider passing a credential-provider callable instead of raw strings to the factory cache.
+**Remaining note:** `factories.py` `@lru_cache(1)` still holds credential strings in the cache key. This is a minor residual risk -- the cache prevents duplicate clients but keeps one copy of credentials immune to GC.
 
 ---
 
