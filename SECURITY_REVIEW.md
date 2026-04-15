@@ -134,17 +134,9 @@ For order streams, the URL contains the account ID: `.../accounts/{account_id}/o
 
 ## LOW Severity
 
-### 8. Deprecated `datetime.utcnow()`
+### 8. Deprecated `datetime.utcnow()` -- FIXED
 
-**File:** `http/client.py` lines 82, 98
-
-```python
-if datetime.utcnow() >= self.token_expiry - timedelta(minutes=5):
-```
-
-`datetime.utcnow()` returns a naive datetime and is deprecated since Python 3.12. Not a security bug on its own, but could cause token expiry miscalculation if the system timezone is changed while running.
-
-**Fix:** Use `datetime.now(datetime.UTC)`.
+**Status:** Resolved. Replaced with `datetime.now(tz=timezone.utc)` in `http/client.py` and tests.
 
 ---
 

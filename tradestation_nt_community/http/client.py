@@ -9,6 +9,7 @@ import logging
 import os
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -107,7 +108,7 @@ class TradeStationHttpClient:
         if not self._access_token or not self.token_expiry:
             await self._refresh_access_token()
             return
-        if datetime.utcnow() >= self.token_expiry - timedelta(minutes=5):
+        if datetime.now(tz=timezone.utc) >= self.token_expiry - timedelta(minutes=5):
             await self._refresh_access_token()
 
     async def _refresh_access_token(self) -> None:
@@ -124,7 +125,7 @@ class TradeStationHttpClient:
         token_data = response.json()
         self._access_token = token_data["access_token"]
         expires_in = token_data.get("expires_in", 1200)
-        self.token_expiry = datetime.utcnow() + timedelta(seconds=expires_in)
+        self.token_expiry = datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
 
     async def _get_headers(self) -> dict[str, str]:
         await self._ensure_authenticated()
