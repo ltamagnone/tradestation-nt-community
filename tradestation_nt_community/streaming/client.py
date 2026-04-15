@@ -83,13 +83,17 @@ class TradeStationStreamClient:
             "Accept": "application/vnd.tradestation.streams.v2+json",
         }
 
-    async def _stream(self, url: str) -> AsyncIterator[dict]:
+    async def _stream(
+        self, url: str, params: dict[str, str] | None = None,
+    ) -> AsyncIterator[dict]:
         """Core SSE reader — yields parsed JSON dicts, reconnects on error."""
         delay = self._reconnect_delay
         while True:
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream("GET", url, headers=self._headers()) as resp:
+                    async with client.stream(
+                        "GET", url, headers=self._headers(), params=params,
+                    ) as resp:
                         if resp.status_code != 200:
                             body = await resp.aread()
                             _log.error(
@@ -177,10 +181,10 @@ class TradeStationStreamClient:
 
         """
         url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
-        params = f"?interval={interval}&unit={unit}&barsback=1"
+        params: dict[str, str] = {"interval": interval, "unit": unit, "barsback": "1"}
         if session_template:
-            params += f"&sessiontemplate={session_template}"
-        async for event in self._stream(url + params):
+            params["sessiontemplate"] = session_template
+        async for event in self._stream(url, params=params):
             # Pass all events through — including Historical seed bars.
             # The caller (_stream_bars) uses them for reconnection gap recovery.
             yield event

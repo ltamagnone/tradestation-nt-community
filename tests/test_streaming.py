@@ -202,7 +202,7 @@ class TestStreamEventParsing:
             {"Status": "RealTime", "Open": 3350.0, "Close": 3355.0},
         ]
 
-        async def fake_stream(url: str):
+        async def fake_stream(url: str, params: dict | None = None):
             for evt in raw:
                 yield evt
 

@@ -42,26 +42,24 @@ An `allow_custom_base_url=True` flag (available in both config classes and the H
 
 ## MEDIUM Severity
 
-### 4. Query string injection in `stream_bars()`
+### 4. Query string injection in `stream_bars()` -- FIXED
 
-**File:** `streaming/client.py` lines 179-183
+**Status:** Resolved.
+
+`stream_bars()` now passes query parameters as a dict via httpx's `params` kwarg instead of manual f-string concatenation. The `_stream()` core method accepts an optional `params` dict and forwards it to `client.stream()`, which handles URL encoding.
+
+**Previously:**
 
 ```python
-url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
 params = f"?interval={interval}&unit={unit}&barsback=1"
 if session_template:
     params += f"&sessiontemplate={session_template}"
 async for event in self._stream(url + params):
 ```
 
-Parameters are manually concatenated into the query string without URL encoding. Compare with `http/client.py:141-150` which correctly uses httpx's `params` dict.
-
-**Risk:** A `session_template` value like `"USEQPreAndPost&malicious=true"` injects extra query parameters. A `symbol` value with `/` or `?` characters could alter the URL path or query structure.
-
-**Fix:** Use httpx's parameter handling consistently:
+**Now:**
 
 ```python
-url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
 params = {"interval": interval, "unit": unit, "barsback": "1"}
 if session_template:
     params["sessiontemplate"] = session_template
