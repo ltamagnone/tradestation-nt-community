@@ -86,8 +86,14 @@ class TradeStationStreamClient:
     async def _stream(
         self, url: str, params: dict[str, str] | None = None,
     ) -> AsyncIterator[dict]:
-        """Core SSE reader — yields parsed JSON dicts, reconnects on error."""
+        """Core SSE reader — yields parsed JSON dicts, reconnects on error.
+
+        After the *first* successful connection, emits ``{"_reconnected": True}``
+        at the start of every subsequent connection so callers can run a catch-up
+        HTTP poll to recover events that were lost during the gap.
+        """
         delay = self._reconnect_delay
+        first_connect = True
         while True:
             try:
                 async with httpx.AsyncClient(timeout=None) as client:
@@ -106,6 +112,12 @@ class TradeStationStreamClient:
 
                         _log.info(f"SSE stream connected: {url}")
                         delay = self._reconnect_delay  # reset on successful connect
+
+                        if not first_connect:
+                            # Signal the caller that a reconnect occurred so it can
+                            # perform a one-shot HTTP poll to recover missed events.
+                            yield {"_reconnected": True}
+                        first_connect = False
 
                         async for line in resp.aiter_lines():
                             line = line.strip()

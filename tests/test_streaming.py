@@ -263,3 +263,53 @@ class TestStreamClientConfig:
         from tradestation_nt_community.config import TradeStationExecClientConfig
         cfg = TradeStationExecClientConfig(account_id="SIM001", use_streaming=True)
         assert cfg.use_streaming is True
+
+
+class TestReconnectSentinel:
+    """
+    _stream emits {"_reconnected": True} on every reconnect after the first connect.
+
+    The sentinel is emitted inside the real _stream() implementation. Tests that
+    mock _stream directly bypass the sentinel logic — those tests verify the
+    *consumer* behaviour (execution client triggering a catch-up poll) rather
+    than the sentinel emission itself.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sentinel_passes_through_to_consumer(self):
+        """
+        When _stream yields a sentinel, stream_orders passes it through unchanged
+        so the execution client can detect the reconnect and run a catch-up poll.
+        """
+        client = _make_client()
+
+        async def stream_with_sentinel(url, params=None):
+            yield {"OrderID": "AAA", "Status": "OPN"}  # first connect event
+            yield {"_reconnected": True}                # sentinel after reconnect
+            yield {"OrderID": "AAA", "Status": "FLL"}  # post-reconnect event
+
+        client._stream = stream_with_sentinel  # type: ignore
+        collected = []
+        async for event in client.stream_orders("SIM001"):
+            collected.append(event)
+
+        assert {"_reconnected": True} in collected
+        # Sentinel is between the two real events
+        idx = collected.index({"_reconnected": True})
+        assert idx == 1
+
+    @pytest.mark.asyncio
+    async def test_no_sentinel_on_clean_stream(self):
+        """Normal stream (no reconnect) produces no sentinel."""
+        client = _make_client()
+
+        async def clean_stream(url, params=None):
+            yield {"OrderID": "BBB", "Status": "OPN"}
+            yield {"OrderID": "BBB", "Status": "FLL"}
+
+        client._stream = clean_stream  # type: ignore
+        collected = []
+        async for event in client.stream_orders("SIM001"):
+            collected.append(event)
+
+        assert not any(e.get("_reconnected") for e in collected)

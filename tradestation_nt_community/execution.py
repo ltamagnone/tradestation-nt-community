@@ -925,6 +925,18 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._log.info("Order fill SSE stream started")
         try:
             async for event in self._stream_client.stream_orders(self._account_id):
+                # Reconnect sentinel — run a catch-up HTTP poll to recover any fills
+                # that were missed during the SSE gap (SSE does not replay events).
+                if event.get("_reconnected"):
+                    self._log.warning(
+                        "Order fill SSE stream reconnected — running catch-up HTTP poll "
+                        "to recover fills missed during the gap"
+                    )
+                    try:
+                        await self._check_order_statuses()
+                    except Exception as e:
+                        self._log.error(f"Catch-up poll after SSE reconnect failed: {e}")
+                    continue
                 try:
                     await self._process_order_event(event)
                 except Exception as e:

@@ -266,3 +266,80 @@ class TestReportCommandObjects:
             ts_init=1_000_000_000,
         )
         assert cmd.instrument_id is None
+
+
+# ---------------------------------------------------------------------------
+# SSE reconnect catch-up poll
+# ---------------------------------------------------------------------------
+
+class TestStreamFillEventsReconnectCatchup:
+    """
+    When the order fill SSE stream reconnects, _stream_order_fills must call
+    _check_order_statuses() to recover fills missed during the gap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reconnect_sentinel_triggers_catch_up_poll(self):
+        """
+        _stream_order_fills calls _check_order_statuses() when it receives
+        the {"_reconnected": True} sentinel from stream_orders.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        exec_client = MagicMock()
+        poll_calls = []
+
+        async def fake_check_order_statuses():
+            poll_calls.append(1)
+
+        async def fake_stream_orders(account_id):
+            yield {"OrderID": "A1", "Status": "OPN"}  # normal event
+            yield {"_reconnected": True}                # sentinel
+            yield {"OrderID": "A1", "Status": "FLL"}   # post-reconnect event
+
+        async def fake_process_event(event):
+            pass
+
+        exec_client._account_id = "SIM001"
+        exec_client._stream_client = MagicMock()
+        exec_client._stream_client.stream_orders = fake_stream_orders
+        exec_client._check_order_statuses = fake_check_order_statuses
+        exec_client._process_order_event = fake_process_event
+        exec_client._log = MagicMock()
+
+        # Run the real _stream_order_fills logic (extracted for test)
+        from tradestation_nt_community.execution import TradeStationExecutionClient
+        await TradeStationExecutionClient._stream_order_fills(exec_client)
+
+        # The catch-up poll must have been triggered exactly once
+        assert len(poll_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_catch_up_without_sentinel(self):
+        """Normal events (no sentinel) do not trigger the catch-up poll."""
+        from unittest.mock import MagicMock
+
+        exec_client = MagicMock()
+        poll_calls = []
+
+        async def fake_check_order_statuses():
+            poll_calls.append(1)
+
+        async def fake_stream_orders(account_id):
+            yield {"OrderID": "B1", "Status": "OPN"}
+            yield {"OrderID": "B1", "Status": "FLL"}
+
+        async def fake_process_event(event):
+            pass
+
+        exec_client._account_id = "SIM001"
+        exec_client._stream_client = MagicMock()
+        exec_client._stream_client.stream_orders = fake_stream_orders
+        exec_client._check_order_statuses = fake_check_order_statuses
+        exec_client._process_order_event = fake_process_event
+        exec_client._log = MagicMock()
+
+        from tradestation_nt_community.execution import TradeStationExecutionClient
+        await TradeStationExecutionClient._stream_order_fills(exec_client)
+
+        assert len(poll_calls) == 0
