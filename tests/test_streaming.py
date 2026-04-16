@@ -7,6 +7,7 @@ network calls.
 import asyncio
 import json
 
+import httpx
 import pytest
 
 from tradestation_nt_community.streaming.client import (
@@ -313,3 +314,132 @@ class TestReconnectSentinel:
             collected.append(event)
 
         assert not any(e.get("_reconnected") for e in collected)
+
+
+class TestHeartbeatTimeout:
+    """httpx.ReadTimeout (zombie connection) triggers immediate reconnect."""
+
+    def _make_mock_client(self, responses):
+        """Build a minimal httpx.AsyncClient mock that serves ``responses`` in order.
+
+        Each item in ``responses`` is either a list of JSON strings to yield or
+        ``httpx.ReadTimeout`` to raise after exhausting the prior yields.
+        """
+        conn_idx = [-1]
+        resp_list = responses
+
+        class _Resp:
+            def __init__(self, idx):
+                self._idx = idx
+                self.status_code = 200
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def aread(self): return b""
+
+            async def aiter_lines(self):
+                spec = resp_list[self._idx]
+                for item in spec:
+                    if isinstance(item, str):
+                        yield item
+                    else:
+                        raise item  # raise the exception (e.g. ReadTimeout)
+
+        class _Client:
+            def __init__(self, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+            def stream(self, *a, **kw):
+                conn_idx[0] += 1
+                return _Resp(conn_idx[0])
+
+        return _Client
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_reconnects_without_backoff(self, monkeypatch):
+        """ReadTimeout yields reconnect sentinel and skips backoff sleep."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        sc = _make_client()
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client([
+                ['{"Symbol": "GCJ26", "Bid": 3350.5}', httpx.ReadTimeout("zombie")],
+                ['{"Symbol": "GCJ26", "Bid": 3351.0}'],
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 3:
+                break
+
+        assert events[0] == {"Symbol": "GCJ26", "Bid": 3350.5}
+        assert events[1] == {"_reconnected": True}
+        assert events[2] == {"Symbol": "GCJ26", "Bid": 3351.0}
+        assert sleep_calls == [], "ReadTimeout must not trigger backoff sleep"
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_on_first_byte_still_reconnects(self, monkeypatch):
+        """ReadTimeout before any event still emits sentinel on reconnect."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        sc = _make_client()
+
+        async def mock_sleep(secs): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client([
+                [httpx.ReadTimeout("zombie before first event")],
+                ['{"OrderID": "X", "Status": "OPN"}'],
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 2:
+                break
+
+        assert events[0] == {"_reconnected": True}
+        assert events[1] == {"OrderID": "X", "Status": "OPN"}
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_does_use_backoff(self, monkeypatch):
+        """Non-timeout exceptions still trigger the exponential backoff sleep."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        sc = _make_client()  # reconnect_delay_secs=0.01
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client([
+                [ConnectionError("network failure")],
+                ['{"Symbol": "GCJ26", "Bid": 3350.5}'],
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            break
+
+        assert len(sleep_calls) == 1, "Generic error must sleep before reconnecting"
+        assert sleep_calls[0] == pytest.approx(0.01)

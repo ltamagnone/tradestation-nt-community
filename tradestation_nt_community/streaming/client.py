@@ -91,12 +91,19 @@ class TradeStationStreamClient:
         After the *first* successful connection, emits ``{"_reconnected": True}``
         at the start of every subsequent connection so callers can run a catch-up
         HTTP poll to recover events that were lost during the gap.
+
+        A 90-second read timeout is applied at the httpx transport level. If no
+        bytes arrive (including heartbeats) within that window, the connection is
+        assumed to be a zombie and is closed immediately — no backoff sleep.
+        The reconnect sentinel is then emitted so the catch-up poll fires normally.
         """
         delay = self._reconnect_delay
         first_connect = True
         while True:
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=30.0, read=90.0, write=None, pool=30.0),
+                ) as client:
                     async with client.stream(
                         "GET", url, headers=self._headers(), params=params,
                     ) as resp:
@@ -138,6 +145,11 @@ class TradeStationStreamClient:
             except asyncio.CancelledError:
                 _log.info(f"SSE stream cancelled: {url}")
                 return
+            except httpx.ReadTimeout:
+                _log.warning(
+                    f"SSE stream no data for 90s — zombie connection detected, "
+                    f"forcing reconnect: {url}"
+                )
             except Exception as e:
                 _log.error(f"SSE stream error ({url}): {e} — reconnecting in {delay:.0f}s")
                 await asyncio.sleep(delay)
