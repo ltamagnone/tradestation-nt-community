@@ -28,6 +28,7 @@ def _mock_resp(status: int = 200, data: dict | list | None = None) -> MagicMock:
     resp.status_code = status
     resp.text = str(data or "")
     resp.json.return_value = data if data is not None else {}
+    resp.headers = {}  # _request() reads X-RateLimit-Remaining / Retry-After
     return resp
 
 
@@ -293,3 +294,162 @@ async def test_place_order_group_raises_on_error(http_client):
     http_client._httpx.post = AsyncMock(return_value=_mock_resp(400, None))
     with pytest.raises(Exception, match="Place order group failed"):
         await http_client.place_order_group("OCO", [])
+
+
+# =============================================================================
+# Refresh-token rotation
+# =============================================================================
+
+class TestRefreshTokenRotation:
+    """_refresh_access_token updates self._refresh_token when provider rotates it."""
+
+    @pytest.mark.asyncio
+    async def test_rotated_token_is_stored(self):
+        """If the auth response contains refresh_token, it is saved in memory."""
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="old_refresh",
+            use_sandbox=True,
+        )
+        client._httpx.post = AsyncMock(return_value=_mock_resp(200, {
+            "access_token": "new_access",
+            "expires_in": 1200,
+            "refresh_token": "new_refresh",
+        }))
+        await client._refresh_access_token()
+        assert client._refresh_token == "new_refresh"
+        assert client._access_token == "new_access"
+
+    @pytest.mark.asyncio
+    async def test_no_rotation_leaves_token_unchanged(self):
+        """If the auth response omits refresh_token, the stored token is unchanged."""
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="original",
+            use_sandbox=True,
+        )
+        client._httpx.post = AsyncMock(return_value=_mock_resp(200, {
+            "access_token": "new_access",
+            "expires_in": 1200,
+        }))
+        await client._refresh_access_token()
+        assert client._refresh_token == "original"
+
+
+# =============================================================================
+# Rate-limit handling via _request()
+# =============================================================================
+
+class TestRateLimitHandling:
+    """_request() handles HTTP 429 with Retry-After sleep and retries."""
+
+    @pytest.mark.asyncio
+    async def test_429_retries_after_retry_after_header(self, http_client, monkeypatch):
+        """429 with Retry-After causes one sleep then a successful retry."""
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        rate_limited = _mock_resp(429, None)
+        rate_limited.headers = {"Retry-After": "2.5"}
+        success = _mock_resp(200, {"Quotes": [{"Bid": 3350.0}]})
+
+        http_client._httpx.get = AsyncMock(side_effect=[rate_limited, success])
+        result = await http_client.get_quotes("GCJ26")
+
+        assert result[0]["Bid"] == 3350.0
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] == pytest.approx(2.5)
+
+    @pytest.mark.asyncio
+    async def test_429_uses_initial_delay_when_no_retry_after(self, http_client, monkeypatch):
+        """429 without Retry-After falls back to retry_delay_initial_s."""
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        rate_limited = _mock_resp(429, None)
+        rate_limited.headers = {}
+        success = _mock_resp(200, {"Quotes": []})
+
+        http_client._httpx.get = AsyncMock(side_effect=[rate_limited, success])
+        await http_client.get_quotes("GCJ26")
+
+        assert sleep_calls[0] == pytest.approx(http_client._retry_delay_initial_s)
+
+    @pytest.mark.asyncio
+    async def test_429_exhausts_retries_and_raises(self, http_client, monkeypatch):
+        """Persistent 429 across all retries still raises the downstream error."""
+        async def mock_sleep(secs): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        rate_limited = _mock_resp(429, None)
+        rate_limited.headers = {"Retry-After": "0.01"}
+
+        http_client._max_retries = 2
+        http_client._httpx.get = AsyncMock(return_value=rate_limited)
+
+        with pytest.raises(Exception, match="Get quotes failed"):
+            await http_client.get_quotes("GCJ26")
+
+    @pytest.mark.asyncio
+    async def test_retry_after_capped_at_max_delay(self, http_client, monkeypatch):
+        """Retry-After larger than retry_delay_max_s is capped."""
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        rate_limited = _mock_resp(429, None)
+        rate_limited.headers = {"Retry-After": "99999"}
+        success = _mock_resp(200, {"Quotes": []})
+
+        http_client._httpx.get = AsyncMock(side_effect=[rate_limited, success])
+        await http_client.get_quotes("GCJ26")
+
+        assert sleep_calls[0] <= http_client._retry_delay_max_s
+
+    @pytest.mark.asyncio
+    async def test_near_exhaustion_triggers_proactive_sleep(self, http_client, monkeypatch):
+        """X-RateLimit-Remaining < 5 causes a proactive sleep before returning."""
+        import time as time_mod
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        reset_epoch = int(time_mod.time()) + 2
+        low_remaining = _mock_resp(200, {"Quotes": [{"Bid": 3350.0}]})
+        low_remaining.headers = {"X-RateLimit-Remaining": "3", "X-RateLimit-Reset": str(reset_epoch)}
+
+        http_client._httpx.get = AsyncMock(return_value=low_remaining)
+        result = await http_client.get_quotes("GCJ26")
+
+        assert result[0]["Bid"] == 3350.0
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] > 0
+
+    @pytest.mark.asyncio
+    async def test_normal_response_skips_sleep(self, http_client, monkeypatch):
+        """200 with healthy rate-limit headers causes no sleep."""
+        sleep_calls = []
+
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        ok = _mock_resp(200, {"Quotes": [{"Bid": 3350.0}]})
+        ok.headers = {"X-RateLimit-Remaining": "95", "X-RateLimit-Reset": "0"}
+
+        http_client._httpx.get = AsyncMock(return_value=ok)
+        await http_client.get_quotes("GCJ26")
+
+        assert sleep_calls == []
