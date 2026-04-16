@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -94,6 +95,7 @@ class TradeStationHttpClient:
 
         self._access_token: str | None = None
         self.token_expiry: datetime | None = None
+        self._on_token_rotated: Callable[[str], None] | None = None
 
         self._max_retries: int = max(1, max_retries)
         self._retry_delay_initial_s: float = retry_delay_initial_ms / 1000.0
@@ -113,6 +115,15 @@ class TradeStationHttpClient:
         """Current OAuth access token (read-only)."""
         return self._access_token
 
+    def set_token_rotation_callback(self, callback: Callable[[str], None]) -> None:
+        """Register a callback invoked whenever the OAuth refresh token rotates.
+
+        The callback receives the new refresh token as its only argument. Use
+        this to persist the rotated token to disk so process restarts succeed
+        without manual credential renewal.
+        """
+        self._on_token_rotated = callback
+
     async def _ensure_authenticated(self) -> None:
         if not self._access_token or not self.token_expiry:
             await self._refresh_access_token()
@@ -127,17 +138,31 @@ class TradeStationHttpClient:
             "client_secret": self._client_secret,
             "refresh_token": self._refresh_token,
         }
-        response = await self._httpx.post(self.auth_url, data=data)
-        if response.status_code != 200:
-            _log.debug(f"Auth failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"TradeStation authentication failed: HTTP {response.status_code}")
-        token_data = response.json()
-        self._access_token = token_data["access_token"]
-        expires_in = token_data.get("expires_in", 1200)
-        self.token_expiry = datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
-        if "refresh_token" in token_data:
-            self._refresh_token = token_data["refresh_token"]
-            _log.debug("OAuth refresh token rotated — updated in memory")
+        response = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(3.0)
+                _log.info(f"Retrying token refresh (attempt {attempt + 1}/3)")
+            response = await self._httpx.post(self.auth_url, data=data)
+            if response.status_code == 200:
+                token_data = response.json()
+                self._access_token = token_data["access_token"]
+                expires_in = token_data.get("expires_in", 1200)
+                self.token_expiry = datetime.now(tz=timezone.utc) + timedelta(seconds=expires_in)
+                if "refresh_token" in token_data:
+                    self._refresh_token = token_data["refresh_token"]
+                    _log.debug("OAuth refresh token rotated — updated in memory")
+                    if self._on_token_rotated:
+                        try:
+                            self._on_token_rotated(self._refresh_token)
+                        except Exception as cb_err:
+                            _log.warning(f"Token rotation callback failed: {cb_err}")
+                return
+            if response.status_code < 500:
+                break  # 4xx: credential problem — retrying won't help
+            _log.warning(f"Auth server error (HTTP {response.status_code}) — retrying")
+        _log.debug(f"Auth failed (HTTP {response.status_code}): {response.text[:500]}")
+        raise Exception(f"TradeStation authentication failed: HTTP {response.status_code}")
 
     async def _get_headers(self) -> dict[str, str]:
         await self._ensure_authenticated()

@@ -333,6 +333,81 @@ class TestRefreshTokenRotation:
         await client._refresh_access_token()
         assert client._refresh_token == "original"
 
+    @pytest.mark.asyncio
+    async def test_rotation_callback_is_invoked(self):
+        """set_token_rotation_callback fires with the new token on rotation."""
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="old",
+            use_sandbox=True,
+        )
+        received = []
+        client.set_token_rotation_callback(received.append)
+        client._httpx.post = AsyncMock(return_value=_mock_resp(200, {
+            "access_token": "a", "expires_in": 1200, "refresh_token": "rotated",
+        }))
+        await client._refresh_access_token()
+        assert received == ["rotated"]
+
+    @pytest.mark.asyncio
+    async def test_callback_not_called_without_rotation(self):
+        """Callback is not invoked when the auth response has no refresh_token."""
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="stable",
+            use_sandbox=True,
+        )
+        received = []
+        client.set_token_rotation_callback(received.append)
+        client._httpx.post = AsyncMock(return_value=_mock_resp(200, {
+            "access_token": "a", "expires_in": 1200,
+        }))
+        await client._refresh_access_token()
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_raise(self):
+        """A failing callback is swallowed — auth still succeeds."""
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="old",
+            use_sandbox=True,
+        )
+        client.set_token_rotation_callback(lambda t: (_ for _ in ()).throw(RuntimeError("disk full")))
+        client._httpx.post = AsyncMock(return_value=_mock_resp(200, {
+            "access_token": "a", "expires_in": 1200, "refresh_token": "new",
+        }))
+        await client._refresh_access_token()  # must not raise
+        assert client._access_token == "a"
+
+    @pytest.mark.asyncio
+    async def test_auth_retries_on_5xx_then_succeeds(self, monkeypatch):
+        """5xx from auth endpoint is retried; success on second attempt."""
+        async def mock_sleep(secs): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="r", use_sandbox=True,
+        )
+        server_err = _mock_resp(503, None)
+        success = _mock_resp(200, {"access_token": "tok", "expires_in": 1200})
+        client._httpx.post = AsyncMock(side_effect=[server_err, success])
+        await client._refresh_access_token()
+        assert client._access_token == "tok"
+
+    @pytest.mark.asyncio
+    async def test_auth_does_not_retry_on_401(self, monkeypatch):
+        """401 from auth endpoint is not retried — credential problem, not transient."""
+        sleep_calls = []
+        async def mock_sleep(secs): sleep_calls.append(secs)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        client = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="dead", use_sandbox=True,
+        )
+        client._httpx.post = AsyncMock(return_value=_mock_resp(401, None))
+        with pytest.raises(Exception, match="authentication failed"):
+            await client._refresh_access_token()
+        assert sleep_calls == [], "401 must not trigger retry sleep"
+        assert client._httpx.post.call_count == 1
+
 
 # =============================================================================
 # Rate-limit handling via _request()
