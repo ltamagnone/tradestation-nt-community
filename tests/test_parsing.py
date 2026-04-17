@@ -393,11 +393,24 @@ class TestParsingQuoteTradeTicks:
         assert parse_quote_tick(raw, self.instrument_id, self.instrument) is None
 
     def test_parse_quote_tick_missing_timestamp_uses_now(self):
+        import time
         raw = {**self.raw}
         del raw["TimeStamp"]
+        before = time.time_ns()
         tick = parse_quote_tick(raw, self.instrument_id, self.instrument)
+        after = time.time_ns()
         assert tick is not None
-        assert tick.ts_event > 0
+        assert before <= tick.ts_event <= after
+
+    def test_parse_trade_tick_missing_timestamp_uses_now(self):
+        import time
+        raw = {**self.raw}
+        del raw["TimeStamp"]
+        before = time.time_ns()
+        tick = parse_trade_tick(raw, self.instrument_id, self.instrument)
+        after = time.time_ns()
+        assert tick is not None
+        assert before <= tick.ts_event <= after
 
     def test_parse_trade_tick_price(self):
         from nautilus_trader.model.data import TradeTick

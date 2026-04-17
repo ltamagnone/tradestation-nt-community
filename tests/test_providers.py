@@ -268,6 +268,62 @@ async def test_find_returns_none_for_not_loaded_instrument(
 
 
 @pytest.mark.asyncio
+async def test_load_ids_async_concurrent_loads_all(
+    instrument_provider,
+    mock_http_client,
+):
+    """load_ids_async fetches all instruments concurrently — all succeed."""
+    mock_http_client.get_symbol_details.side_effect = [
+        GOLD_FUTURE_RESPONSE,
+        EQUITY_RESPONSE,
+    ]
+    ids = [
+        InstrumentId(Symbol("GCG25"), TRADESTATION_VENUE),
+        InstrumentId(Symbol("AAPL"), TRADESTATION_VENUE),
+    ]
+    await instrument_provider.load_ids_async(ids)
+
+    assert instrument_provider.find(ids[0]) is not None
+    assert instrument_provider.find(ids[1]) is not None
+    assert mock_http_client.get_symbol_details.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_load_ids_async_skips_cached(
+    instrument_provider,
+    mock_http_client,
+):
+    """Instruments already in cache are not re-fetched."""
+    mock_http_client.get_symbol_details.return_value = GOLD_FUTURE_RESPONSE
+    iid = InstrumentId(Symbol("GCG25"), TRADESTATION_VENUE)
+
+    await instrument_provider.load_ids_async([iid])
+    await instrument_provider.load_ids_async([iid])  # second call — already cached
+
+    assert mock_http_client.get_symbol_details.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_load_ids_async_one_failure_does_not_abort_others(
+    instrument_provider,
+    mock_http_client,
+):
+    """A single instrument load failure is isolated — remaining instruments still load."""
+    mock_http_client.get_symbol_details.side_effect = [
+        Exception("HTTP 503"),   # GCG25 fails
+        EQUITY_RESPONSE,          # AAPL succeeds
+    ]
+    ids = [
+        InstrumentId(Symbol("GCG25"), TRADESTATION_VENUE),
+        InstrumentId(Symbol("AAPL"), TRADESTATION_VENUE),
+    ]
+    await instrument_provider.load_ids_async(ids)  # must not raise
+
+    assert instrument_provider.find(ids[0]) is None   # failed — not loaded
+    assert instrument_provider.find(ids[1]) is not None  # succeeded
+
+
+@pytest.mark.asyncio
 async def test_load_option_contract_parses_correctly(
     instrument_provider,
     mock_http_client,

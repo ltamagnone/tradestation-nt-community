@@ -1,6 +1,7 @@
 """
 TradeStation instrument provider implementation.
 """
+import asyncio
 
 from tradestation_nt_community.constants import TRADESTATION_VENUE
 from tradestation_nt_community.http.client import TradeStationHttpClient
@@ -61,7 +62,11 @@ class TradeStationInstrumentProvider(InstrumentProvider):
         filters: dict | None = None,
     ) -> None:
         """
-        Load specific instruments by their IDs.
+        Load specific instruments by their IDs concurrently.
+
+        All non-cached instruments are fetched in parallel via
+        ``asyncio.gather``. Individual failures are logged and do not abort
+        the remaining loads.
 
         Parameters
         ----------
@@ -71,30 +76,28 @@ class TradeStationInstrumentProvider(InstrumentProvider):
             Additional filters (currently not used).
 
         """
-        for instrument_id in instrument_ids:
-            try:
-                # Check if already cached
-                if self.find(instrument_id) is not None:
-                    self._log.debug(f"Instrument already loaded: {instrument_id}")
-                    continue
+        to_load = [iid for iid in instrument_ids if self.find(iid) is None]
+        if not to_load:
+            return
 
-                # Extract symbol from instrument ID
-                symbol_str = instrument_id.symbol.value
+        results = await asyncio.gather(
+            *[self._load_single(iid) for iid in to_load],
+            return_exceptions=True,
+        )
+        for iid, result in zip(to_load, results):
+            if isinstance(result, Exception):
+                self._log.error(f"Error loading instrument {iid}: {result}")
 
-                # Get symbol details from TradeStation
-                symbol_data = await self._client.get_symbol_details(symbol_str)
-
-                # Parse and create instrument
-                instrument = self._parse_instrument(symbol_str, symbol_data)
-
-                if instrument:
-                    self.add(instrument)
-                    self._log.info(f"Loaded instrument: {instrument_id}")
-                else:
-                    self._log.warning(f"Failed to parse instrument: {instrument_id}")
-
-            except Exception as e:
-                self._log.error(f"Error loading instrument {instrument_id}: {e}")
+    async def _load_single(self, instrument_id: InstrumentId) -> None:
+        """Fetch and register one instrument; raises on any failure."""
+        symbol_str = instrument_id.symbol.value
+        symbol_data = await self._client.get_symbol_details(symbol_str)
+        instrument = self._parse_instrument(symbol_str, symbol_data)
+        if instrument:
+            self.add(instrument)
+            self._log.info(f"Loaded instrument: {instrument_id}")
+        else:
+            self._log.warning(f"Failed to parse instrument: {instrument_id}")
 
     async def load_async(self, instrument_id: InstrumentId, filters: dict | None = None) -> None:
         """

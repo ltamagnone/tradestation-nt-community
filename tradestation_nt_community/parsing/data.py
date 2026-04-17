@@ -2,6 +2,7 @@
 Parsing functions for TradeStation market data (bars, quotes).
 """
 import logging
+import time
 
 import pandas as pd
 
@@ -119,7 +120,7 @@ def parse_quote_tick(
         if ts_str:
             ts_event = dt_to_unix_nanos(pd.Timestamp(ts_str, tz="UTC"))
         else:
-            ts_event = pd.Timestamp.utcnow().value
+            ts_event = time.time_ns()
 
         return QuoteTick(
             instrument_id=instrument_id,
@@ -168,7 +169,7 @@ def parse_trade_tick(
         if ts_str:
             ts_event = dt_to_unix_nanos(pd.Timestamp(ts_str, tz="UTC"))
         else:
-            ts_event = pd.Timestamp.utcnow().value
+            ts_event = time.time_ns()
 
         return TradeTick(
             instrument_id=instrument_id,
