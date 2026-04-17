@@ -676,7 +676,31 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
 
         except Exception as e:
-            self._log.error(f"Failed to modify order {client_order_id}: {e}")
+            err = str(e)
+            if "HTTP 4" in err:
+                # 4xx: broker definitively rejected the modify — safe to surface
+                # as a rejection event so NT reverts PENDING_UPDATE and the
+                # strategy can react (retry, cancel, hedge).
+                self._log.error(
+                    f"Modify rejected by broker for {client_order_id}: {err}"
+                )
+                self.generate_order_modify_rejected(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=VenueOrderId(ts_order_id),
+                    reason=err[:150],
+                    ts_event=self._clock.timestamp_ns(),
+                )
+            else:
+                # 5xx / network error: modify may have already succeeded at the
+                # broker before the error occurred. Emitting a rejection would
+                # create false state drift. Log and leave PENDING_UPDATE in place;
+                # the next reconciliation cycle will correct state.
+                self._log.error(
+                    f"Failed to modify order {client_order_id} "
+                    f"(ambiguous — broker state unknown): {err}"
+                )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Cancel an order."""
