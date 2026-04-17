@@ -140,8 +140,12 @@ class TestParsingExecutionModule:
         assert convert_time_in_force(TimeInForce.DAY) == "DAY"
         assert convert_time_in_force(TimeInForce.GTC) == "GTC"
         assert convert_time_in_force(TimeInForce.IOC) == "IOC"
-        assert convert_time_in_force(TimeInForce.FOK) == "FOK"
         assert convert_time_in_force(TimeInForce.AT_THE_OPEN) == "DAY"
+
+    def test_convert_time_in_force_fok_raises(self):
+        """FOK raises ValueError — TradeStation always rejects these orders."""
+        with pytest.raises(ValueError, match="FOK"):
+            convert_time_in_force(TimeInForce.FOK)
 
     def test_parse_order_status_report_filled(self):
         report = parse_order_status_report(

@@ -100,8 +100,10 @@ class TestTimeInForceConversion:
     def test_ioc_converts(self):
         assert convert_time_in_force(TimeInForce.IOC) == "IOC"
 
-    def test_fok_converts(self):
-        assert convert_time_in_force(TimeInForce.FOK) == "FOK"
+    def test_fok_raises(self):
+        """FOK is explicitly rejected — TradeStation always rejects these orders."""
+        with pytest.raises(ValueError, match="FOK"):
+            convert_time_in_force(TimeInForce.FOK)
 
     def test_unsupported_defaults_to_day(self):
         assert convert_time_in_force(TimeInForce.AT_THE_OPEN) == "DAY"

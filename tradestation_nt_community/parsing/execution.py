@@ -19,6 +19,31 @@ from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLim
 
 _log = logging.getLogger(__name__)
 
+# Module-level constants — built once at import time, not on every call.
+_TIF_TO_TS: dict[TimeInForce, str] = {
+    TimeInForce.DAY: "DAY",
+    TimeInForce.GTC: "GTC",
+    TimeInForce.IOC: "IOC",
+}
+
+_TS_STATUS_TO_NT: dict[str, OrderStatus] = {
+    "ACK": OrderStatus.ACCEPTED,
+    "OPN": OrderStatus.SUBMITTED,
+    "FLL": OrderStatus.FILLED,
+    "FLP": OrderStatus.PARTIALLY_FILLED,
+    "OUT": OrderStatus.CANCELED,
+    "REJ": OrderStatus.REJECTED,
+    "CAN": OrderStatus.CANCELED,
+    "EXP": OrderStatus.EXPIRED,
+}
+
+_TS_ORDER_TYPE_TO_NT: dict[str, OrderType] = {
+    "Market": OrderType.MARKET,
+    "Limit": OrderType.LIMIT,
+    "StopMarket": OrderType.STOP_MARKET,
+    "StopLimit": OrderType.STOP_LIMIT,
+}
+
 
 def convert_order_type(order: Order) -> str:
     """Convert a NautilusTrader order to a TradeStation order type string.
@@ -43,15 +68,21 @@ def convert_order_type(order: Order) -> str:
 def convert_time_in_force(tif: TimeInForce) -> str:
     """Convert a NautilusTrader TimeInForce to a TradeStation duration string.
 
-    Unknown values default to 'DAY' (TradeStation rejects FOK; use DAY instead).
+    Raises
+    ------
+    ValueError
+        If ``tif`` is ``TimeInForce.FOK``. TradeStation always rejects FOK
+        orders; callers must use ``TimeInForce.DAY`` instead.
+
+    Notes
+    -----
+    Unknown values other than FOK fall back to ``"DAY"`` (safe default).
     """
-    _MAP = {
-        TimeInForce.DAY: "DAY",
-        TimeInForce.GTC: "GTC",
-        TimeInForce.IOC: "IOC",
-        TimeInForce.FOK: "FOK",
-    }
-    return _MAP.get(tif, "DAY")
+    if tif == TimeInForce.FOK:
+        raise ValueError(
+            "TradeStation rejects FOK orders — use TimeInForce.DAY instead."
+        )
+    return _TIF_TO_TS.get(tif, "DAY")
 
 
 def convert_order_to_ts_format(order: Order, account_id: str) -> dict[str, Any]:
@@ -96,28 +127,12 @@ def convert_order_to_ts_format(order: Order, account_id: str) -> dict[str, Any]:
 
 def parse_order_status(ts_status: str) -> OrderStatus:
     """Parse a TradeStation order status string to NautilusTrader OrderStatus."""
-    _MAP = {
-        "ACK": OrderStatus.ACCEPTED,
-        "OPN": OrderStatus.SUBMITTED,
-        "FLL": OrderStatus.FILLED,
-        "FLP": OrderStatus.PARTIALLY_FILLED,
-        "OUT": OrderStatus.CANCELED,
-        "REJ": OrderStatus.REJECTED,
-        "CAN": OrderStatus.CANCELED,
-        "EXP": OrderStatus.EXPIRED,
-    }
-    return _MAP.get(ts_status, OrderStatus.PENDING_UPDATE)
+    return _TS_STATUS_TO_NT.get(ts_status, OrderStatus.PENDING_UPDATE)
 
 
 def parse_ts_order_type(ts_order_type: str) -> OrderType:
     """Parse a TradeStation order type string to NautilusTrader OrderType."""
-    _MAP = {
-        "Market": OrderType.MARKET,
-        "Limit": OrderType.LIMIT,
-        "StopMarket": OrderType.STOP_MARKET,
-        "StopLimit": OrderType.STOP_LIMIT,
-    }
-    return _MAP.get(ts_order_type, OrderType.MARKET)
+    return _TS_ORDER_TYPE_TO_NT.get(ts_order_type, OrderType.MARKET)
 
 
 def parse_order_status_report(
