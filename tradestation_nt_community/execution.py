@@ -1076,54 +1076,76 @@ class TradeStationExecutionClient(LiveExecutionClient):
     # -- INTERNAL METHODS -----------------------------------------------------------------
 
     async def _update_account_state(self) -> None:
-        """Update account state from TradeStation."""
-        try:
-            balances_data = await self._client.get_balances(
-                account_keys=self._account_id,
-            )
+        """Update account state from TradeStation.
 
-            # Parse balances
-            cash_balance = Decimal(balances_data.get("CashBalance", "0"))
-            equity = Decimal(balances_data.get("Equity", "0"))
-            # MarketValue is negative for short positions — clamp to 0.
-            # NautilusTrader requires non-negative MarginBalance values.
-            # We don't enforce margin limits so 0 is safe when short.
-            margin_used = max(Decimal("0"), Decimal(balances_data.get("MarketValue", "0")))
+        Retries up to 3 times on transient errors (3 s between attempts).
+        If all attempts fail the method returns without raising — trading
+        continues and the broker enforces margin on every order. A prominent
+        warning is logged so the operator is aware the local balance snapshot
+        is unavailable until a subsequent successful call.
+        """
+        last_err: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(3.0)
+                self._log.info(
+                    f"Retrying account state fetch (attempt {attempt + 1}/3)"
+                )
+            try:
+                balances_data = await self._client.get_balances(
+                    account_keys=self._account_id,
+                )
 
-            # Generate account state event
-            balances = [
-                AccountBalance(
-                    Money(cash_balance, Currency.from_str("USD")),
-                    Money(0, Currency.from_str("USD")),  # No locked balance in this context
-                    Money(cash_balance, Currency.from_str("USD")),
-                ),
-            ]
+                cash_balance = Decimal(balances_data.get("CashBalance", "0"))
+                equity = Decimal(balances_data.get("Equity", "0"))
+                # MarketValue is negative for short positions — clamp to 0.
+                # NautilusTrader requires non-negative MarginBalance values.
+                # We don't enforce margin limits so 0 is safe when short.
+                margin_used = max(
+                    Decimal("0"), Decimal(balances_data.get("MarketValue", "0"))
+                )
 
-            margins = [
-                MarginBalance(
-                    initial=Money(margin_used, Currency.from_str("USD")),
-                    maintenance=Money(margin_used, Currency.from_str("USD")),
-                ),
-            ]
+                balances = [
+                    AccountBalance(
+                        Money(cash_balance, Currency.from_str("USD")),
+                        Money(0, Currency.from_str("USD")),
+                        Money(cash_balance, Currency.from_str("USD")),
+                    ),
+                ]
+                margins = [
+                    MarginBalance(
+                        initial=Money(margin_used, Currency.from_str("USD")),
+                        maintenance=Money(margin_used, Currency.from_str("USD")),
+                    ),
+                ]
 
-            # Ensure base class account_id is set before generating the event
-            if self.account_id is None:
-                self._set_account_id(self._account_id_nautilus)
+                if self.account_id is None:
+                    self._set_account_id(self._account_id_nautilus)
 
-            self.generate_account_state(
-                balances=balances,
-                margins=margins,
-                reported=True,
-                ts_event=self._clock.timestamp_ns(),
-                info={
-                    "equity": str(equity),
-                    "cash_balance": str(cash_balance),
-                    "account_id": self._account_id,
-                },
-            )
+                self.generate_account_state(
+                    balances=balances,
+                    margins=margins,
+                    reported=True,
+                    ts_event=self._clock.timestamp_ns(),
+                    info={
+                        "equity": str(equity),
+                        "cash_balance": str(cash_balance),
+                        "account_id": self._account_id,
+                    },
+                )
+                return  # success — exit retry loop
 
-        except Exception as e:
-            self._log.error(f"Failed to update account state: {e}")
+            except Exception as e:
+                last_err = e
+                self._log.warning(
+                    f"Account state fetch failed (attempt {attempt + 1}/3): {e}"
+                )
+
+        self._log.warning(
+            f"Account state unavailable after 3 attempts ({last_err}). "
+            "Trading will continue — the broker enforces margin on every order. "
+            "Balance display will be stale until the next successful update."
+        )
 
     def _convert_order_to_ts_format(self, order: Order) -> dict[str, Any]:
         """Convert Nautilus order to TradeStation format.

@@ -451,3 +451,78 @@ class TestModifyOrderErrorHandling:
         await TradeStationExecutionClient._modify_order(m, cmd)
         m.generate_order_updated.assert_called_once()
         m.generate_order_modify_rejected.assert_not_called()
+
+
+# =============================================================================
+# _update_account_state: retry and graceful degradation
+# =============================================================================
+
+def _make_account_state_mock() -> MagicMock:
+    m = MagicMock()
+    m._account_id = "SIM001"
+    m._account_id_nautilus = AccountId("TRADESTATION-SIM001")
+    m.account_id = AccountId("TRADESTATION-SIM001")
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    return m
+
+
+_BALANCES_OK = {"CashBalance": "50000", "Equity": "55000", "MarketValue": "5000"}
+
+
+class TestUpdateAccountState:
+    """_update_account_state retries on failure and never raises."""
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self, monkeypatch):
+        """Happy path: account state fetched and generate_account_state called."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(return_value=_BALANCES_OK)
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transient_error_then_succeeds(self, monkeypatch):
+        """First attempt fails, second succeeds — generate_account_state called once."""
+        sleep_calls = []
+        async def mock_sleep(s): sleep_calls.append(s)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(
+            side_effect=[Exception("HTTP 500"), _BALANCES_OK]
+        )
+        await TradeStationExecutionClient._update_account_state(m)
+        m.generate_account_state.assert_called_once()
+        assert len(sleep_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_retries_exhausted_does_not_raise(self, monkeypatch):
+        """Three consecutive failures log a warning but do not raise."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)  # must not raise
+        m.generate_account_state.assert_not_called()
+        assert m._log.warning.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_logs_trading_continues_message(self, monkeypatch):
+        """Final warning message tells operator trading continues."""
+        async def mock_sleep(s): pass
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        m = _make_account_state_mock()
+        m._client.get_balances = AsyncMock(side_effect=Exception("HTTP 503"))
+        await TradeStationExecutionClient._update_account_state(m)
+
+        warning_messages = " ".join(
+            str(call) for call in m._log.warning.call_args_list
+        )
+        assert "Trading will continue" in warning_messages
