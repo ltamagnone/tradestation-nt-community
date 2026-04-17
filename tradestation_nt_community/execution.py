@@ -597,7 +597,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
-        """Modify (replace) an existing order price via TradeStation PUT endpoint."""
+        """Modify (replace) an existing order price via TradeStation PUT endpoint.
+
+        On a definitive 4xx rejection from the broker, emits
+        ``generate_order_modify_rejected()`` so NT reverts the order out of
+        ``PENDING_UPDATE`` and the strategy can react (retry, cancel, hedge).
+
+        On 5xx or network errors the rejection is intentionally suppressed: the
+        modify may have already succeeded at the broker before the error was
+        returned, and a false rejection event would create state drift in the
+        wrong direction. The next reconciliation cycle will correct state.
+        """
         client_order_id = command.client_order_id
         ts_order_id = self._client_order_id_to_ts_order_id.get(client_order_id)
 
