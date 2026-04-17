@@ -55,14 +55,13 @@ def convert_order_type(order: Order) -> str:
     """
     if isinstance(order, MarketOrder):
         return "Market"
-    elif isinstance(order, LimitOrder):
+    if isinstance(order, LimitOrder):
         return "Limit"
-    elif isinstance(order, StopMarketOrder):
+    if isinstance(order, StopMarketOrder):
         return "StopMarket"
-    elif isinstance(order, StopLimitOrder):
+    if isinstance(order, StopLimitOrder):
         return "StopLimit"
-    else:
-        raise ValueError(f"Unsupported order type: {type(order)}")
+    raise ValueError(f"Unsupported order type: {type(order)}")
 
 
 def convert_time_in_force(tif: TimeInForce) -> str:

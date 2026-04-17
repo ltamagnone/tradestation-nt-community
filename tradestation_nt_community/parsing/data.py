@@ -35,15 +35,14 @@ def bar_spec_to_ts_params(spec: BarSpecification) -> tuple[str, TradeStationBarU
     """
     if spec.aggregation == BarAggregation.MINUTE:
         return str(spec.step), TradeStationBarUnit.MINUTE
-    elif spec.aggregation == BarAggregation.HOUR:
+    if spec.aggregation == BarAggregation.HOUR:
         return str(spec.step * 60), TradeStationBarUnit.MINUTE
-    elif spec.aggregation == BarAggregation.DAY:
+    if spec.aggregation == BarAggregation.DAY:
         return "1", TradeStationBarUnit.DAILY
-    else:
-        raise ValueError(
-            f"Unsupported bar aggregation: {spec.aggregation}. "
-            f"Supported aggregations: MINUTE, HOUR, DAY."
-        )
+    raise ValueError(
+        f"Unsupported bar aggregation: {spec.aggregation}. "
+        f"Supported aggregations: MINUTE, HOUR, DAY."
+    )
 
 
 def parse_bars(raw_bars: list[dict], bar_type: BarType) -> list[Bar]:
