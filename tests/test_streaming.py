@@ -443,3 +443,184 @@ class TestHeartbeatTimeout:
 
         assert len(sleep_calls) == 1, "Generic error must sleep before reconnecting"
         assert sleep_calls[0] == pytest.approx(0.01)
+
+
+class TestAuthErrorRefresh:
+    """401 errors trigger the on_auth_error callback to refresh the OAuth token."""
+
+    def _make_mock_client_with_status(self, responses):
+        """Build httpx.AsyncClient mock where each response is (status_code, body/lines).
+
+        Each item: (status_code, content)
+          - status_code != 200: content is the error body bytes
+          - status_code == 200: content is a list of JSON strings to yield
+        """
+        conn_idx = [-1]
+        resp_list = responses
+
+        class _Resp:
+            def __init__(self, idx):
+                self._idx = idx
+                self.status_code = resp_list[idx][0]
+                self._content = resp_list[idx][1]
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+            async def aread(self):
+                if isinstance(self._content, bytes):
+                    return self._content
+                return json.dumps(self._content).encode() if self._content else b""
+
+            async def aiter_lines(self):
+                for item in self._content:
+                    yield item
+
+        class _Client:
+            def __init__(self, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+
+            def stream(self, *a, **kw):
+                conn_idx[0] += 1
+                return _Resp(conn_idx[0])
+
+        return _Client
+
+    @pytest.mark.asyncio
+    async def test_401_triggers_on_auth_error_callback(self, monkeypatch):
+        """On 401 with on_auth_error set, the callback is awaited and stream reconnects."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        refresh_calls = []
+
+        async def mock_refresh():
+            refresh_calls.append(1)
+
+        sc = TradeStationStreamClient(
+            access_token_provider=lambda: "refreshed_token",
+            base_url="https://mock.ts.com/v3",
+            reconnect_delay_secs=0.01,
+            on_auth_error=mock_refresh,
+        )
+        sleep_calls = []
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client_with_status([
+                (401, b'{"Message":"Access token has expired."}'),
+                (200, ['{"Symbol": "GCJ26", "Bid": 3350.5}']),
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 1:
+                break
+
+        assert len(refresh_calls) == 1, "on_auth_error must be called on 401"
+        assert sleep_calls == [], "Successful refresh must skip backoff sleep"
+        assert events[0] == {"Symbol": "GCJ26", "Bid": 3350.5}
+
+    @pytest.mark.asyncio
+    async def test_401_resets_backoff_after_successful_refresh(self, monkeypatch):
+        """After a successful token refresh, the delay resets to the initial value."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        async def mock_refresh():
+            pass
+
+        sc = TradeStationStreamClient(
+            access_token_provider=lambda: "tok",
+            base_url="https://mock.ts.com/v3",
+            reconnect_delay_secs=0.01,
+            on_auth_error=mock_refresh,
+        )
+        sleep_calls = []
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client_with_status([
+                (401, b'{"Message":"expired"}'),
+                (401, b'{"Message":"expired again"}'),
+                (200, ['{"Symbol": "GCJ26", "Bid": 3350.5}']),
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 1:
+                break
+
+        assert sleep_calls == [], "All 401s with successful refresh skip backoff"
+
+    @pytest.mark.asyncio
+    async def test_401_without_callback_falls_back_to_backoff(self, monkeypatch):
+        """When on_auth_error is None, 401 uses normal backoff (backward compat)."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        sc = _make_client()  # no on_auth_error
+        sleep_calls = []
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client_with_status([
+                (401, b'{"Message":"expired"}'),
+                (200, ['{"Symbol": "GCJ26", "Bid": 3350.5}']),
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 1:
+                break
+
+        assert len(sleep_calls) == 1, "No callback → must use backoff sleep"
+        assert sleep_calls[0] == pytest.approx(0.01)
+
+    @pytest.mark.asyncio
+    async def test_401_callback_failure_falls_through_to_backoff(self, monkeypatch):
+        """When on_auth_error raises, fall through to normal backoff."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+
+        async def failing_refresh():
+            raise RuntimeError("token endpoint down")
+
+        sc = TradeStationStreamClient(
+            access_token_provider=lambda: "tok",
+            base_url="https://mock.ts.com/v3",
+            reconnect_delay_secs=0.01,
+            on_auth_error=failing_refresh,
+        )
+        sleep_calls = []
+        async def mock_sleep(secs):
+            sleep_calls.append(secs)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(
+            streaming_mod.httpx,
+            "AsyncClient",
+            self._make_mock_client_with_status([
+                (401, b'{"Message":"expired"}'),
+                (200, ['{"Symbol": "GCJ26", "Bid": 3350.5}']),
+            ]),
+        )
+
+        events = []
+        async for event in sc._stream("https://mock.ts.com/stream"):
+            events.append(event)
+            if len(events) >= 1:
+                break
+
+        assert len(sleep_calls) == 1, "Failed refresh must fall through to backoff"

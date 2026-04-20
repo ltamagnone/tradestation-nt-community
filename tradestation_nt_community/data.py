@@ -101,6 +101,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                 access_token_provider=lambda: self._client.access_token,
                 base_url=self._client.base_url,
                 reconnect_delay_secs=streaming_reconnect_delay_secs,
+                on_auth_error=self._client._ensure_authenticated,
             )
 
         # Bar subscription state

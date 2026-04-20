@@ -33,7 +33,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
-from typing import Callable
+from typing import Awaitable, Callable
 
 import httpx
 
@@ -70,11 +70,13 @@ class TradeStationStreamClient:
         access_token_provider: Callable[[], str | None],
         base_url: str,
         reconnect_delay_secs: float = 5.0,
+        on_auth_error: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._token_provider = access_token_provider
         self._base_url = base_url.rstrip("/")
         self._reconnect_delay = reconnect_delay_secs
         self._max_delay = reconnect_delay_secs * 8
+        self._on_auth_error = on_auth_error
 
     def _headers(self) -> dict[str, str]:
         token = self._token_provider()
@@ -113,6 +115,14 @@ class TradeStationStreamClient:
                                 f"SSE stream {url} returned {resp.status_code}: "
                                 f"{body.decode(errors='replace')[:200]}"
                             )
+                            if resp.status_code == 401 and self._on_auth_error:
+                                _log.info("401 on SSE stream — refreshing OAuth token")
+                                try:
+                                    await self._on_auth_error()
+                                    delay = self._reconnect_delay
+                                    continue
+                                except Exception as refresh_err:
+                                    _log.error(f"Token refresh failed: {refresh_err}")
                             await asyncio.sleep(delay)
                             delay = min(delay * 2, self._max_delay)
                             continue
