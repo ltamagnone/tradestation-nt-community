@@ -526,3 +526,156 @@ class TestUpdateAccountState:
             str(call) for call in m._log.warning.call_args_list
         )
         assert "Trading will continue" in warning_messages
+
+
+# =============================================================================
+# _cancel_all_orders: instrument/strategy-scoped cancellation
+# =============================================================================
+
+from nautilus_trader.execution.messages import CancelAllOrders
+from nautilus_trader.model.enums import OrderSide
+
+
+def _make_cancel_all_command(
+    instrument_str: str = "GCJ26.TRADESTATION",
+    strategy_str: str = "S-001",
+    order_side: OrderSide = OrderSide.NO_ORDER_SIDE,
+) -> CancelAllOrders:
+    return CancelAllOrders(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId(strategy_str),
+        instrument_id=InstrumentId.from_str(instrument_str),
+        order_side=order_side,
+        command_id=UUID4(),
+        ts_init=0,
+    )
+
+
+def _make_mock_order(
+    client_order_id: str,
+    venue_order_id: str,
+    side: OrderSide = OrderSide.BUY,
+    status: OrderStatus = OrderStatus.ACCEPTED,
+):
+    order = MagicMock()
+    order.client_order_id = ClientOrderId(client_order_id)
+    order.venue_order_id = VenueOrderId(venue_order_id)
+    order.side = side
+    order.status = status
+    return order
+
+
+def _make_cancel_all_exec_mock(
+    open_orders=None,
+    inflight_orders=None,
+):
+    m = MagicMock()
+    m._cache = MagicMock()
+    m._cache.orders_open.return_value = open_orders or []
+    m._cache.orders_inflight.return_value = inflight_orders or []
+    m._client = MagicMock()
+    m._client.cancel_order = AsyncMock()
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    m.generate_order_canceled = MagicMock()
+    return m
+
+
+class TestCancelAllOrdersFiltering:
+    """_cancel_all_orders must only cancel orders for the specified
+    instrument and strategy, never touching other strategies' orders."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_only_matching_orders(self):
+        """Only orders returned by cache for this instrument+strategy get canceled."""
+        gc_order = _make_mock_order("O-GC-1", "TS-100", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[gc_order])
+
+        cmd = _make_cancel_all_command("GCJ26.TRADESTATION", "S-001")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._cache.orders_open.assert_called_once_with(
+            instrument_id=cmd.instrument_id,
+            strategy_id=cmd.strategy_id,
+            side=cmd.order_side,
+        )
+        m._client.cancel_order.assert_called_once_with(order_id="TS-100")
+        m.generate_order_canceled.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_orders_skips_cancel(self):
+        """When cache returns no orders, no TS API calls are made."""
+        m = _make_cancel_all_exec_mock(open_orders=[])
+
+        cmd = _make_cancel_all_command("NQU26.TRADESTATION", "S-002")
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_orders_all_canceled(self):
+        """All orders for the instrument+strategy are canceled."""
+        stop = _make_mock_order("O-1", "TS-200", OrderSide.SELL)
+        target = _make_mock_order("O-2", "TS-201", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[stop, target])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        assert m._client.cancel_order.call_count == 2
+        assert m.generate_order_canceled.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inflight_submitted_orders_included(self):
+        """Inflight orders with SUBMITTED status are also canceled."""
+        inflight = _make_mock_order(
+            "O-INF", "TS-300", OrderSide.BUY, OrderStatus.SUBMITTED,
+        )
+        m = _make_cancel_all_exec_mock(inflight_orders=[inflight])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-300")
+
+    @pytest.mark.asyncio
+    async def test_not_an_open_order_is_warning_not_error(self):
+        """Broker 'Not an open order' is logged as warning, not error."""
+        order = _make_mock_order("O-1", "TS-400")
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+        m._client.cancel_order = AsyncMock(
+            side_effect=Exception("Not an open order"),
+        )
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._log.warning.assert_called()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_order_without_venue_id_skipped(self):
+        """Orders with no venue_order_id (not yet acknowledged) are skipped."""
+        order = _make_mock_order("O-1", "TS-500")
+        order.venue_order_id = None
+        m = _make_cancel_all_exec_mock(open_orders=[order])
+
+        cmd = _make_cancel_all_command()
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_not_called()
+        m._log.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_side_filter_applied(self):
+        """When command specifies a side, only that side is canceled."""
+        buy = _make_mock_order("O-BUY", "TS-600", OrderSide.BUY)
+        sell = _make_mock_order("O-SELL", "TS-601", OrderSide.SELL)
+        m = _make_cancel_all_exec_mock(open_orders=[buy, sell])
+
+        cmd = _make_cancel_all_command(order_side=OrderSide.SELL)
+        await TradeStationExecutionClient._cancel_all_orders(m, cmd)
+
+        m._client.cancel_order.assert_called_once_with(order_id="TS-601")

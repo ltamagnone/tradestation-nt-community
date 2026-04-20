@@ -760,36 +760,74 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        """Cancel all open orders."""
-        self._log.info("Cancelling all orders")
+        """Cancel all orders for a specific instrument and strategy.
 
-        try:
-            # Get all open orders
-            orders = await self._client.get_orders(
-                account_keys=self._account_id,
+        Uses the NT cache to identify which orders belong to the requesting
+        strategy, then cancels only those.  Orders from other strategies or
+        processes sharing the same TS account are never touched.
+
+        This follows the same pattern as the official Binance adapter.
+        """
+        self._log.info(
+            f"Cancelling orders for {command.instrument_id} "
+            f"(strategy={command.strategy_id})"
+        )
+
+        open_orders = self._cache.orders_open(
+            instrument_id=command.instrument_id,
+            strategy_id=command.strategy_id,
+            side=command.order_side,
+        )
+        inflight_orders = [
+            o for o in self._cache.orders_inflight(
+                instrument_id=command.instrument_id,
+                strategy_id=command.strategy_id,
             )
+            if o.status == OrderStatus.SUBMITTED
+        ]
 
-            # Cancel each order
-            for ts_order in orders:
-                status = ts_order.get("Status", "")
-                if status in ("FLL", "OUT", "REJ", "CAN"):  # Already filled/cancelled
-                    continue
+        all_orders = list(open_orders) + inflight_orders
 
-                ts_order_id = ts_order.get("OrderID")
-                if ts_order_id:
-                    try:
-                        await self._client.cancel_order(
-                            order_id=ts_order_id,
-                        )
-                        self._log.info(f"Cancelled order {ts_order_id}")
-                    except Exception as e:
-                        if "Not an open order" in str(e):
-                            self._log.warning(f"Order {ts_order_id} already gone at broker — skipping")
-                        else:
-                            self._log.error(f"Failed to cancel order {ts_order_id}: {e}")
+        if command.order_side != OrderSide.NO_ORDER_SIDE:
+            all_orders = [o for o in all_orders if o.side == command.order_side]
 
-        except Exception as e:
-            self._log.error(f"Failed to cancel all orders: {e}")
+        if not all_orders:
+            self._log.info("No matching orders to cancel")
+            return
+
+        self._log.info(f"Cancelling {len(all_orders)} order(s)")
+
+        for order in all_orders:
+            venue_order_id = order.venue_order_id
+            if venue_order_id is None:
+                self._log.warning(
+                    f"Order {order.client_order_id} has no venue_order_id — skipping"
+                )
+                continue
+
+            ts_order_id = venue_order_id.value
+            try:
+                await self._client.cancel_order(order_id=ts_order_id)
+                self.generate_order_canceled(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+                self._log.info(
+                    f"Cancelled order {order.client_order_id} ({ts_order_id})"
+                )
+            except Exception as e:
+                if "Not an open order" in str(e):
+                    self._log.warning(
+                        f"Order {order.client_order_id} ({ts_order_id}) "
+                        f"not found at broker — skipping"
+                    )
+                else:
+                    self._log.error(
+                        f"Failed to cancel order {order.client_order_id}: {e}"
+                    )
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
         """Cancel a batch of orders."""
