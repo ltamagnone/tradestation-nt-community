@@ -96,6 +96,7 @@ class TradeStationHttpClient:
         self._access_token: str | None = None
         self.token_expiry: datetime | None = None
         self._on_token_rotated: Callable[[str], None] | None = None
+        self._auth_lock = asyncio.Lock()
 
         self._max_retries: int = max(1, max_retries)
         self._retry_delay_initial_s: float = retry_delay_initial_ms / 1000.0
@@ -125,11 +126,12 @@ class TradeStationHttpClient:
         self._on_token_rotated = callback
 
     async def _ensure_authenticated(self) -> None:
-        if not self._access_token or not self.token_expiry:
-            await self._refresh_access_token()
-            return
-        if datetime.now(tz=timezone.utc) >= self.token_expiry - timedelta(minutes=5):
-            await self._refresh_access_token()
+        async with self._auth_lock:
+            if not self._access_token or not self.token_expiry:
+                await self._refresh_access_token()
+                return
+            if datetime.now(tz=timezone.utc) >= self.token_expiry - timedelta(minutes=5):
+                await self._refresh_access_token()
 
     async def _refresh_access_token(self) -> None:
         data = {

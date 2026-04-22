@@ -480,6 +480,80 @@ class TradeStationDataClient(LiveMarketDataClient):
         self._last_bar_ts.pop(bar_type, None)
         self._log.info(f"Unsubscribed from {bar_type}")
 
+    async def reconnect_bar_streams(self, stale_only: bool = True, max_age_secs: float = 7200) -> int:
+        """Cancel and restart bar SSE streams.
+
+        Parameters
+        ----------
+        stale_only : bool, default True
+            If True, only reconnect streams that haven't received data in
+            ``max_age_secs``. If False, reconnect ALL bar streams.
+        max_age_secs : float, default 7200
+            Age threshold (seconds) for considering a stream stale.
+
+        Returns
+        -------
+        int
+            Number of streams reconnected.
+        """
+        if not self._use_streaming or not self._stream_client:
+            return 0
+
+        import time as _time
+        now = _time.time()
+        reconnected = 0
+
+        for bar_type, task in list(self._bar_subscriptions.items()):
+            if stale_only:
+                last_ts = self._last_bar_ts.get(bar_type)
+                if last_ts:
+                    try:
+                        from datetime import datetime as _dt
+                        last_dt = _dt.fromisoformat(last_ts.replace("Z", "+00:00"))
+                        age = now - last_dt.timestamp()
+                        if age < max_age_secs:
+                            continue
+                    except Exception:
+                        pass
+                elif not task.done():
+                    continue
+
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            self._last_bar_ts.pop(bar_type, None)
+
+            from nautilus_trader.model.data import BarSpecification
+            from nautilus_trader.model.enums import BarAggregation
+            spec = bar_type.spec
+            symbol = bar_type.instrument_id.symbol.value
+            if spec.aggregation == BarAggregation.HOUR:
+                interval = str(spec.step * 60)
+                unit = TradeStationBarUnit.MINUTE
+            elif spec.aggregation == BarAggregation.DAY:
+                interval = str(spec.step)
+                unit = TradeStationBarUnit.DAILY
+            else:
+                interval = str(spec.step)
+                unit = TradeStationBarUnit.MINUTE
+
+            instrument = self._cache.instrument(bar_type.instrument_id)
+            if not instrument:
+                self._log.warning(f"Cannot reconnect {bar_type}: instrument not in cache")
+                continue
+
+            new_task = self._loop.create_task(
+                self._stream_bars(bar_type, symbol, interval, unit, instrument)
+            )
+            self._bar_subscriptions[bar_type] = new_task
+            reconnected += 1
+            self._log.warning(f"Reconnected bar stream: {bar_type}")
+
+        return reconnected
+
     # -- QUOTE / TRADE TICK SUBSCRIPTIONS (shared multiplexer) -----------------
 
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
