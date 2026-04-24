@@ -5,10 +5,17 @@ Tests the parsing helpers and HTTP client fixture.  The full _submit_order_list
 integration path requires a live NT node and is covered by the fallback path test.
 """
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tradestation_nt_community.http.client import (
+    DuplicateOrderConfirmIdException,
+    OrderRejectedException,
+    TradeStationHttpClient,
+)
 from tradestation_nt_community.parsing.execution import (
     _group_type_for_order_list,
     convert_order_list_to_ts_group,
@@ -232,3 +239,165 @@ class TestPlaceOrderGroupFixture:
         )
         assert result["OrderGroupId"] == "GRP-001"
         assert len(result["Orders"]) == 2
+
+
+# =============================================================================
+# place_order_group() — OrderConfirmId injection and dedup protocol (Group B)
+# =============================================================================
+
+def _mock_resp(status: int = 200, data: dict | list | None = None) -> MagicMock:
+    """Return a MagicMock that looks like an httpx Response."""
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = str(data or "")
+    resp.json.return_value = data if data is not None else {}
+    resp.headers = {}
+    return resp
+
+
+def _dedup_ack_body() -> dict:
+    """Return a TS duplicate-acknowledge response body for a group order."""
+    msg = "Order not placed because a unique orderconfirmid already exists."
+    return {"Orders": [{"Error": "FAILED", "Message": msg, "OrderID": ""}]}
+
+
+def _two_leg_orders(with_account_id: bool = True) -> list[dict]:
+    """Return a minimal 2-leg OCO order list."""
+    legs = [
+        {"Symbol": "GCJ26", "Quantity": "1", "OrderType": "StopMarket",
+         "TradeAction": "Sell", "TimeInForce": {"Duration": "GTC"}, "StopPrice": "3300.0"},
+        {"Symbol": "GCJ26", "Quantity": "1", "OrderType": "Limit",
+         "TradeAction": "Sell", "TimeInForce": {"Duration": "GTC"}, "LimitPrice": "3500.0"},
+    ]
+    if with_account_id:
+        for leg in legs:
+            leg["AccountID"] = "SIM0000001F"
+    return legs
+
+
+@pytest.fixture
+def http_client_for_groups():
+    """TradeStationHttpClient fixture pre-authenticated (no OAuth calls)."""
+    client = TradeStationHttpClient(
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        refresh_token="test_refresh_token",
+        use_sandbox=True,
+    )
+    client._access_token = "test_access_token"
+    client.token_expiry = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+    return client
+
+
+class TestPlaceOrderGroupConfirmId:
+    """place_order_group() injects per-leg OrderConfirmIds and handles all dedup paths."""
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_injects_confirm_id_per_leg(self, http_client_for_groups):
+        """Each leg in the POST body has a distinct 22-char hex OrderConfirmId."""
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["payload"] = json
+            return _mock_resp(200, {"OrderGroupId": "G-1", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]})
+
+        http_client_for_groups._httpx.post = mock_post
+        await http_client_for_groups.place_order_group("OCO", _two_leg_orders())
+
+        orders_in_payload = captured["payload"]["Orders"]
+        assert len(orders_in_payload) == 2
+        cids = [o["OrderConfirmId"] for o in orders_in_payload]
+        # Each must be 22 hex chars
+        for cid in cids:
+            assert len(cid) == 22
+            assert all(c in "0123456789abcdef" for c in cid)
+        # They must be distinct
+        assert cids[0] != cids[1]
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_uses_supplied_confirm_ids(self, http_client_for_groups):
+        """Caller-supplied order_confirm_ids are placed into each leg verbatim."""
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["payload"] = json
+            return _mock_resp(200, {"OrderGroupId": "G-2", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]})
+
+        http_client_for_groups._httpx.post = mock_post
+        await http_client_for_groups.place_order_group(
+            "OCO", _two_leg_orders(),
+            order_confirm_ids=["cid-1", "cid-2"],
+        )
+
+        orders_in_payload = captured["payload"]["Orders"]
+        assert orders_in_payload[0]["OrderConfirmId"] == "cid-1"
+        assert orders_in_payload[1]["OrderConfirmId"] == "cid-2"
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_normal_success_returns_response_as_is(self, http_client_for_groups):
+        """Normal 200 group success is returned unchanged."""
+        expected = {"OrderGroupId": "G-1", "Orders": [{"OrderID": "A"}, {"OrderID": "B"}]}
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, expected))
+
+        result = await http_client_for_groups.place_order_group("OCO", _two_leg_orders())
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_duplicate_ack_resolves_all_legs(self, http_client_for_groups):
+        """Dedup-ack: all legs are found in GET /orders; OrderGroupId preserved."""
+        cid_a, cid_b = "dedup-leg-a-cid-abcde", "dedup-leg-b-cid-abcde"
+
+        dedup_body = _dedup_ack_body()
+        get_orders_data = {
+            "Orders": [
+                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
+                {"OrderID": "real-B", "OrderConfirmId": cid_b, "OrderGroupId": "G-9"},
+            ]
+        }
+
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
+
+        result = await http_client_for_groups.place_order_group(
+            "OCO", _two_leg_orders(),
+            order_confirm_ids=[cid_a, cid_b],
+        )
+
+        assert result["OrderGroupId"] == "G-9"
+        assert len(result["Orders"]) == 2
+        order_ids = {o["OrderID"] for o in result["Orders"]}
+        assert order_ids == {"real-A", "real-B"}
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_duplicate_ack_partial_resolution_raises(self, http_client_for_groups):
+        """Dedup-ack with only 1 of 2 legs found → DuplicateOrderConfirmIdException."""
+        cid_a, cid_b = "found-cid-a-abcdefghij", "missing-cid-b-abcdefgh"
+
+        dedup_body = _dedup_ack_body()
+        # GET /orders returns only leg A
+        get_orders_data = {
+            "Orders": [
+                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
+            ]
+        }
+
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
+
+        with pytest.raises(DuplicateOrderConfirmIdException):
+            await http_client_for_groups.place_order_group(
+                "OCO", _two_leg_orders(),
+                order_confirm_ids=[cid_a, cid_b],
+            )
+
+    @pytest.mark.asyncio
+    async def test_place_order_group_legs_missing_account_id_raises_OrderRejectedException(self, http_client_for_groups):
+        """Legs without AccountID on a dedup-ack → OrderRejectedException (not KeyError)."""
+        dedup_body = _dedup_ack_body()
+        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
+
+        with pytest.raises(OrderRejectedException):
+            await http_client_for_groups.place_order_group(
+                "OCO", _two_leg_orders(with_account_id=False),
+            )

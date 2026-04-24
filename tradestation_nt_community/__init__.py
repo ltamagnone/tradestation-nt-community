@@ -25,6 +25,8 @@ from tradestation_nt_community.constants import TRADESTATION_VENUE
 from tradestation_nt_community.data import TradeStationDataClient
 from tradestation_nt_community.factories import TradeStationLiveDataClientFactory
 from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
+from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
+from tradestation_nt_community.http.client import OrderRejectedException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.providers import TradeStationInstrumentProvider
 
@@ -33,6 +35,8 @@ __all__ = [
     "TRADESTATION",
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",
+    "DuplicateOrderConfirmIdException",
+    "OrderRejectedException",
     "TradeStationDataClient",
     "TradeStationDataClientConfig",
     "TradeStationExecClientConfig",

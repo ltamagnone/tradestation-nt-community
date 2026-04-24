@@ -12,7 +12,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from tradestation_nt_community.common.enums import TradeStationBarUnit
-from tradestation_nt_community.http.client import TradeStationHttpClient
+from tradestation_nt_community.http.client import (
+    DuplicateOrderConfirmIdException,
+    OrderRejectedException,
+    TradeStationHttpClient,
+)
 
 
 RESOURCES_DIR = Path(__file__).parent / "resources"
@@ -528,3 +532,163 @@ class TestRateLimitHandling:
         await http_client.get_quotes("GCJ26")
 
         assert sleep_calls == []
+
+
+# =============================================================================
+# place_order() — OrderConfirmId injection and dedup protocol (Group A)
+# =============================================================================
+
+def _dedup_ack_body(confirm_id: str | None = None) -> dict:
+    """Return a TS duplicate-acknowledge response body."""
+    msg = "Order not placed because a unique orderconfirmid already exists."
+    return {"Orders": [{"Error": "FAILED", "Message": msg, "OrderID": ""}]}
+
+
+class TestPlaceOrderConfirmId:
+    """place_order() injects OrderConfirmId and handles all dedup paths."""
+
+    @pytest.mark.asyncio
+    async def test_place_order_injects_order_confirm_id_when_not_supplied(self, http_client):
+        """POST body contains auto-generated OrderConfirmId — exactly 22 hex chars."""
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["body"] = json
+            return _mock_resp(200, {"Orders": [{"OrderID": "111", "Message": "Sent order"}]})
+
+        http_client._httpx.post = mock_post
+        await http_client.place_order(
+            account_id="SIM001", symbol="GCJ26", quantity="1",
+            order_type="Market", trade_action="Buy",
+        )
+
+        body = captured["body"]
+        assert "OrderConfirmId" in body
+        cid = body["OrderConfirmId"]
+        assert len(cid) == 22
+        assert all(c in "0123456789abcdef" for c in cid)
+
+    @pytest.mark.asyncio
+    async def test_place_order_uses_supplied_order_confirm_id(self, http_client):
+        """Caller-supplied order_confirm_id is placed in POST body verbatim."""
+        custom_id = "my-custom-id-abc12345"
+        captured = {}
+
+        async def mock_post(url, headers=None, json=None, **kw):
+            captured["body"] = json
+            return _mock_resp(200, {"Orders": [{"OrderID": "222", "Message": "Sent order"}]})
+
+        http_client._httpx.post = mock_post
+        await http_client.place_order(
+            account_id="SIM001", symbol="GCJ26", quantity="1",
+            order_type="Market", trade_action="Buy",
+            order_confirm_id=custom_id,
+        )
+
+        assert captured["body"]["OrderConfirmId"] == custom_id
+
+    @pytest.mark.asyncio
+    async def test_place_order_normal_success_returns_response_as_is(self, http_client):
+        """Normal 200 success response is returned unchanged."""
+        expected = {"Orders": [{"Message": "Sent order", "OrderID": "111"}]}
+        http_client._httpx.post = AsyncMock(return_value=_mock_resp(200, expected))
+
+        result = await http_client.place_order(
+            account_id="SIM001", symbol="GCJ26", quantity="1",
+            order_type="Market", trade_action="Buy",
+        )
+
+        assert result == expected
+
+    @pytest.mark.asyncio
+    async def test_place_order_duplicate_ack_resolves_via_get_orders(self, http_client):
+        """Dedup-ack: GET /orders lookup by confirm_id resolves to real OrderID."""
+        custom_id = "dedup-confirm-id-abcde"
+
+        dedup_body = _dedup_ack_body()
+        get_orders_response = _mock_resp(200, {
+            "Orders": [{"OrderID": "real-222", "OrderConfirmId": custom_id}]
+        })
+
+        post_resp = _mock_resp(200, dedup_body)
+        http_client._httpx.post = AsyncMock(return_value=post_resp)
+        http_client._httpx.get = AsyncMock(return_value=get_orders_response)
+
+        result = await http_client.place_order(
+            account_id="SIM001", symbol="GCJ26", quantity="1",
+            order_type="Market", trade_action="Buy",
+            order_confirm_id=custom_id,
+        )
+
+        assert "Orders" in result
+        assert result["Orders"][0]["OrderID"] == "real-222"
+        assert result["Orders"][0]["Message"].startswith("Dedup acknowledged")
+
+    @pytest.mark.asyncio
+    async def test_place_order_duplicate_ack_original_not_found_raises(self, http_client):
+        """Dedup-ack but GET /orders returns empty list → DuplicateOrderConfirmIdException."""
+        dedup_body = _dedup_ack_body()
+        post_resp = _mock_resp(200, dedup_body)
+        get_orders_resp = _mock_resp(200, {"Orders": []})
+
+        http_client._httpx.post = AsyncMock(return_value=post_resp)
+        http_client._httpx.get = AsyncMock(return_value=get_orders_resp)
+
+        with pytest.raises(DuplicateOrderConfirmIdException):
+            await http_client.place_order(
+                account_id="SIM001", symbol="GCJ26", quantity="1",
+                order_type="Market", trade_action="Buy",
+            )
+
+    @pytest.mark.asyncio
+    async def test_place_order_non_dedup_body_error_raises_OrderRejectedException(self, http_client):
+        """Non-dedup FAILED body raises OrderRejectedException; GET /orders not called."""
+        rejection_body = {
+            "Orders": [{"Error": "FAILED", "Message": "Insufficient buying power", "OrderID": "reject-999"}]
+        }
+        post_resp = _mock_resp(200, rejection_body)
+        get_mock = AsyncMock()
+
+        http_client._httpx.post = AsyncMock(return_value=post_resp)
+        http_client._httpx.get = get_mock
+
+        with pytest.raises(OrderRejectedException) as exc_info:
+            await http_client.place_order(
+                account_id="SIM001", symbol="GCJ26", quantity="1",
+                order_type="Market", trade_action="Buy",
+            )
+
+        assert "Insufficient buying power" in exc_info.value.ts_message
+        get_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_place_order_http_5xx_still_raises(self, http_client):
+        """HTTP 500 raises a generic exception (pre-existing behavior)."""
+        http_client._httpx.post = AsyncMock(return_value=_mock_resp(500, None))
+
+        with pytest.raises(Exception, match="Place order failed"):
+            await http_client.place_order(
+                account_id="SIM001", symbol="GCJ26", quantity="1",
+                order_type="Market", trade_action="Buy",
+            )
+
+
+# =============================================================================
+# Exception shape tests (Group C)
+# =============================================================================
+
+class TestExceptionShape:
+    """DuplicateOrderConfirmIdException and OrderRejectedException expose correct attrs."""
+
+    def test_DuplicateOrderConfirmIdException_exposes_confirm_id_and_message(self):
+        """.confirm_id and .message are accessible on the exception."""
+        exc = DuplicateOrderConfirmIdException(
+            message="TS duplicate message", confirm_id="abc123"
+        )
+        assert exc.confirm_id == "abc123"
+        assert exc.message == "TS duplicate message"
+
+    def test_OrderRejectedException_exposes_ts_message(self):
+        """.ts_message is accessible on the exception."""
+        exc = OrderRejectedException("Insufficient buying power")
+        assert exc.ts_message == "Insufficient buying power"

@@ -155,6 +155,29 @@ pip install -e ".[dev]"
 pytest tests/ -q
 ```
 
+## Order Idempotency
+
+`place_order()` and `place_order_group()` automatically inject an `OrderConfirmId` (max
+22 chars) into every POST. TradeStation uses this field to deduplicate — if the same
+confirm ID is received twice, the broker rejects the second submission without creating a
+duplicate order. This protects against duplicate fills on 5xx retries.
+
+You can supply your own ID via the optional kwarg:
+```python
+await client.place_order(..., order_confirm_id="my-unique-id-22chars")
+```
+If omitted, the adapter auto-generates a valid ID.
+
+**HTTP 200 does not mean success.** TradeStation returns 200 for rejected orders; the
+rejection is in the body (`Orders[0]["Error"] == "FAILED"`). The adapter raises:
+- `OrderRejectedException` — business rejection (insufficient margin, invalid symbol, etc.)
+- `DuplicateOrderConfirmIdException` — dedup-ack received but original order unfindable
+
+Both exceptions are exported from the top-level package:
+```python
+from tradestation_nt_community import OrderRejectedException, DuplicateOrderConfirmIdException
+```
+
 ## Known Constraints
 
 - `60-MINUTE` bar spec is invalid in NautilusTrader -- use `1-HOUR` instead
