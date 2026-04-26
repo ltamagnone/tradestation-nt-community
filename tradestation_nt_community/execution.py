@@ -108,6 +108,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         use_streaming: bool = False,
         streaming_reconnect_delay_secs: float = 5.0,
         extended_hours: bool = False,
+        order_map_path: str | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -150,8 +151,66 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 on_auth_error=self._client._ensure_authenticated,
             )
 
+        # Order-map persistence (T-2)
+        self._order_map_path: str | None = order_map_path
+
         # Account setup
         self._account_id_nautilus = AccountId(f"{self.id}-{account_id}")
+
+
+    def _persist_order_map(self) -> None:
+        """Persist _ts_order_id_to_client_order_id to disk for cross-restart recovery."""
+        if not self._order_map_path:
+            return
+        import json as _json, time as _time, os as _os
+        try:
+            now_s = _time.time()
+            # Merge with existing file to preserve entries from both directions
+            try:
+                with open(self._order_map_path, "r") as _f:
+                    existing = _json.load(_f)
+            except Exception:
+                existing = {}
+            # Update with current in-memory entries (add submitted_ts if missing)
+            for ts_id, coid in self._ts_order_id_to_client_order_id.items():
+                existing[ts_id] = {
+                    "client_order_id": str(coid),
+                    "submitted_ts": existing.get(ts_id, {}).get("submitted_ts", now_s),
+                }
+            tmp = self._order_map_path + f".{_os.getpid()}.tmp"
+            with open(tmp, "w") as _f:
+                _json.dump(existing, _f)
+            _os.replace(tmp, self._order_map_path)
+        except Exception as exc:
+            self._log.warning(f"[ORDER-MAP] Failed to persist order map: {exc}")
+
+    def _load_order_map(self) -> None:
+        """Load persisted order map at startup; prune entries older than 7 days."""
+        if not self._order_map_path:
+            return
+        import json as _json, time as _time
+        try:
+            with open(self._order_map_path, "r") as _f:
+                raw = _json.load(_f)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            self._log.warning(f"[ORDER-MAP] Failed to load order map: {exc}")
+            return
+        cutoff = _time.time() - 7 * 86400
+        loaded = pruned = 0
+        for ts_id, entry in raw.items():
+            if entry.get("submitted_ts", 0) < cutoff:
+                pruned += 1
+                continue
+            try:
+                coid = ClientOrderId(entry["client_order_id"])
+                self._ts_order_id_to_client_order_id[ts_id] = coid
+                self._client_order_id_to_ts_order_id[coid] = ts_id
+                loaded += 1
+            except Exception:
+                pass
+        self._log.info(f"[ORDER-MAP] Loaded {loaded} order ID mappings ({pruned} pruned >7d)")
 
     async def _connect(self) -> None:
         """Connect to TradeStation."""
@@ -182,6 +241,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 LogColor.GREEN,
             )
 
+        self._load_order_map()
         self._log.info("Connected to TradeStation", LogColor.GREEN)
 
     async def _disconnect(self) -> None:
@@ -470,6 +530,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Track order IDs
             self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
             self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
+            self._persist_order_map()
 
             # Generate order accepted event
             self.generate_order_accepted(
@@ -568,6 +629,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Register in tracking dicts
                 self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
+                self._persist_order_map()
 
                 # Generate accepted event for each leg
                 self.generate_order_accepted(
@@ -666,6 +728,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._ts_order_id_to_client_order_id.pop(ts_order_id, None)
                 self._ts_order_id_to_client_order_id[new_ts_order_id] = client_order_id
                 self._client_order_id_to_ts_order_id[client_order_id] = new_ts_order_id
+                self._persist_order_map()
                 venue_order_id = VenueOrderId(new_ts_order_id)
             else:
                 venue_order_id = VenueOrderId(ts_order_id)
