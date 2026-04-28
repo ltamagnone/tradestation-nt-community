@@ -168,6 +168,11 @@ def parse_order_status_report(
         qty_ordered = Decimal(ts_order.get("Quantity") or "0")
         qty_filled = Decimal(ts_order.get("FilledQuantity") or "0")
 
+        # TS returns Quantity=0 for rejected/cancelled-before-placed orders.
+        # NT's Quantity requires a positive value — skip rather than error.
+        if qty_ordered == 0:
+            return None
+
         price_str = ts_order.get("LimitPrice") or ts_order.get("Price") or "0"
         price = Price.from_str(price_str) if price_str != "0" else None
 
