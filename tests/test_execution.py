@@ -174,6 +174,12 @@ class TestPositionStubs:
         es = next(p for p in TSTestOrderStubs.positions() if p["Symbol"] == "ESM26")
         assert float(es["Quantity"]) < 0
 
+    def test_positions_have_average_price(self):
+        """Every position fixture entry must carry AveragePrice so avg_px_open is populated."""
+        for pos in TSTestOrderStubs.positions():
+            assert "AveragePrice" in pos, f"Missing AveragePrice in {pos}"
+            assert float(pos["AveragePrice"]) > 0, f"AveragePrice must be > 0, got {pos}"
+
 
 class TestReportCommandObjects:
     """Verify command objects used by execution client report methods.

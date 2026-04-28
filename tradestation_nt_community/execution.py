@@ -486,11 +486,15 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Determine side — PositionSide not OrderSide
                 position_side = PositionSide.LONG if quantity > 0 else PositionSide.SHORT
 
+                avg_px_str = ts_position.get("AveragePrice") or "0"
+                avg_px_open = Decimal(avg_px_str) if avg_px_str != "0" else None
+
                 report = PositionStatusReport(
                     account_id=self._account_id_nautilus,
                     instrument_id=position_instrument_id,
                     position_side=position_side,
                     quantity=Quantity.from_str(str(abs(quantity))),
+                    avg_px_open=avg_px_open,
                     report_id=UUID4(),
                     ts_last=self._clock.timestamp_ns(),
                     ts_init=self._clock.timestamp_ns(),
