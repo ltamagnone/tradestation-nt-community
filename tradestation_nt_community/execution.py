@@ -133,6 +133,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         # Fill detection — polling or streaming
         self._order_last_status: dict[str, str] = {}   # ts_order_id → last seen status
+
+        # PENDING_UPDATE recovery: stores the trigger_price requested by _modify_order.
+        # On 5xx the adapter emits no event, leaving the order stuck in PENDING_UPDATE
+        # indefinitely. _check_order_statuses uses this dict to compare TS's actual stop
+        # price and resolve PENDING_UPDATE within the next poll cycle (≤5 s).
+        self._pending_modify_trigger_price: dict[ClientOrderId, "Price | None"] = {}
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
 
@@ -689,6 +695,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
 
+        # Track the requested trigger price so _check_order_statuses can recover
+        # PENDING_UPDATE if a 5xx prevents the response from arriving.
+        self._pending_modify_trigger_price[client_order_id] = command.trigger_price
+
         try:
             symbol = str(order.instrument_id.symbol)
             ts_order_type = self._convert_order_type(order)
@@ -747,6 +757,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 trigger_price=command.trigger_price,
                 ts_event=self._clock.timestamp_ns(),
             )
+            self._pending_modify_trigger_price.pop(client_order_id, None)  # resolved
 
             self._log.info(
                 f"Order {client_order_id} modified → venue {venue_order_id}",
@@ -770,11 +781,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     reason=err[:150],
                     ts_event=self._clock.timestamp_ns(),
                 )
+                self._pending_modify_trigger_price.pop(client_order_id, None)  # resolved
             else:
                 # 5xx / network error: modify may have already succeeded at the
                 # broker before the error occurred. Emitting a rejection would
                 # create false state drift. Log and leave PENDING_UPDATE in place;
-                # the next reconciliation cycle will correct state.
+                # _check_order_statuses will compare TS's actual price next poll.
                 self._log.error(
                     f"Failed to modify order {client_order_id} "
                     f"(ambiguous — broker state unknown): {err}"
@@ -953,9 +965,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
             status = ts_order.get("Status", "")
             last_status = self._order_last_status.get(ts_order_id, "")
+            has_pending_amend = client_order_id in self._pending_modify_trigger_price
 
-            if status == last_status:
-                continue  # No change
+            # Normal skip: no status change and no pending amend to resolve.
+            # If a 5xx left an amend in-flight (has_pending_amend=True) we must
+            # process the order even when TS status is unchanged (still OPN/ACK).
+            if status == last_status and not has_pending_amend:
+                continue
 
             self._order_last_status[ts_order_id] = status
 
@@ -967,9 +983,69 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            # Skip if NautilusTrader already considers the order closed (idempotency guard)
+            # Skip if NautilusTrader already considers the order closed (idempotency guard).
+            # Also clean up any stale pending-amend record (e.g. SSE filled it first).
             if cached_order.is_closed:
+                self._pending_modify_trigger_price.pop(client_order_id, None)
                 continue
+
+            # --- PENDING_UPDATE recovery ---
+            # An in-flight amend had a 5xx: the adapter emitted no event, leaving the
+            # order stuck in PENDING_UPDATE. Compare TS's current stop price to the
+            # requested new price to decide whether the modify actually went through.
+            _TS_OPEN_STATUSES = ("OPN", "ACK", "FPR")
+            if cached_order.status == OrderStatus.PENDING_UPDATE and has_pending_amend:
+                if status not in _TS_OPEN_STATUSES:
+                    # Order closed/expired at TS (e.g. DAY order at market-close).
+                    # Discard the amend record and fall through to normal CAN/FLL/REJ
+                    # handling so the correct event is emitted.
+                    self._pending_modify_trigger_price.pop(client_order_id, None)
+                    self._log.info(
+                        f"[PENDING_UPDATE recovery] {client_order_id} no longer open "
+                        f"(status={status}) — deferring to normal handling"
+                    )
+                    # fall through — no continue
+                else:
+                    # Order is still open: compare prices to determine amend outcome.
+                    pending_tp = self._pending_modify_trigger_price.pop(client_order_id, None)
+                    ts_stop_str = ts_order.get("StopPrice") or ts_order.get("LimitPrice") or ""
+                    try:
+                        _price_match = False
+                        if pending_tp is not None and ts_stop_str:
+                            _price_match = abs(float(pending_tp) - float(ts_stop_str)) < 1e-6
+                        if _price_match:
+                            # TS has the new price — modify succeeded before the 5xx
+                            self.generate_order_updated(
+                                strategy_id=cached_order.strategy_id,
+                                instrument_id=cached_order.instrument_id,
+                                client_order_id=client_order_id,
+                                venue_order_id=VenueOrderId(ts_order_id),
+                                quantity=cached_order.quantity,
+                                price=None,
+                                trigger_price=pending_tp,
+                                ts_event=self._clock.timestamp_ns(),
+                            )
+                            self._log.info(
+                                f"[PENDING_UPDATE recovery] modify succeeded for {client_order_id}"
+                            )
+                        else:
+                            # TS still has old price — modify didn't go through; safe to reject
+                            self.generate_order_modify_rejected(
+                                strategy_id=cached_order.strategy_id,
+                                instrument_id=cached_order.instrument_id,
+                                client_order_id=client_order_id,
+                                venue_order_id=VenueOrderId(ts_order_id),
+                                reason="5xx recovery: TS stop price unchanged — treating as rejected",
+                                ts_event=self._clock.timestamp_ns(),
+                            )
+                            self._log.warning(
+                                f"[PENDING_UPDATE recovery] modify failed for {client_order_id} — rejecting"
+                            )
+                    except Exception as rec_e:
+                        self._log.error(
+                            f"[PENDING_UPDATE recovery] comparison failed for {client_order_id}: {rec_e}"
+                        )
+                    continue  # recovery handled this order — skip normal status processing
 
             venue_order_id = VenueOrderId(ts_order_id)
             ts_now = self._clock.timestamp_ns()
@@ -1156,6 +1232,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
                 ts_event=ts_now,
             )
+            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px}")
 
         elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
@@ -1166,6 +1243,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 ts_event=ts_now,
             )
+            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
 
         elif status in ("REJ", "BRO", "LAT"):

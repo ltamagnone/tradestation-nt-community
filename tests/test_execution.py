@@ -685,3 +685,207 @@ class TestCancelAllOrdersFiltering:
         await TradeStationExecutionClient._cancel_all_orders(m, cmd)
 
         m._client.cancel_order.assert_called_once_with(order_id="TS-601")
+
+
+# =============================================================================
+# PENDING_UPDATE recovery: _modify_order tracking + _check_order_statuses
+# =============================================================================
+
+def _make_modify_command_with_trigger(
+    client_order_id: str = "O-STOP",
+    ts_order_id: str = "TS-STOP",
+    trigger_price: float = 21050.0,
+) -> ModifyOrder:
+    """ModifyOrder with a trigger_price (stop-market amend)."""
+    return ModifyOrder(
+        TraderId("TRADER-001"),
+        StrategyId("S-001"),
+        InstrumentId(Symbol("NQM26"), Venue("TRADESTATION")),
+        ClientOrderId(client_order_id),
+        VenueOrderId(ts_order_id),
+        None,   # quantity unchanged
+        None,   # price unchanged
+        Price(trigger_price, 2),
+        UUID4(),
+        0,
+    )
+
+
+def _make_check_statuses_mock(
+    client_order_id: str = "O-STOP",
+    ts_order_id: str = "TS-STOP",
+    nt_order_status: OrderStatus = OrderStatus.PENDING_UPDATE,
+    ts_orders: list[dict] | None = None,
+) -> MagicMock:
+    """Minimal mock for _check_order_statuses tests."""
+    coid = ClientOrderId(client_order_id)
+    m = MagicMock()
+    m._ts_order_id_to_client_order_id = {ts_order_id: coid}
+    m._client_order_id_to_ts_order_id = {coid: ts_order_id}
+    m._order_last_status = {ts_order_id: "OPN"}
+    m._pending_modify_trigger_price = {}
+
+    cached_order = MagicMock()
+    cached_order.status = nt_order_status
+    cached_order.is_closed = False
+    cached_order.strategy_id = StrategyId("S-001")
+    cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
+    cached_order.quantity = Quantity.from_int(1)
+    m._cache = MagicMock()
+    m._cache.order.return_value = cached_order
+
+    if ts_orders is None:
+        ts_orders = [{"OrderID": ts_order_id, "Status": "OPN", "StopPrice": "21000.00"}]
+    m._client = MagicMock()
+    m._client.get_orders = AsyncMock(return_value=ts_orders)
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._log = MagicMock()
+    return m
+
+
+class TestPendingUpdateRecovery:
+    """PENDING_UPDATE recovery in _check_order_statuses after a 5xx in _modify_order."""
+
+    # --- _modify_order tracking ---
+
+    @pytest.mark.asyncio
+    async def test_4xx_clears_tracking(self):
+        """4xx: generate_order_modify_rejected fired and tracking entry removed."""
+        cmd = _make_modify_command_with_trigger()
+        m = _make_exec_mock(cmd)
+        m._pending_modify_trigger_price = {}
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 400): Invalid stop price")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+        assert cmd.client_order_id not in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_5xx_leaves_tracking_entry(self):
+        """5xx: no rejection event emitted, tracking entry remains for poll recovery."""
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _make_exec_mock(cmd)
+        m._pending_modify_trigger_price = {}
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable")
+        )
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_not_called()
+        assert cmd.client_order_id in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_success_clears_tracking(self):
+        """Success: generate_order_updated fired and tracking entry removed."""
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _make_exec_mock(cmd)
+        m._pending_modify_trigger_price = {}
+        m._ts_order_id_to_client_order_id = {}
+        m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-STOP"})
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_updated.assert_called_once()
+        assert cmd.client_order_id not in m._pending_modify_trigger_price
+
+    # --- _check_order_statuses recovery ---
+
+    @pytest.mark.asyncio
+    async def test_5xx_recovery_modify_succeeded(self):
+        """TS stop price matches new price: generate_order_updated clears PENDING_UPDATE."""
+        coid = ClientOrderId("O-STOP")
+        m = _make_check_statuses_mock(
+            ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21050.0"}]
+        )
+        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
+
+        await TradeStationExecutionClient._check_order_statuses(m)
+
+        m.generate_order_updated.assert_called_once()
+        m.generate_order_modify_rejected.assert_not_called()
+        assert coid not in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_5xx_recovery_modify_failed(self):
+        """TS stop price still old: generate_order_modify_rejected emitted."""
+        coid = ClientOrderId("O-STOP")
+        m = _make_check_statuses_mock(
+            ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21000.0"}]
+        )
+        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
+
+        await TradeStationExecutionClient._check_order_statuses(m)
+
+        m.generate_order_modify_rejected.assert_called_once()
+        m.generate_order_updated.assert_not_called()
+        assert coid not in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_market_closed_day_order_expired(self):
+        """CAN status: tracking entry cleared, generate_order_canceled fired (not modify_rejected)."""
+        coid = ClientOrderId("O-STOP")
+        cached_order = MagicMock()
+        cached_order.status = OrderStatus.PENDING_UPDATE
+        cached_order.is_closed = False
+        cached_order.strategy_id = StrategyId("S-001")
+        cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
+        cached_order.quantity = Quantity.from_int(1)
+
+        m = MagicMock()
+        m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
+        m._order_last_status = {"TS-STOP": "OPN"}
+        m._pending_modify_trigger_price = {coid: Price(21050.0, 2)}
+        m._cache = MagicMock()
+        m._cache.order.return_value = cached_order
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[{"OrderID": "TS-STOP", "Status": "CAN", "StopPrice": "21000.0"}]
+        )
+        m._clock = MagicMock()
+        m._clock.timestamp_ns.return_value = 0
+        m._log = MagicMock()
+
+        await TradeStationExecutionClient._check_order_statuses(m)
+
+        m.generate_order_canceled.assert_called_once()
+        m.generate_order_modify_rejected.assert_not_called()
+        m.generate_order_updated.assert_not_called()
+        assert coid not in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_sse_fill_clears_tracking(self):
+        """FLL via SSE (_process_order_event) pops the pending-amend entry (no leak)."""
+        coid = ClientOrderId("O-STOP")
+        instrument = MagicMock()
+        instrument.price_precision = 2
+        instrument.quote_currency = MagicMock()
+
+        cached_order = MagicMock()
+        cached_order.status = OrderStatus.PENDING_UPDATE
+        cached_order.is_closed = False
+        cached_order.strategy_id = StrategyId("S-001")
+        cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
+        cached_order.quantity = Quantity.from_int(1)
+        cached_order.side = MagicMock()
+        cached_order.order_type = MagicMock()
+
+        m = MagicMock()
+        m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
+        m._order_last_status = {}
+        m._pending_modify_trigger_price = {coid: Price(21050.0, 2)}
+        m._cache = MagicMock()
+        m._cache.order.return_value = cached_order
+        m._cache.instrument.return_value = instrument
+        m._clock = MagicMock()
+        m._clock.timestamp_ns.return_value = 0
+        m._log = MagicMock()
+
+        ts_fill_event = {
+            "OrderID": "TS-STOP",
+            "Status": "FLL",
+            "AveragePrice": "21000.00",
+            "FilledQuantity": "1",
+        }
+        await TradeStationExecutionClient._process_order_event(m, ts_fill_event)
+
+        m.generate_order_filled.assert_called_once()
+        assert coid not in m._pending_modify_trigger_price
