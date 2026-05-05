@@ -734,6 +734,7 @@ class TradeStationHttpClient:
         self,
         account_keys: str,
         since: str | None = None,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get orders for account(s).
@@ -744,6 +745,13 @@ class TradeStationHttpClient:
             Account key(s) — single or comma-separated.
         since : str, optional
             Return orders since this date (format: 'MM-DD-YYYY').
+            Note: empirically, TS ignores `since` for open/working orders —
+            all OPN/ACK orders appear regardless of placement date. Use
+            ``status='Open'`` instead when only working orders are needed.
+        status : str, optional
+            Filter by order status. Use ``'Open'`` to retrieve only working
+            orders (ACK/OPN/DON) without historical fills cluttering the
+            response. Case-sensitive — 'Open' not 'OPN'.
 
         Return
         -------
@@ -755,6 +763,8 @@ class TradeStationHttpClient:
         params: dict[str, str] = {}
         if since:
             params["since"] = since
+        if status:
+            params["status"] = status
         response = await self._request("GET", url, params=params)
         if response.status_code != 200:
             _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")

@@ -73,7 +73,7 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
     async def get_positions(self, account_keys: str) -> list[dict[str, Any]]:
         return json.loads((_RESOURCES / "positions_response.json").read_text())
 
-    async def get_orders(self, account_keys: str, since: str | None = None) -> list[dict[str, Any]]:
+    async def get_orders(self, account_keys: str, since: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         return [
             json.loads((_RESOURCES / "order_market_filled.json").read_text()),
             json.loads((_RESOURCES / "order_limit_open.json").read_text()),
