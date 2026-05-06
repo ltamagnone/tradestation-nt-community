@@ -141,6 +141,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._pending_modify_trigger_price: dict[ClientOrderId, "Price | None"] = {}
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
+        self._token_keepalive_task: asyncio.Task | None = None
+        self._TOKEN_KEEPALIVE_SECS: float = 600.0  # 10 min; TS tokens expire in 20 min
 
         # Streaming configuration
         self._use_streaming = use_streaming
@@ -239,6 +241,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._fill_poll_task = self._loop.create_task(
                 self._stream_order_fills()
             )
+            self._token_keepalive_task = self._loop.create_task(
+                self._token_keepalive_loop()
+            )
             self._log.info("Started order fill detection via SSE streaming", LogColor.GREEN)
         else:
             self._fill_poll_task = self._loop.create_task(self._poll_order_fills())
@@ -254,7 +259,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """Disconnect from TradeStation."""
         self._log.info("Disconnecting from TradeStation...")
 
-        # Stop fill polling
+        # Stop fill polling and token keepalive
         if self._fill_poll_task:
             self._fill_poll_task.cancel()
             try:
@@ -262,6 +267,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except asyncio.CancelledError:
                 pass
             self._fill_poll_task = None
+        if self._token_keepalive_task:
+            self._token_keepalive_task.cancel()
+            try:
+                await self._token_keepalive_task
+            except asyncio.CancelledError:
+                pass
+            self._token_keepalive_task = None
 
         await self._client.close()
         self._log.info("Disconnected from TradeStation", LogColor.GREEN)
@@ -1130,6 +1142,27 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=ts_now,
                 )
                 self._log.error(f"Order rejected: {client_order_id} ({reason})")
+
+    async def _token_keepalive_loop(self) -> None:
+        """Background task: keep the OAuth access token fresh in streaming mode.
+
+        In polling mode _poll_order_fills calls _check_order_statuses every 5 s, which
+        calls _get_headers → _ensure_authenticated — the token is never stale.  In
+        streaming mode the SSE loop only calls _check_order_statuses on reconnect, so
+        without this task the token expires silently after 20 min when no orders are
+        being placed.  Firing every 10 min guarantees _ensure_authenticated sees the
+        token within its 5-min refresh window before expiry.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._TOKEN_KEEPALIVE_SECS)
+                try:
+                    await self._client._ensure_authenticated()
+                    self._log.debug("Token keepalive: OK")
+                except Exception as e:
+                    self._log.error(f"Token keepalive failed: {e}")
+        except asyncio.CancelledError:
+            pass
 
     async def _stream_order_fills(self) -> None:
         """SSE streaming task: receive real-time order events and emit NT order events.
