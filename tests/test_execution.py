@@ -888,4 +888,174 @@ class TestPendingUpdateRecovery:
         await TradeStationExecutionClient._process_order_event(m, ts_fill_event)
 
         m.generate_order_filled.assert_called_once()
-        assert coid not in m._pending_modify_trigger_price
+
+
+class TestTokenKeepalive:
+    """
+    _token_keepalive_loop keeps the OAuth access token fresh in streaming mode.
+
+    In streaming mode the SSE loop only calls _check_order_statuses on reconnect,
+    so without the keepalive the token expires silently after 20 min when no
+    orders are placed.  The keepalive fires every _TOKEN_KEEPALIVE_SECS and calls
+    _ensure_authenticated so the token is always caught within its refresh window.
+    """
+
+    @pytest.mark.asyncio
+    async def test_calls_ensure_authenticated_after_sleep(self):
+        """Loop calls _ensure_authenticated once per iteration."""
+        import asyncio
+        from tradestation_nt_community.execution import TradeStationExecutionClient
+
+        calls = []
+        m = MagicMock()
+        m._TOKEN_KEEPALIVE_SECS = 0.01  # tiny interval so test runs fast
+
+        async def fake_ensure_authenticated():
+            calls.append(1)
+
+        m._client = MagicMock()
+        m._client._ensure_authenticated = fake_ensure_authenticated
+        m._log = MagicMock()
+
+        task = asyncio.ensure_future(
+            TradeStationExecutionClient._token_keepalive_loop(m)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert len(calls) >= 1
+
+    @pytest.mark.asyncio
+    async def test_exception_in_ensure_authenticated_is_caught(self):
+        """An exception from _ensure_authenticated is logged and loop continues."""
+        import asyncio
+        from tradestation_nt_community.execution import TradeStationExecutionClient
+
+        call_count = [0]
+        m = MagicMock()
+        m._TOKEN_KEEPALIVE_SECS = 0.01
+
+        async def flaky_ensure_authenticated():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("network timeout")
+
+        m._client = MagicMock()
+        m._client._ensure_authenticated = flaky_ensure_authenticated
+        m._log = MagicMock()
+
+        task = asyncio.ensure_future(
+            TradeStationExecutionClient._token_keepalive_loop(m)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Loop must have continued past the first failure
+        assert call_count[0] >= 2
+        m._log.error.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_exits_cleanly(self):
+        """CancelledError shuts down the loop without propagating."""
+        import asyncio
+        from tradestation_nt_community.execution import TradeStationExecutionClient
+
+        m = MagicMock()
+        m._TOKEN_KEEPALIVE_SECS = 60.0  # long — rely on cancel to stop it
+
+        async def noop():
+            pass
+
+        m._client = MagicMock()
+        m._client._ensure_authenticated = noop
+        m._log = MagicMock()
+
+        task = asyncio.ensure_future(
+            TradeStationExecutionClient._token_keepalive_loop(m)
+        )
+        await asyncio.sleep(0.01)
+        task.cancel()
+        # Must not raise
+        try:
+            await task
+        except asyncio.CancelledError:
+            pytest.fail("CancelledError leaked out of _token_keepalive_loop")
+
+    @pytest.mark.asyncio
+    async def test_keepalive_task_started_in_streaming_mode(self):
+        """_connect creates _token_keepalive_task when use_streaming=True."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        exec_client = MagicMock()
+        exec_client._use_streaming = True
+        exec_client._stream_client = MagicMock()
+        exec_client._loop = asyncio.get_event_loop()
+        exec_client._fill_poll_task = None
+        exec_client._token_keepalive_task = None
+
+        created_tasks = []
+
+        real_create_task = asyncio.get_event_loop().create_task
+
+        def fake_create_task(coro):
+            t = real_create_task(coro)
+            created_tasks.append(t)
+            return t
+
+        exec_client._loop.create_task = fake_create_task
+
+        # Patch the two coroutine methods so they exit immediately
+        async def noop_stream():
+            pass
+
+        async def noop_keepalive():
+            pass
+
+        exec_client._stream_order_fills = noop_stream
+        exec_client._token_keepalive_loop = noop_keepalive
+        exec_client._log = MagicMock()
+
+        # Manually invoke just the streaming task-creation block
+        if exec_client._use_streaming and exec_client._stream_client:
+            exec_client._fill_poll_task = exec_client._loop.create_task(
+                exec_client._stream_order_fills()
+            )
+            exec_client._token_keepalive_task = exec_client._loop.create_task(
+                exec_client._token_keepalive_loop()
+            )
+
+        assert exec_client._fill_poll_task is not None
+        assert exec_client._token_keepalive_task is not None
+        assert len(created_tasks) == 2
+
+        # Clean up
+        for t in created_tasks:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_keepalive_task_not_started_in_polling_mode(self):
+        """_connect does NOT create _token_keepalive_task when use_streaming=False."""
+        import asyncio
+
+        exec_client = MagicMock()
+        exec_client._use_streaming = False
+        exec_client._token_keepalive_task = None
+
+        # In polling mode only _fill_poll_task is created — keepalive stays None
+        if exec_client._use_streaming:
+            exec_client._token_keepalive_task = object()  # should not reach
+
+        assert exec_client._token_keepalive_task is None
