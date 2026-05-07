@@ -585,6 +585,7 @@ def _make_cancel_all_exec_mock(
     m._clock.timestamp_ns.return_value = 0
     m._log = MagicMock()
     m.generate_order_canceled = MagicMock()
+    m._check_order_statuses = AsyncMock()
     return m
 
 
@@ -685,6 +686,70 @@ class TestCancelAllOrdersFiltering:
         await TradeStationExecutionClient._cancel_all_orders(m, cmd)
 
         m._client.cancel_order.assert_called_once_with(order_id="TS-601")
+
+
+# =============================================================================
+# _cancel_order: concurrent fill recovery
+# =============================================================================
+
+class TestCancelOrderConcurrentFill:
+    """When broker returns 'Not an open order', _cancel_order must call
+    _check_order_statuses immediately so any concurrent fill is processed
+    before NT's ExecEngine times out and auto-generates OrderCanceled."""
+
+    def _make_cancel_order_mock(self, ts_order_id: str):
+        from nautilus_trader.model.identifiers import (
+            ClientOrderId,
+            InstrumentId,
+            Symbol,
+            Venue,
+        )
+        from nautilus_trader.model.identifiers import StrategyId, TraderId
+        from nautilus_trader.execution.messages import CancelOrder
+
+        m = MagicMock()
+        m._log = MagicMock()
+        m._client = MagicMock()
+        m._client_order_id_to_ts_order_id = {
+            ClientOrderId("O-EC-1"): ts_order_id,
+        }
+        m._check_order_statuses = AsyncMock()
+        m.generate_order_canceled = MagicMock()
+
+        cmd = CancelOrder(
+            trader_id=TraderId("TRADER-001"),
+            strategy_id=StrategyId("S-001"),
+            instrument_id=InstrumentId(Symbol("ECM26"), Venue("TRADESTATION")),
+            client_order_id=ClientOrderId("O-EC-1"),
+            venue_order_id=None,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+        return m, cmd
+
+    @pytest.mark.asyncio
+    async def test_check_order_statuses_called_on_concurrent_fill(self):
+        """_check_order_statuses fires immediately when cancel returns 'Not an open order'
+        so any concurrent fill is processed before NT's ExecEngine auto-cancels."""
+        m, cmd = self._make_cancel_order_mock("TS-950568948")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Not an open order"))
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m._log.warning.assert_called()
+        m.generate_order_canceled.assert_not_called()
+        m._check_order_statuses.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_check_order_statuses_not_called_on_other_error(self):
+        """Other cancel errors log as error and do not trigger _check_order_statuses."""
+        m, cmd = self._make_cancel_order_mock("TS-950568948")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Connection refused"))
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m._log.error.assert_called()
+        m._check_order_statuses.assert_not_called()
 
 
 # =============================================================================

@@ -840,13 +840,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # a synthetic cancel would put the order in a terminal state and cause
                 # NT to silently drop the fill → orphan position at broker.
                 #
-                # The downside: NT keeps the order as "open" until restart. Strategies
-                # will attempt cancel again next bar and get this warning again. This
-                # is acceptable noise compared to the risk of masking a real fill.
+                # Proactively run _check_order_statuses so the fill event is processed
+                # within seconds — before NT's ExecEngine times out and auto-generates
+                # an OrderCanceled (which would drop any subsequent SSE fill event).
                 self._log.warning(
                     f"Order {command.client_order_id} ({ts_order_id}) not found at broker "
-                    f"(expired DAY order or concurrent fill) — no cancel event generated"
+                    f"(expired DAY order or concurrent fill) — checking order statuses now"
                 )
+                await self._check_order_statuses()
             else:
                 self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
 
