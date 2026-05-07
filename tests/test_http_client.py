@@ -692,3 +692,74 @@ class TestExceptionShape:
         """.ts_message is accessible on the exception."""
         exc = OrderRejectedException("Insufficient buying power")
         assert exc.ts_message == "Insufficient buying power"
+
+
+class TestCachedHttpClientFactory:
+    """
+    Verify lru_cache singleton behaviour for get_cached_tradestation_http_client.
+
+    Critical invariant: every caller that should share the adapter's
+    _token_keepalive_loop MUST pass base_url and allow_custom_base_url
+    explicitly, even when the values are the defaults (None / False).
+    Python's lru_cache keys on ALL explicitly-passed kwargs, so omitting
+    them produces a different cache entry and a separate, un-refreshed
+    instance — the root cause of §52 (LESSONS_LEARNED).
+    """
+
+    def setup_method(self):
+        from tradestation_nt_community.factories import get_cached_tradestation_http_client
+        get_cached_tradestation_http_client.cache_clear()
+
+    def teardown_method(self):
+        from tradestation_nt_community.factories import get_cached_tradestation_http_client
+        get_cached_tradestation_http_client.cache_clear()
+
+    def test_implicit_and_explicit_defaults_are_different_cache_entries(self):
+        """Omitting base_url/allow_custom_base_url creates a second instance (the §52 bug)."""
+        from tradestation_nt_community.factories import get_cached_tradestation_http_client
+
+        explicit = get_cached_tradestation_http_client(
+            client_id="id", client_secret="sec", refresh_token="tok",
+            use_sandbox=True, base_url=None, allow_custom_base_url=False,
+        )
+        implicit = get_cached_tradestation_http_client(
+            client_id="id", client_secret="sec", refresh_token="tok",
+            use_sandbox=True,
+        )
+        assert explicit is not implicit, (
+            "lru_cache treats implicit defaults as a different key — "
+            "callers must always pass base_url and allow_custom_base_url explicitly"
+        )
+
+    def test_identical_explicit_kwargs_return_same_instance(self):
+        """Same explicit kwargs always hit the cache and return the same object."""
+        from tradestation_nt_community.factories import get_cached_tradestation_http_client
+
+        c1 = get_cached_tradestation_http_client(
+            client_id="id", client_secret="sec", refresh_token="tok",
+            use_sandbox=True, base_url=None, allow_custom_base_url=False,
+        )
+        c2 = get_cached_tradestation_http_client(
+            client_id="id", client_secret="sec", refresh_token="tok",
+            use_sandbox=True, base_url=None, allow_custom_base_url=False,
+        )
+        assert c1 is c2, "Identical explicit kwargs must return the cached singleton"
+
+    def test_run_paper_trading_kwargs_match_factory_kwargs(self):
+        """The exact kwargs used in run_paper_trading.py produce the same instance as factories.py."""
+        from tradestation_nt_community.factories import get_cached_tradestation_http_client
+
+        # Simulates factories.py (TradeStationLiveDataClientFactory / ExecClientFactory)
+        factory_client = get_cached_tradestation_http_client(
+            client_id="cid", client_secret="csec", refresh_token="rtok",
+            use_sandbox=True, base_url=None, allow_custom_base_url=False,
+        )
+        # Simulates run_paper_trading.py after the §52 fix
+        runner_client = get_cached_tradestation_http_client(
+            client_id="cid", client_secret="csec", refresh_token="rtok",
+            use_sandbox=True, base_url=None, allow_custom_base_url=False,
+        )
+        assert factory_client is runner_client, (
+            "run_paper_trading.py and factories.py must share the same HTTP client "
+            "so that _token_keepalive_loop refreshes the token used by HEAL/RECON/SWEEP"
+        )
