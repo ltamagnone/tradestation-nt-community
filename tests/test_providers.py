@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -351,3 +352,85 @@ async def test_load_option_contract_parses_correctly(
     assert float(instrument.strike_price) == pytest.approx(175.0, rel=1e-4)
     assert instrument.underlying == "AAPL"
     assert instrument.expiration_ns > 0
+
+
+# ---------------------------------------------------------------------------
+# Per-instrument timeout tests (zombie-startup prevention — §55)
+# ---------------------------------------------------------------------------
+
+class TestLoadSingleTimeout:
+    """_load_single must fail fast when the TS API hangs on an instrument."""
+
+    @pytest.mark.asyncio
+    async def test_slow_instrument_raises_timeout_error(
+        self,
+        instrument_provider,
+        mock_http_client,
+    ):
+        """_load_single raises TimeoutError when get_symbol_details exceeds _LOAD_TIMEOUT_S."""
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(999)  # simulate non-responsive TS API
+
+        mock_http_client.get_symbol_details.side_effect = _hang
+
+        iid = InstrumentId(Symbol("MCLN26"), TRADESTATION_VENUE)
+        # Temporarily shrink timeout so the test finishes in milliseconds.
+        original_timeout = instrument_provider._LOAD_TIMEOUT_S
+        instrument_provider._LOAD_TIMEOUT_S = 0.05
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await instrument_provider._load_single(iid)
+        finally:
+            instrument_provider._LOAD_TIMEOUT_S = original_timeout
+
+    @pytest.mark.asyncio
+    async def test_slow_instrument_in_batch_does_not_block_others(
+        self,
+        instrument_provider,
+        mock_http_client,
+    ):
+        """One slow instrument is cancelled; the fast one still loads."""
+        calls = []
+
+        async def _side_effect(symbol, *_args, **_kwargs):
+            calls.append(symbol)
+            if symbol == "GCG25":
+                await asyncio.sleep(999)  # simulate non-responsive TS API
+            return EQUITY_RESPONSE
+
+        mock_http_client.get_symbol_details.side_effect = _side_effect
+
+        ids = [
+            InstrumentId(Symbol("GCG25"), TRADESTATION_VENUE),
+            InstrumentId(Symbol("AAPL"), TRADESTATION_VENUE),
+        ]
+        original_timeout = instrument_provider._LOAD_TIMEOUT_S
+        instrument_provider._LOAD_TIMEOUT_S = 0.05
+        try:
+            await instrument_provider.load_ids_async(ids)  # must not raise or hang
+        finally:
+            instrument_provider._LOAD_TIMEOUT_S = original_timeout
+
+        assert instrument_provider.find(ids[0]) is None   # timed out — not loaded
+        assert instrument_provider.find(ids[1]) is not None  # fast one loaded fine
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_message_includes_symbol_and_duration(
+        self,
+        instrument_provider,
+        mock_http_client,
+    ):
+        """TimeoutError message identifies the symbol so operators know which contract hung."""
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(999)
+
+        mock_http_client.get_symbol_details.side_effect = _hang
+
+        iid = InstrumentId(Symbol("MCLN26"), TRADESTATION_VENUE)
+        original_timeout = instrument_provider._LOAD_TIMEOUT_S
+        instrument_provider._LOAD_TIMEOUT_S = 0.05
+        try:
+            with pytest.raises(asyncio.TimeoutError, match="MCLN26"):
+                await instrument_provider._load_single(iid)
+        finally:
+            instrument_provider._LOAD_TIMEOUT_S = original_timeout

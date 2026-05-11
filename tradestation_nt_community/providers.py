@@ -88,10 +88,27 @@ class TradeStationInstrumentProvider(InstrumentProvider):
             if isinstance(result, Exception):
                 self._log.error(f"Error loading instrument {iid}: {result}")
 
+    # Per-instrument HTTP timeout.  Must be > slowest observed valid load (~21 s for
+    # QMM26 in sandbox); set to 25 s so a non-responsive contract (e.g. next-month
+    # micro not yet listed in sandbox) fails after 25 s instead of the httpx default
+    # 30 s.  Without this guard a single slow instrument can consume the entire NT
+    # connection-timeout window, causing kernel.start_async() to return early before
+    # trader.start() is called — leaving the process alive but trading nothing.
+    _LOAD_TIMEOUT_S: float = 25.0
+
     async def _load_single(self, instrument_id: InstrumentId) -> None:
         """Fetch and register one instrument; raises on any failure."""
         symbol_str = instrument_id.symbol.value
-        symbol_data = await self._client.get_symbol_details(symbol_str)
+        try:
+            symbol_data = await asyncio.wait_for(
+                self._client.get_symbol_details(symbol_str),
+                timeout=self._LOAD_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(
+                f"timed out after {self._LOAD_TIMEOUT_S}s — "
+                f"TS API did not respond for {symbol_str}"
+            )
         instrument = self._parse_instrument(symbol_str, symbol_data)
         if instrument:
             self.add(instrument)
