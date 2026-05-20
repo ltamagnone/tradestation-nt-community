@@ -355,6 +355,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                             )
                             for bar in bars:
                                 self._handle_data(bar)
+                                self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
                             self._log.debug(
                                 f"Bar emitted (pre-gap) for {bar_type}: "
                                 f"ts={buffered_ts}"
@@ -365,6 +366,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                         )
                         for bar in bars:
                             self._handle_data(bar)
+                            self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
                         self._log.info(
                             f"Bar gap recovery for {bar_type}: emitted seed "
                             f"ts={event_ts}"
@@ -395,6 +397,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                         )
                         for bar in bars:
                             self._handle_data(bar)
+                            self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
                         self._log.debug(
                             f"Bar emitted for {bar_type}: ts={buffered_ts}"
                         )
@@ -503,6 +506,13 @@ class TradeStationDataClient(LiveMarketDataClient):
         now = _time.time()
         reconnected = 0
 
+        # Refresh OAuth token once before the loop — maintenance window may have
+        # let the token near expiry before streams are reconnected. (§70)
+        try:
+            await self._http_client._ensure_authenticated()
+        except Exception as e:
+            self._log.warning(f"Token refresh before stream reconnect failed: {e}")
+
         for bar_type, task in list(self._bar_subscriptions.items()):
             if stale_only:
                 last_ts = self._last_bar_ts.get(bar_type)
@@ -512,11 +522,10 @@ class TradeStationDataClient(LiveMarketDataClient):
                         last_dt = _dt.fromisoformat(last_ts.replace("Z", "+00:00"))
                         age = now - last_dt.timestamp()
                         if age < max_age_secs:
-                            continue
+                            continue  # genuinely fresh — skip
                     except Exception:
                         pass
-                elif not task.done():
-                    continue
+                # No timestamp → can't confirm freshness → fall through to reconnect (§70)
 
             task.cancel()
             try:
