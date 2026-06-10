@@ -247,6 +247,7 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             base_url_ws=config.base_url_ws,
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
+            streaming_status_poll_secs=config.streaming_status_poll_secs,
             extended_hours=config.extended_hours,
             order_map_path=config.order_map_path,
         )

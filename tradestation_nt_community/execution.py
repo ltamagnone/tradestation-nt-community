@@ -107,6 +107,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         base_url_ws: str | None = None,
         use_streaming: bool = False,
         streaming_reconnect_delay_secs: float = 5.0,
+        streaming_status_poll_secs: float = 60.0,
         extended_hours: bool = False,
         order_map_path: str | None = None,
     ) -> None:
@@ -143,6 +144,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
         self._token_keepalive_task: asyncio.Task | None = None
         self._TOKEN_KEEPALIVE_SECS: float = 600.0  # 10 min; TS tokens expire in 20 min
+        # §95: streaming-mode safety net — the SSE stream can go one-way-dead
+        # (heartbeats keep the connection alive while fill events are dropped),
+        # so a low-frequency status poll runs alongside it.  0 disables.
+        self._status_safety_poll_secs: float = streaming_status_poll_secs
+        self._status_safety_poll_task: asyncio.Task | None = None
 
         # Streaming configuration
         self._use_streaming = use_streaming
@@ -245,6 +251,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._token_keepalive_loop()
             )
             self._log.info("Started order fill detection via SSE streaming", LogColor.GREEN)
+            # §95: safety poll — recovers fills the SSE stream silently drops
+            if self._status_safety_poll_secs > 0:
+                self._status_safety_poll_task = self._loop.create_task(
+                    self._status_safety_poll_loop()
+                )
+                self._log.info(
+                    f"Started status safety poll (every {self._status_safety_poll_secs:.0f}s) "
+                    f"— catches fills missed by a silently-dead SSE stream",
+                    LogColor.GREEN,
+                )
         else:
             self._fill_poll_task = self._loop.create_task(self._poll_order_fills())
             self._log.info(
@@ -274,6 +290,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except asyncio.CancelledError:
                 pass
             self._token_keepalive_task = None
+        if self._status_safety_poll_task:
+            self._status_safety_poll_task.cancel()
+            try:
+                await self._status_safety_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._status_safety_poll_task = None
 
         await self._client.close()
         self._log.info("Disconnected from TradeStation", LogColor.GREEN)
@@ -946,6 +969,32 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except Exception as e:
                 self._log.error(f"Error in order fill polling: {e}")
                 await asyncio.sleep(5.0)
+
+    async def _status_safety_poll_loop(self) -> None:
+        """§95: low-frequency order-status poll alongside the SSE stream.
+
+        The order SSE stream can go one-way-dead: heartbeats keep arriving (so
+        the 90s read timeout never fires) while FLL events are silently
+        dropped.  Before this loop, `_check_order_statuses()` ran only on the
+        reconnect sentinel — missed fills stayed invisible for hours (observed
+        3h01m and 2h15m gaps in production paper trading, 2026-06-09/10),
+        leaving real broker positions with no exit orders and no ownership
+        record.  `_check_order_statuses()` is idempotent (skips unchanged
+        statuses and closed orders, no-ops when nothing is tracked), so this
+        is a pure safety net.
+        """
+        self._log.info(
+            f"Status safety poll loop started ({self._status_safety_poll_secs:.0f}s interval)"
+        )
+        while True:
+            try:
+                await asyncio.sleep(self._status_safety_poll_secs)
+                await self._check_order_statuses()
+            except asyncio.CancelledError:
+                self._log.info("Status safety poll loop stopped")
+                raise
+            except Exception as e:
+                self._log.error(f"Error in status safety poll: {e}")
 
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.

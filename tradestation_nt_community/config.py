@@ -105,5 +105,10 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     retry_delay_max_ms: int = 60000
     use_streaming: bool = True  # Use SSE order stream for fill notifications (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay
+    # §95: low-frequency HTTP status poll alongside the SSE stream.  The SSE
+    # stream can go one-way-dead (heartbeats flow, FLL events dropped) — without
+    # this net, missed fills stay invisible until a reconnect (observed 2-3h
+    # gaps in production paper trading).  0 disables.
+    streaming_status_poll_secs: float = 60.0
     extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)
     order_map_path: str | None = None  # Path to persist order-ID map across restarts (T-2)
