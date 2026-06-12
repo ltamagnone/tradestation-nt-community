@@ -3,17 +3,72 @@ Test stubs for TradeStation adapter tests.
 """
 import json
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.identifiers import InstrumentId, Symbol, Venue
+from nautilus_trader.model.enums import AssetClass, OrderSide, TimeInForce
+from nautilus_trader.model.identifiers import (
+    ClientOrderId,
+    InstrumentId,
+    StrategyId,
+    Symbol,
+    TraderId,
+    Venue,
+)
 from nautilus_trader.model.instruments import Equity, FuturesContract
 from nautilus_trader.model.objects import Price, Quantity
+from nautilus_trader.model.orders import MarketOrder
 
 
 RESOURCES = Path(__file__).parent / "resources"
+
+
+_DEFAULT_INSTRUMENT_ID = InstrumentId(Symbol("GCJ26"), Venue("TRADESTATION"))
+
+
+def make_market_order(
+    tags: Optional[list[str]] = None,
+    instrument_id: InstrumentId = _DEFAULT_INSTRUMENT_ID,
+    side: OrderSide = OrderSide.BUY,
+    quantity: int = 1,
+    client_order_id: str = "O-001",
+    strategy_id: str = "S-001",
+    trader_id: str = "T-001",
+) -> MarketOrder:
+    """Build a MarketOrder for use in tests.
+
+    Parameters
+    ----------
+    tags : list[str] or None
+        Optional order tags (e.g. ["purpose=exit", "heal"]).
+    instrument_id : InstrumentId
+        Instrument to trade (defaults to GCJ26.TRADESTATION).
+    side : OrderSide
+        BUY or SELL.
+    quantity : int
+        Number of contracts/shares.
+    client_order_id : str
+        Client-side order identifier string.
+    strategy_id : str
+        Strategy identifier string.
+    trader_id : str
+        Trader identifier string.
+    """
+    return MarketOrder(
+        trader_id=TraderId(trader_id),
+        strategy_id=StrategyId(strategy_id),
+        instrument_id=instrument_id,
+        client_order_id=ClientOrderId(client_order_id),
+        order_side=side,
+        quantity=Quantity.from_int(quantity),
+        time_in_force=TimeInForce.DAY,
+        init_id=UUID4(),
+        ts_init=0,
+        tags=tags,
+    )
 
 
 class TSTestInstrumentStubs:

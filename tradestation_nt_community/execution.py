@@ -3,11 +3,13 @@ TradeStation execution client implementation.
 """
 
 import asyncio
+import json
 from decimal import Decimal
 from typing import Any
 
 import pandas as pd
 
+from tradestation_nt_community._attribution import order_attribution
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
 from tradestation_nt_community.parsing.execution import convert_order_type
@@ -576,6 +578,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
             self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
             self._persist_order_map()
+
+            # Emit structured attribution log (Phase 0A)
+            self._log.info(
+                "[ORDER-SUBMIT] " + json.dumps(
+                    {**order_attribution(order), "ts_order_id": ts_order_id},
+                    sort_keys=True,
+                )
+            )
 
             # Generate order accepted event
             self.generate_order_accepted(
