@@ -1,0 +1,34 @@
+[
+  {
+    "OrderID": "TS-EXTERNAL-999",
+    "Status": "FLL",
+    "StatusDescription": "Filled",
+    "AccountID": "SIM0000001F",
+    "Symbol": "ESM26",
+    "OrderType": "Market",
+    "TradeAction": "Buy",
+    "TimeInForce": {"Duration": "DAY"},
+    "Quantity": "1",
+    "FilledQuantity": "1",
+    "AveragePrice": "5300.0",
+    "UnfilledQuantity": "0",
+    "OpenedDateTime": "2026-06-12T10:00:00Z",
+    "ClosedDateTime": "2026-06-12T10:00:01Z"
+  },
+  {
+    "OrderID": "TS-KNOWN-001",
+    "Status": "OPN",
+    "StatusDescription": "Open",
+    "AccountID": "SIM0000001F",
+    "Symbol": "GCJ26",
+    "OrderType": "Limit",
+    "LimitPrice": "3400.0",
+    "TradeAction": "Sell",
+    "TimeInForce": {"Duration": "DAY"},
+    "Quantity": "1",
+    "FilledQuantity": "0",
+    "AveragePrice": "0",
+    "UnfilledQuantity": "1",
+    "OpenedDateTime": "2026-06-12T10:05:00Z"
+  }
+]

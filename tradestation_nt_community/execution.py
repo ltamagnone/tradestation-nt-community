@@ -388,6 +388,23 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         f"Skipping order with empty Symbol during reconciliation: {ts_order}"
                     )
                     continue
+
+                # OBSERVE-ONLY: emit a structured debug line for every broker order that
+                # is (a) absent from the order-ID map AND (b) not in the NT cache.
+                # This is the "adopted/external order" gap — _check_order_statuses double-
+                # skips these orders, so fills on them are invisible to the safety poll.
+                # Task 2-1: measure frequency; do NOT register anything or change behavior.
+                if ts_order_id not in self._ts_order_id_to_client_order_id:
+                    if self._cache.order(client_order_id) is None:
+                        import json as _json
+                        self._log.debug("[RECON-SHADOW] " + _json.dumps({
+                            "event": "adopted_unmapped_order",
+                            "ts_order_id": ts_order_id,
+                            "minted_coid": str(client_order_id),
+                            "symbol": symbol,
+                            "status": ts_order.get("Status", ""),
+                        }, sort_keys=True))
+
                 order_instrument_id = instrument_id or InstrumentId.from_str(
                     f"{symbol}.TRADESTATION",
                 )
