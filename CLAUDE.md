@@ -85,6 +85,14 @@ Tests use a `MockTradeStationHttpClient` (in `tests/mock_http_client.py`) that r
 
 Core dependencies for the adapter: `nautilus_trader >= 1.200`, `httpx >= 0.27`, `pandas`.
 
+> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **352 passed**. Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
+
+## Observability (June 2026)
+
+Two structured, greppable log lines aid post-incident reconstruction (both additive, no behavior change):
+- **`[ORDER-SUBMIT]`** — emitted by `execution._submit_order` for every order we submit, carrying the order attribution (`client_order_id`, `strategy_id`, `instrument_id`, side, type, `tags`, `ts_order_id`) from `_attribution.order_attribution`. TradeStation has no round-tripping tag field, so attribution is kept on our side.
+- **`[RECON-SHADOW]`** (observe-only) — emitted by `generate_order_status_reports` for any broker order absent from `_ts_order_id_to_client_order_id` **and** the NT cache: the "adopted/external order" gap where `_check_order_statuses` (the §95 safety poll) double-skips, so a dropped fill is invisible. This **measures** the gap (it does not fix it — no map registration, no behavior change); a later phase uses the soak data to close it.
+
 ## Known Constraints
 
 - `60-MINUTE` bar spec is invalid in NautilusTrader -- use `1-HOUR`
