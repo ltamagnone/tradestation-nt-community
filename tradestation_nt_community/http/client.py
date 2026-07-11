@@ -275,15 +275,24 @@ class TradeStationHttpClient:
         barsback : int, optional
             Number of bars to retrieve (alternative to date range).
         first_date : str, optional
-            Start date in format 'MM-DD-YYYY' or 'MM-DD-YYYY HH:MM'.
+            Start date in ISO format 'YYYY-MM-DD' (e.g. '2026-01-01'). Other formats
+            (e.g. 'MM-DD-YYYY') are rejected by the API with HTTP 400 "Invalid
+            firstdate format" — confirmed empirically, 2026-07-11.
         last_date : str, optional
-            End date in format 'MM-DD-YYYY' or 'MM-DD-YYYY HH:MM'.
+            End date in ISO format 'YYYY-MM-DD', same constraint as first_date.
 
         Return
         -------
         list[dict[str, Any]]
             List of bar data dictionaries.
 
+        Notes
+        -----
+        TradeStation enforces a hard per-request cap of 57,600 intraday bars —
+        confirmed via the API's own error message ("Request exceeds history limit: a
+        maximum of 57600 intraday bars is allowed") — regardless of whether the
+        request uses `barsback` or a `first_date`/`last_date` range. Callers needing
+        more history than that must paginate across multiple date-range requests.
         """
         url = f"{self.base_url}/marketdata/barcharts/{symbol}"
         params: dict[str, str] = {"interval": interval, "unit": unit.value}
