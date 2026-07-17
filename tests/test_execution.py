@@ -789,6 +789,8 @@ def _make_check_statuses_mock(
     m._client_order_id_to_ts_order_id = {coid: ts_order_id}
     m._order_last_status = {ts_order_id: "OPN"}
     m._pending_modify_trigger_price = {}
+    m._cancel_verify_pending = {}
+    m._verify_pending_cancels = AsyncMock()
 
     cached_order = MagicMock()
     cached_order.status = nt_order_status
@@ -899,6 +901,8 @@ class TestPendingUpdateRecovery:
         m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
         m._order_last_status = {"TS-STOP": "OPN"}
         m._pending_modify_trigger_price = {coid: Price(21050.0, 2)}
+        m._cancel_verify_pending = {}
+        m._verify_pending_cancels = AsyncMock()
         m._cache = MagicMock()
         m._cache.order.return_value = cached_order
         m._client = MagicMock()

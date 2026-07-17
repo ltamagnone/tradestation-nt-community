@@ -4,6 +4,7 @@ TradeStation execution client implementation.
 
 import asyncio
 import json
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -97,6 +98,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     """
 
+    # §111: post-cancel verification (QMU26/RTYU26/CLQ26 — TS sim confirmed the
+    # cancel but kept the order live on its book).
+    _CANCEL_VERIFY_MIN_AGE_S = 120.0
+    _CANCEL_VERIFY_MAX_ATTEMPTS = 3
+
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
@@ -151,6 +157,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # so a low-frequency status poll runs alongside it.  0 disables.
         self._status_safety_poll_secs: float = streaming_status_poll_secs
         self._status_safety_poll_task: asyncio.Task | None = None
+
+        # §111: post-cancel zombie verification — orders this session already
+        # reported cancelled, checked against the safety poll's own order fetch.
+        # In-memory only: cross-restart zombies remain the agent orphan scan's job.
+        self._cancel_verify_pending: dict[str, tuple[float, int]] = {}
 
         # Streaming configuration
         self._use_streaming = use_streaming
@@ -876,6 +887,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 venue_order_id=VenueOrderId(ts_order_id),
                 ts_event=self._clock.timestamp_ns(),
             )
+            self._register_cancel_verify(ts_order_id)  # §111
 
             self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
 
@@ -957,6 +969,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     venue_order_id=venue_order_id,
                     ts_event=self._clock.timestamp_ns(),
                 )
+                self._register_cancel_verify(ts_order_id)  # §111
                 self._log.info(
                     f"Cancelled order {order.client_order_id} ({ts_order_id})"
                 )
@@ -1023,6 +1036,54 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except Exception as e:
                 self._log.error(f"Error in status safety poll: {e}")
 
+    def _register_cancel_verify(self, ts_order_id: str) -> None:
+        """Queue a cancelled order for §111 zombie verification (idempotent)."""
+        if ts_order_id and ts_order_id not in self._cancel_verify_pending:
+            self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0)
+
+    async def _verify_pending_cancels(self, orders: list) -> None:
+        """§111: re-check every order reported cancelled against the broker's own
+        order list; if still ACK/OPN/FPR >=_CANCEL_VERIFY_MIN_AGE_S later, re-issue
+        the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Safe by construction:
+        only orders our session already decided/observed to cancel are targeted —
+        no new cancel decision is ever made here.  In-memory only: zombies from a
+        prior process (before restart) are out of scope here — the agent's own
+        orphan scan is the cross-restart backstop.
+        """
+        if not self._cancel_verify_pending:
+            return
+        now = time.monotonic()
+        open_status = {
+            o.get("OrderID"): o.get("Status")
+            for o in orders
+            if o.get("Status") in ("ACK", "OPN", "FPR")
+        }
+        for ts_order_id in list(self._cancel_verify_pending):
+            first_seen, attempts = self._cancel_verify_pending[ts_order_id]
+            if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S:
+                continue
+            if ts_order_id not in open_status:
+                del self._cancel_verify_pending[ts_order_id]
+                continue
+            if attempts >= self._CANCEL_VERIFY_MAX_ATTEMPTS:
+                self._log.error(
+                    f"[CANCEL-ZOMBIE] Order {ts_order_id} still open after "
+                    f"{attempts} re-cancel attempts — giving up (the agent's "
+                    f"orphan scan will flag it)"
+                )
+                del self._cancel_verify_pending[ts_order_id]
+                continue
+            self._log.warning(
+                f"[CANCEL-ZOMBIE] Order {ts_order_id} was reported cancelled but is "
+                f"still {open_status[ts_order_id]} at the broker — re-issuing cancel "
+                f"(attempt {attempts + 1}/{self._CANCEL_VERIFY_MAX_ATTEMPTS}, §111)"
+            )
+            try:
+                await self._client.cancel_order(order_id=ts_order_id)
+            except Exception as e:
+                self._log.warning(f"[CANCEL-ZOMBIE] re-cancel failed for {ts_order_id}: {e}")
+            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1)
+
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.
 
@@ -1032,7 +1093,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
           CAN / UCN / OUT / EXP / DON → canceled/expired → generate_order_canceled
           REJ / BRO / LAT → rejected → generate_order_rejected
         """
-        if not self._ts_order_id_to_client_order_id:
+        if not self._ts_order_id_to_client_order_id and not self._cancel_verify_pending:
             return  # Nothing tracked yet
 
         try:
@@ -1042,6 +1103,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Fill poll: failed to fetch orders: {e}")
             return
+
+        await self._verify_pending_cancels(orders)  # §111
 
         for ts_order in orders:
             ts_order_id = ts_order.get("OrderID")
@@ -1206,6 +1269,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     venue_order_id=venue_order_id,
                     ts_event=ts_now,
                 )
+                self._register_cancel_verify(ts_order_id)  # §111
                 self._log.info(f"Order canceled: {client_order_id} (status={status})")
 
             elif status in ("REJ", "BRO", "LAT"):
@@ -1353,6 +1417,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 venue_order_id=venue_order_id,
                 ts_event=ts_now,
             )
+            self._register_cancel_verify(ts_order_id)  # §111
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
 
