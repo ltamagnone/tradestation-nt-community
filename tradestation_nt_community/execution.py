@@ -1252,7 +1252,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         ts_event=ts_now,
                     )
                     self._log.info(
-                        f"Order filled: {client_order_id} @ {fill_px} qty={filled_qty}",
+                        f"Order filled: {client_order_id} @ {fill_px} qty={filled_qty} "
+                        f"[fill-source=status-poll]",
                         LogColor.GREEN,
                     )
                 except Exception as e:
@@ -1407,7 +1408,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_event=ts_now,
             )
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
-            self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px}")
+            self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px} [fill-source=sse]")
 
         elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
             self.generate_order_canceled(
