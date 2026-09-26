@@ -28,7 +28,8 @@ def _iso_ago(minutes: float) -> str:
     return datetime.fromtimestamp(time.time() - minutes * 60, tz=timezone.utc).isoformat()
 
 
-async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = True):
+async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = True,
+               **kw):
     """Return the set of bar types whose task was cancelled (= reconnected)."""
     tasks = {bt: asyncio.get_running_loop().create_task(asyncio.sleep(3600)) for bt in ages_min}
     fake = types.SimpleNamespace(
@@ -42,7 +43,7 @@ async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = Tr
         _loop=asyncio.get_running_loop(),
     )
     await TradeStationDataClient.reconnect_bar_streams(
-        fake, stale_only=stale_only, max_age_secs=max_age_secs)
+        fake, stale_only=stale_only, max_age_secs=max_age_secs, **kw)
     out = {bt for bt, t in tasks.items() if t.cancelled()}
     for t in tasks.values():
         t.cancel()
@@ -90,16 +91,31 @@ def test_bar_interval_secs():
 
 
 async def test_unparseable_bar_type_uses_max_age_secs():
-    bad = "not-a-bar-type"  # dict key without .spec → default threshold
-    tasks = {bad: asyncio.get_running_loop().create_task(asyncio.sleep(3600))}
-    fake = types.SimpleNamespace(
-        _use_streaming=True, _stream_client=object(),
-        _http_client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
-        _bar_subscriptions=dict(tasks), _last_bar_ts={bad: _iso_ago(20)},
-        _cache=types.SimpleNamespace(instrument=lambda iid: None),
-        _log=MagicMock(), _loop=asyncio.get_running_loop(),
-    )
-    # 20 min < 1800 s → fresh, skipped before any bar_type attribute is touched
-    await TradeStationDataClient.reconnect_bar_streams(fake, stale_only=True, max_age_secs=1800)
-    assert not tasks[bad].cancelled()
-    tasks[bad].cancel()
+    """40 min idle, max_age 30 min: with the fallback it IS reconnected. If an
+    unknown interval were treated as e.g. 1 hour (threshold 2 h), it would not."""
+    class _OddBarType:  # hashable; aggregation the adapter has no interval for
+        spec = types.SimpleNamespace(step=100, aggregation="TICK")
+        instrument_id = types.SimpleNamespace(symbol=types.SimpleNamespace(value="ESZ26"))
+
+    bad = _OddBarType()
+    assert await _run({bad: 40}) == {bad}
+
+
+# ── bar_types scoping (fix round 2) ────────────────────────────────────────
+
+async def test_bar_types_scopes_reconnect_to_listed_streams():
+    # M15 idle 3 h is stale on its own merits but NOT listed → untouched.
+    out = await _run({M15: 180, H1: 125}, bar_types=[H1])
+    assert out == {H1}
+
+
+async def test_bar_types_listed_but_fresh_is_not_reconnected():
+    assert await _run({H1: 45, M15: 180}, bar_types=[H1]) == set()
+
+
+async def test_bar_types_empty_touches_nothing():
+    assert await _run({M15: 180}, bar_types=[]) == set()
+
+
+async def test_bar_types_none_keeps_global_sweep():
+    assert await _run({M15: 180, H1: 125}, bar_types=None) == {M15, H1}

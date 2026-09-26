@@ -502,7 +502,12 @@ class TradeStationDataClient(LiveMarketDataClient):
         self._last_bar_ts.pop(bar_type, None)
         self._log.info(f"Unsubscribed from {bar_type}")
 
-    async def reconnect_bar_streams(self, stale_only: bool = True, max_age_secs: float = 7200) -> int:
+    async def reconnect_bar_streams(
+        self,
+        stale_only: bool = True,
+        max_age_secs: float = 7200,
+        bar_types=None,
+    ) -> int:
         """Cancel and restart bar SSE streams.
 
         Parameters
@@ -516,6 +521,11 @@ class TradeStationDataClient(LiveMarketDataClient):
             If False, reconnect ALL bar streams.
         max_age_secs : float, default 7200
             Minimum age threshold (seconds) for considering a stream stale.
+        bar_types : Iterable[BarType], optional
+            If given, only these subscriptions are considered (still subject to
+            ``stale_only`` and their threshold); every other stream is left
+            untouched. An empty iterable reconnects nothing. ``None`` (default)
+            considers all bar subscriptions.
 
         Returns
         -------
@@ -536,7 +546,10 @@ class TradeStationDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.warning(f"Token refresh before stream reconnect failed: {e}")
 
+        wanted = None if bar_types is None else set(bar_types)
         for bar_type, task in list(self._bar_subscriptions.items()):
+            if wanted is not None and bar_type not in wanted:
+                continue
             if stale_only:
                 last_ts = self._last_bar_ts.get(bar_type)
                 if last_ts:
