@@ -1,0 +1,105 @@
+"""reconnect_bar_streams(stale_only=True): per-bar-type staleness threshold.
+
+Found 2026-09-26: the node's stream watchdog passes max_age_secs=1800. With a
+single threshold, a pass triggered by one stale 15-min stream also tore down
+every hourly/daily stream idle 30-60+ min — normal for those bar sizes. The
+threshold is now max(max_age_secs, 2 x bar interval) per subscription.
+
+These call the REAL method on a minimal fake `self` (no stub replica).
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+import types
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+from nautilus_trader.model.data import BarType
+
+from tradestation_nt_community.data import TradeStationDataClient
+
+H1 = BarType.from_str("GCZ26.TRADESTATION-1-HOUR-LAST-EXTERNAL")
+M15 = BarType.from_str("ESZ26.TRADESTATION-15-MINUTE-LAST-EXTERNAL")
+D1 = BarType.from_str("FDAXZ26.TRADESTATION-1-DAY-LAST-EXTERNAL")
+
+
+def _iso_ago(minutes: float) -> str:
+    return datetime.fromtimestamp(time.time() - minutes * 60, tz=timezone.utc).isoformat()
+
+
+async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = True):
+    """Return the set of bar types whose task was cancelled (= reconnected)."""
+    tasks = {bt: asyncio.get_running_loop().create_task(asyncio.sleep(3600)) for bt in ages_min}
+    fake = types.SimpleNamespace(
+        _use_streaming=True,
+        _stream_client=object(),
+        _http_client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
+        _bar_subscriptions=dict(tasks),
+        _last_bar_ts={bt: _iso_ago(m) for bt, m in ages_min.items() if m is not None},
+        _cache=types.SimpleNamespace(instrument=lambda iid: None),  # skip re-create
+        _log=MagicMock(),
+        _loop=asyncio.get_running_loop(),
+    )
+    await TradeStationDataClient.reconnect_bar_streams(
+        fake, stale_only=stale_only, max_age_secs=max_age_secs)
+    out = {bt for bt, t in tasks.items() if t.cancelled()}
+    for t in tasks.values():
+        t.cancel()
+    return out
+
+
+async def test_hourly_stream_45_min_is_not_reconnected():
+    assert await _run({H1: 45}) == set()
+
+
+async def test_hourly_stream_125_min_is_reconnected():
+    assert await _run({H1: 125}) == {H1}
+
+
+async def test_15_min_stream_35_min_is_reconnected():
+    assert await _run({M15: 35}) == {M15}
+
+
+async def test_mixed_pass_reconnects_only_the_stale_one():
+    assert await _run({M15: 35, H1: 45, D1: 600}) == {M15}
+
+
+async def test_max_age_secs_is_a_floor():
+    # 15-min bars: 2 x 15 min = 30 min < 7200 s floor → 60 min idle is fresh
+    assert await _run({M15: 60}, max_age_secs=7200) == set()
+
+
+async def test_stale_only_false_reconnects_all():
+    assert await _run({H1: 1, M15: 1}, stale_only=False) == {H1, M15}
+
+
+async def test_no_timestamp_still_reconnects():
+    assert await _run({H1: None}) == {H1}
+
+
+def test_bar_interval_secs():
+    from tradestation_nt_community.data import _bar_interval_secs
+
+    assert _bar_interval_secs(M15) == 900
+    assert _bar_interval_secs(H1) == 3600
+    assert _bar_interval_secs(D1) == 86400
+    assert _bar_interval_secs(BarType.from_str("ESZ26.TRADESTATION-100-TICK-LAST-EXTERNAL")) is None
+    assert _bar_interval_secs("garbage") is None
+    assert _bar_interval_secs(None) is None
+
+
+async def test_unparseable_bar_type_uses_max_age_secs():
+    bad = "not-a-bar-type"  # dict key without .spec → default threshold
+    tasks = {bad: asyncio.get_running_loop().create_task(asyncio.sleep(3600))}
+    fake = types.SimpleNamespace(
+        _use_streaming=True, _stream_client=object(),
+        _http_client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
+        _bar_subscriptions=dict(tasks), _last_bar_ts={bad: _iso_ago(20)},
+        _cache=types.SimpleNamespace(instrument=lambda iid: None),
+        _log=MagicMock(), _loop=asyncio.get_running_loop(),
+    )
+    # 20 min < 1800 s → fresh, skipped before any bar_type attribute is touched
+    await TradeStationDataClient.reconnect_bar_streams(fake, stale_only=True, max_age_secs=1800)
+    assert not tasks[bad].cancelled()
+    tasks[bad].cancel()

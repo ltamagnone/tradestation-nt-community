@@ -40,6 +40,25 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
 
+_BAR_AGG_SECS = {
+    BarAggregation.MINUTE: 60,
+    BarAggregation.HOUR: 3600,
+    BarAggregation.DAY: 86400,
+}
+
+
+def _bar_interval_secs(bar_type) -> int | None:
+    """Bar interval in seconds (step x MINUTE/HOUR/DAY); None if unknown/unparseable."""
+    try:
+        spec = bar_type.spec
+        unit = _BAR_AGG_SECS.get(spec.aggregation)
+        if unit is None or spec.step <= 0:
+            return None
+        return int(spec.step) * unit
+    except Exception:
+        return None
+
+
 class TradeStationDataClient(LiveMarketDataClient):
     """
     Provide a data client for TradeStation.
@@ -489,10 +508,14 @@ class TradeStationDataClient(LiveMarketDataClient):
         Parameters
         ----------
         stale_only : bool, default True
-            If True, only reconnect streams that haven't received data in
-            ``max_age_secs``. If False, reconnect ALL bar streams.
+            If True, only reconnect streams that haven't received data within
+            their threshold: ``max(max_age_secs, 2 x bar interval)`` per
+            subscription, so an hourly stream 45 min after its last bar is not
+            torn down by a 30-min pass (unknown interval → ``max_age_secs``).
+            A stream with no recorded bar timestamp is always reconnected.
+            If False, reconnect ALL bar streams.
         max_age_secs : float, default 7200
-            Age threshold (seconds) for considering a stream stale.
+            Minimum age threshold (seconds) for considering a stream stale.
 
         Returns
         -------
@@ -521,7 +544,11 @@ class TradeStationDataClient(LiveMarketDataClient):
                         from datetime import datetime as _dt
                         last_dt = _dt.fromisoformat(last_ts.replace("Z", "+00:00"))
                         age = now - last_dt.timestamp()
-                        if age < max_age_secs:
+                        interval = _bar_interval_secs(bar_type)
+                        threshold = (
+                            max(max_age_secs, 2 * interval) if interval else max_age_secs
+                        )
+                        if age < threshold:
                             continue  # genuinely fresh — skip
                     except Exception:
                         pass
