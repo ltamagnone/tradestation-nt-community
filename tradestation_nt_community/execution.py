@@ -873,6 +873,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         if not ts_order_id:
             self._log.error(f"Cannot find TradeStation order ID for {command.client_order_id}")
+            # Reject rather than stay silent: NT otherwise holds the order PENDING_CANCEL
+            # until its in-flight check resolves it — possibly by synthesizing OrderCanceled
+            # for an order that is live at the broker (2026-09-26).
+            self.generate_order_cancel_rejected(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=command.client_order_id,
+                venue_order_id=None,
+                reason="no TradeStation order id yet (not acknowledged)",
+                ts_event=self._clock.timestamp_ns(),
+            )
             return
 
         try:
@@ -912,6 +923,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 await self._check_order_statuses()
             else:
                 self._log.error(f"Failed to cancel order {command.client_order_id}: {e}")
+                # The order is still working at the broker as far as we know — say so, so
+                # NT reverts PENDING_CANCEL immediately instead of guessing later.
+                self.generate_order_cancel_rejected(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=command.client_order_id,
+                    venue_order_id=VenueOrderId(ts_order_id),
+                    reason=f"cancel failed: {e}"[:200],
+                    ts_event=self._clock.timestamp_ns(),
+                )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         """Cancel all orders for a specific instrument and strategy.

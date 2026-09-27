@@ -752,6 +752,58 @@ class TestCancelOrderConcurrentFill:
         m._check_order_statuses.assert_not_called()
 
 
+class TestCancelOrderRejectedEmission(TestCancelOrderConcurrentFill):
+    """A cancel that genuinely failed emits OrderCancelRejected (2026-09-26).
+
+    Before, the failure was only logged: NT held the order PENDING_CANCEL until its
+    in-flight check re-queried the status (~5-25 s), and if that query also failed NT
+    synthesized OrderCanceled for an order still live at the broker. Emitting the
+    rejection reverts the order immediately (PENDING_CANCEL -> previous status), so
+    strategies see the truth: the order is still working.
+    "Not an open order" is NOT a rejection — the order is gone (filled / expired) and
+    the fill path owns it, exactly as before.
+    """
+
+    @pytest.mark.asyncio
+    async def test_genuine_failure_emits_cancel_rejected(self):
+        m, cmd = self._make_cancel_order_mock("950568948")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Connection refused"))
+        m.generate_order_cancel_rejected = MagicMock()
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m.generate_order_cancel_rejected.assert_called_once()
+        kw = m.generate_order_cancel_rejected.call_args.kwargs
+        assert str(kw["client_order_id"]) == "O-EC-1"
+        assert str(kw["venue_order_id"]) == "950568948"
+        assert "Connection refused" in kw["reason"]
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_ts_order_id_emits_cancel_rejected(self):
+        m, cmd = self._make_cancel_order_mock("950568948")
+        m._client_order_id_to_ts_order_id = {}
+        m._client.cancel_order = AsyncMock()
+        m.generate_order_cancel_rejected = MagicMock()
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m._client.cancel_order.assert_not_awaited()
+        m.generate_order_cancel_rejected.assert_called_once()
+        assert m.generate_order_cancel_rejected.call_args.kwargs["venue_order_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_not_an_open_order_is_not_a_rejection(self):
+        m, cmd = self._make_cancel_order_mock("950568948")
+        m._client.cancel_order = AsyncMock(side_effect=Exception("Not an open order"))
+        m.generate_order_cancel_rejected = MagicMock()
+
+        await TradeStationExecutionClient._cancel_order(m, cmd)
+
+        m.generate_order_cancel_rejected.assert_not_called()
+        m._check_order_statuses.assert_called_once()
+
+
 # =============================================================================
 # PENDING_UPDATE recovery: _modify_order tracking + _check_order_statuses
 # =============================================================================
