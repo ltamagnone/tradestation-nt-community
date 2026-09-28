@@ -99,6 +99,7 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 - TradeStation rejects FOK orders -- use `TimeInForce.DAY`
 - `reduce_only` is silently ignored (no broker-side effect)
 - Only full fills (FLL) trigger fill reports; no partial fill (FLP) handling
+- `DON` (done for day) on a **GTC** order is a session pause, not a cancel — the order stays working at the broker and resumes next session; only a **DAY** order's `DON` is a real cancel (§140)
 - Options: instrument loading works, but order submission is not implemented
 - TradeStation uses SSE (not WebSocket) for streaming
 - Instruments should be pre-loaded via `instrument_ids` config for reliable subscriptions
