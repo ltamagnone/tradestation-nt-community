@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+import types
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+from tradestation_nt_community.data import TradeStationDataClient
 
 
 # ---------------------------------------------------------------------------
@@ -245,42 +248,30 @@ class TestReconnectRefreshesTokenFirst:
 
     @pytest.mark.asyncio
     async def test_reconnect_bar_streams_calls_ensure_authenticated(self):
-        """Integration-level check: reconnect_bar_streams calls _ensure_authenticated.
+        """Integration-level check: reconnect_bar_streams calls _client._ensure_authenticated.
 
-        Uses AsyncMock to patch the HTTP client and verify the call is made
-        even when no streams are actually reconnected.
+        Calls the REAL TradeStationDataClient.reconnect_bar_streams on a minimal
+        fake self to ensure token refresh is invoked before iterating subscriptions.
         """
-        # Build minimal mock data client replicating reconnect_bar_streams interface
-        mock_http = MagicMock()
-        mock_http._ensure_authenticated = AsyncMock()
+        # Minimal fake self with correct attribute (_client, not _http_client)
+        fake = types.SimpleNamespace(
+            _use_streaming=True,
+            _stream_client=object(),
+            _client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
+            _bar_subscriptions={},
+            _last_bar_ts={},
+            _cache=types.SimpleNamespace(instrument=lambda iid: None),
+            _log=MagicMock(),
+            _loop=asyncio.get_event_loop(),
+        )
 
-        # Simulate a bar subscription with a recent timestamp (nothing to reconnect)
-        recent_ts = datetime.utcnow().isoformat() + "Z"
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
+        # Call the REAL method on the fake self
+        result = await TradeStationDataClient.reconnect_bar_streams(
+            fake, stale_only=True, max_age_secs=1800
+        )
 
-        class _FakeDataClient:
-            _use_streaming = True
-            _stream_client = MagicMock()
-            _http_client = mock_http
-            _bar_subscriptions: dict = {}
-            _last_bar_ts: dict = {}
-            _cache = MagicMock()
-            _loop = asyncio.get_event_loop()
-
-            async def reconnect_bar_streams(self, stale_only=True, max_age_secs=7200):
-                # Replicate only the token-refresh preamble (Fix 1c)
-                import time as _time
-                _ = _time.time()
-                try:
-                    await self._http_client._ensure_authenticated()
-                except Exception:
-                    pass
-                # (rest of loop omitted — no subscriptions to iterate)
-                return 0
-
-        client = _FakeDataClient()
-        result = await client.reconnect_bar_streams(stale_only=True, max_age_secs=1800)
-
-        mock_http._ensure_authenticated.assert_awaited_once()
+        # Assert token refresh was called exactly once
+        fake._client._ensure_authenticated.assert_awaited_once()
         assert result == 0
+        # Verify no error was logged (no AttributeError on _http_client)
+        assert not any("Token refresh" in str(c) for c in fake._log.warning.call_args_list)
