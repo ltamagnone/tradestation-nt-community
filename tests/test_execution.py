@@ -1180,3 +1180,79 @@ class TestTokenKeepalive:
             exec_client._token_keepalive_task = object()  # should not reach
 
         assert exec_client._token_keepalive_task is None
+
+
+class TestDonIsASessionPauseForGtc:
+    """TS 'DON' at the daily/weekly close on a GTC order = paused until next session.
+
+    2026-09-23/25: GTC exits marked DON were cancelled in NT, kept working at the
+    broker, and the §111 verifier re-cancelled them ~2 min later on every weekday close.
+    A fill later in the same session would have been dropped (order closed in NT).
+    """
+
+    @staticmethod
+    def _client(tif):
+        coid = ClientOrderId("O-EXIT")
+        cached = MagicMock()
+        cached.is_closed = False
+        cached.status = OrderStatus.ACCEPTED
+        cached.time_in_force = tif
+        cached.strategy_id = StrategyId("S-001")
+        cached.instrument_id = InstrumentId(Symbol("NQZ26"), Venue("TRADESTATION"))
+        m = MagicMock()
+        m._ts_order_id_to_client_order_id = {"TS-1": coid}
+        m._order_last_status = {}
+        m._pending_modify_trigger_price = {}
+        m._cancel_verify_pending = {}
+        m._verify_pending_cancels = AsyncMock()  # as in _make_check_statuses_mock
+        m._cache = MagicMock()
+        m._cache.order.return_value = cached
+        m._clock = MagicMock()
+        m._clock.timestamp_ns.return_value = 0
+        m._log = MagicMock()
+        return m
+
+    @pytest.mark.asyncio
+    async def test_gtc_don_via_sse_emits_no_cancel(self):
+        m = self._client(TimeInForce.GTC)
+        await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": "DON"})
+        m.generate_order_canceled.assert_not_called()
+        m._register_cancel_verify.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gtc_don_via_poll_emits_no_cancel(self):
+        m = self._client(TimeInForce.GTC)
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(return_value=[{"OrderID": "TS-1", "Status": "DON"}])
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_canceled.assert_not_called()
+        m._register_cancel_verify.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_day_don_is_still_a_cancel(self):
+        m = self._client(TimeInForce.DAY)
+        await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": "DON"})
+        m.generate_order_canceled.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_don_then_ack_emits_nothing_and_no_cancel_verify(self):
+        m = self._client(TimeInForce.GTC)
+        for st in ("DON", "ACK"):
+            await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": st})
+        m.generate_order_canceled.assert_not_called()
+        m.generate_order_accepted.assert_not_called()
+        m._register_cancel_verify.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gtc_fill_after_don_reaches_the_strategy(self):
+        m = self._client(TimeInForce.GTC)
+        cached = m._cache.order.return_value
+        # a real cancel closes the order in NT — without this the test passes unfixed
+        m.generate_order_canceled.side_effect = lambda **kw: setattr(cached, "is_closed", True)
+        inst = MagicMock(); inst.price_precision = 2; inst.quote_currency = MagicMock()
+        m._cache.instrument.return_value = inst
+        m._cache.order.return_value.quantity = Quantity.from_int(1)
+        await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": "DON"})
+        await TradeStationExecutionClient._process_order_event(
+            m, {"OrderID": "TS-1", "Status": "FLL", "AveragePrice": "30664.00", "FilledQuantity": "1"})
+        m.generate_order_filled.assert_called_once()

@@ -73,6 +73,18 @@ from nautilus_trader.model.orders import StopLimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
 
 
+def _is_gtc_session_pause(status: str, cached_order) -> bool:
+    """TradeStation 'DON' (done for day) on a GTC order is a session pause.
+
+    The order stays in the broker's working list (status=Open, LESSONS §49) and
+    resumes next session — it can still fill. Treating it as cancelled closed it in
+    NT (a later same-session fill would be dropped) and queued it for the §111
+    verifier, which re-cancelled the live exit once it returned to ACK (every
+    weekday close, e.g. #972249111 2026-09-23 21:02Z). DAY orders: a real expiry.
+    """
+    return status == "DON" and getattr(cached_order, "time_in_force", None) == TimeInForce.GTC
+
+
 class TradeStationExecutionClient(LiveExecutionClient):
     """
     Provide an execution client for TradeStation.
@@ -1112,6 +1124,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
           ACK / OPN → order is open
           FLL       → fully filled   → generate_order_filled
           CAN / UCN / OUT / EXP / DON → canceled/expired → generate_order_canceled
+          DON on a GTC order → session pause, no event (_is_gtc_session_pause)
           REJ / BRO / LAT → rejected → generate_order_rejected
         """
         if not self._ts_order_id_to_client_order_id and not self._cancel_verify_pending:
@@ -1282,6 +1295,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
 
+            elif _is_gtc_session_pause(status, cached_order):
+                self._log.info(
+                    f"Order {client_order_id} GTC status=DON — session pause, kept open"
+                )
+
             elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
                 # Canceled or expired
                 self.generate_order_canceled(
@@ -1430,6 +1448,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px} [fill-source=sse]")
+
+        elif _is_gtc_session_pause(status, cached_order):
+            self._log.info(
+                f"Stream: order {client_order_id} GTC status=DON — session pause, kept open"
+            )
 
         elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
             self.generate_order_canceled(
