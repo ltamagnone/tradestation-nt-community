@@ -30,12 +30,12 @@ def _iso_ago(minutes: float) -> str:
 
 async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = True,
                **kw):
-    """Return the set of bar types whose task was cancelled (= reconnected)."""
+    """Return (set of bar types reconnected, fake self) for assertion."""
     tasks = {bt: asyncio.get_running_loop().create_task(asyncio.sleep(3600)) for bt in ages_min}
     fake = types.SimpleNamespace(
         _use_streaming=True,
         _stream_client=object(),
-        _http_client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
+        _client=types.SimpleNamespace(_ensure_authenticated=AsyncMock()),
         _bar_subscriptions=dict(tasks),
         _last_bar_ts={bt: _iso_ago(m) for bt, m in ages_min.items() if m is not None},
         _cache=types.SimpleNamespace(instrument=lambda iid: None),  # skip re-create
@@ -47,36 +47,36 @@ async def _run(ages_min: dict, max_age_secs: float = 1800, stale_only: bool = Tr
     out = {bt for bt, t in tasks.items() if t.cancelled()}
     for t in tasks.values():
         t.cancel()
-    return out
+    return out, fake
 
 
 async def test_hourly_stream_45_min_is_not_reconnected():
-    assert await _run({H1: 45}) == set()
+    assert (await _run({H1: 45}))[0] == set()
 
 
 async def test_hourly_stream_125_min_is_reconnected():
-    assert await _run({H1: 125}) == {H1}
+    assert (await _run({H1: 125}))[0] == {H1}
 
 
 async def test_15_min_stream_35_min_is_reconnected():
-    assert await _run({M15: 35}) == {M15}
+    assert (await _run({M15: 35}))[0] == {M15}
 
 
 async def test_mixed_pass_reconnects_only_the_stale_one():
-    assert await _run({M15: 35, H1: 45, D1: 600}) == {M15}
+    assert (await _run({M15: 35, H1: 45, D1: 600}))[0] == {M15}
 
 
 async def test_max_age_secs_is_a_floor():
     # 15-min bars: 2 x 15 min = 30 min < 7200 s floor → 60 min idle is fresh
-    assert await _run({M15: 60}, max_age_secs=7200) == set()
+    assert (await _run({M15: 60}, max_age_secs=7200))[0] == set()
 
 
 async def test_stale_only_false_reconnects_all():
-    assert await _run({H1: 1, M15: 1}, stale_only=False) == {H1, M15}
+    assert (await _run({H1: 1, M15: 1}, stale_only=False))[0] == {H1, M15}
 
 
 async def test_no_timestamp_still_reconnects():
-    assert await _run({H1: None}) == {H1}
+    assert (await _run({H1: None}))[0] == {H1}
 
 
 def test_bar_interval_secs():
@@ -98,24 +98,31 @@ async def test_unparseable_bar_type_uses_max_age_secs():
         instrument_id = types.SimpleNamespace(symbol=types.SimpleNamespace(value="ESZ26"))
 
     bad = _OddBarType()
-    assert await _run({bad: 40}) == {bad}
+    assert (await _run({bad: 40}))[0] == {bad}
 
 
 # ── bar_types scoping (fix round 2) ────────────────────────────────────────
 
 async def test_bar_types_scopes_reconnect_to_listed_streams():
     # M15 idle 3 h is stale on its own merits but NOT listed → untouched.
-    out = await _run({M15: 180, H1: 125}, bar_types=[H1])
+    (out, _) = await _run({M15: 180, H1: 125}, bar_types=[H1])
     assert out == {H1}
 
 
 async def test_bar_types_listed_but_fresh_is_not_reconnected():
-    assert await _run({H1: 45, M15: 180}, bar_types=[H1]) == set()
+    assert (await _run({H1: 45, M15: 180}, bar_types=[H1]))[0] == set()
 
 
 async def test_bar_types_empty_touches_nothing():
-    assert await _run({M15: 180}, bar_types=[]) == set()
+    assert (await _run({M15: 180}, bar_types=[]))[0] == set()
 
 
 async def test_bar_types_none_keeps_global_sweep():
-    assert await _run({M15: 180, H1: 125}, bar_types=None) == {M15, H1}
+    assert (await _run({M15: 180, H1: 125}, bar_types=None))[0] == {M15, H1}
+
+
+async def test_token_is_refreshed_through_the_real_client_attribute():
+    # 2026-09-28 stable.log: "... object has no attribute '_http_client'" on every reconnect
+    _, fake = await _run({M15: 35})
+    fake._client._ensure_authenticated.assert_awaited_once()
+    assert not any("Token refresh" in str(c) for c in fake._log.warning.call_args_list)

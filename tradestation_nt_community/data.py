@@ -542,7 +542,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         # Refresh OAuth token once before the loop — maintenance window may have
         # let the token near expiry before streams are reconnected. (§70)
         try:
-            await self._http_client._ensure_authenticated()
+            await self._client._ensure_authenticated()
         except Exception as e:
             self._log.warning(f"Token refresh before stream reconnect failed: {e}")
 
