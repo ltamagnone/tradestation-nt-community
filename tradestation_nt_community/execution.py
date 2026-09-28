@@ -85,6 +85,20 @@ def _is_gtc_session_pause(status: str, cached_order) -> bool:
     return status == "DON" and getattr(cached_order, "time_in_force", None) == TimeInForce.GTC
 
 
+def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
+    """Greppable warning for a fill on a mapped order that NT's cache does not hold.
+
+    Happens for orders placed before a node restart: the persisted order map knows
+    them, but startup reconciliation does not rebuild them into the NT cache
+    (2026-09-28 NQZ26 #972721176), so the fill cannot be delivered to the strategy.
+    """
+    return (
+        f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) filled but is not "
+        f"in the NT cache (placed before a restart?) — the strategy will not see this "
+        f"fill; HEAL CASE-A/PERIODIC-RECON must reconcile"
+    )
+
+
 class TradeStationExecutionClient(LiveExecutionClient):
     """
     Provide an execution client for TradeStation.
@@ -1167,6 +1181,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._log.warning(
                     f"Fill poll: order {client_order_id} not found in cache (status={status})"
                 )
+                if status in ("FLL", "FLP"):
+                    self._log.warning(_uncached_fill_message(ts_order_id, client_order_id))
                 continue
 
             # Skip if NautilusTrader already considers the order closed (idempotency guard).
@@ -1393,7 +1409,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._order_last_status[ts_order_id] = status
 
         cached_order = self._cache.order(client_order_id)
-        if cached_order is None or cached_order.is_closed:
+        if cached_order is None:
+            # _order_last_status is already updated above, so the safety poll will
+            # not see this change again — this is the only chance to make it loud.
+            if status in ("FLL", "FLP"):
+                self._log.warning(_uncached_fill_message(ts_order_id, client_order_id))
+            return
+        if cached_order.is_closed:
             return
 
         venue_order_id = VenueOrderId(ts_order_id)

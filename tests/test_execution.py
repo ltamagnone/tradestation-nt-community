@@ -1256,3 +1256,57 @@ class TestDonIsASessionPauseForGtc:
         await TradeStationExecutionClient._process_order_event(
             m, {"OrderID": "TS-1", "Status": "FLL", "AveragePrice": "30664.00", "FilledQuantity": "1"})
         m.generate_order_filled.assert_called_once()
+
+
+class TestUncachedFillWarning:
+    """FLL/FLP for a mapped TS order that is not in the NT cache must be loud.
+
+    2026-09-28: NQZ26 #972721176 (placed 09-25, node restarted 09-27 21:25Z,
+    reconciliation rebuilt 0 orders) filled at ~03:27Z; the SSE path returned
+    silently and the poll then saw no status change — no log line at all.
+    """
+
+    @staticmethod
+    def _client():
+        m = MagicMock()
+        m._ts_order_id_to_client_order_id = {"972721176": ClientOrderId("O-OLD-5")}
+        m._order_last_status = {}
+        m._pending_modify_trigger_price = {}
+        m._cancel_verify_pending = {}
+        m._verify_pending_cancels = AsyncMock()
+        m._cache = MagicMock()
+        m._cache.order.return_value = None  # not in the NT cache (pre-restart order)
+        m._clock = MagicMock()
+        m._clock.timestamp_ns.return_value = 0
+        m._log = MagicMock()
+        return m
+
+    @staticmethod
+    def _uncached_warnings(m):
+        return [c for c in m._log.warning.call_args_list if "[UNCACHED-FILL]" in str(c)]
+
+    @pytest.mark.asyncio
+    async def test_sse_fill_on_uncached_order_warns(self):
+        m = self._client()
+        await TradeStationExecutionClient._process_order_event(
+            m, {"OrderID": "972721176", "Status": "FLL", "AveragePrice": "30664.00"})
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert "972721176" in str(warns[0]) and "O-OLD-5" in str(warns[0])
+        m.generate_order_filled.assert_not_called()
+        # a non-fill status on an uncached order stays silent (behaviour unchanged)
+        await TradeStationExecutionClient._process_order_event(
+            m, {"OrderID": "972721176", "Status": "ACK"})
+        assert len(self._uncached_warnings(m)) == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_fill_on_uncached_order_warns(self):
+        m = self._client()
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[{"OrderID": "972721176", "Status": "FLP", "AveragePrice": "30664.00"}])
+        await TradeStationExecutionClient._check_order_statuses(m)
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert "972721176" in str(warns[0]) and "O-OLD-5" in str(warns[0])
+        m.generate_order_filled.assert_not_called()
