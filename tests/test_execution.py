@@ -1310,3 +1310,109 @@ class TestUncachedFillWarning:
         assert len(warns) == 1
         assert "972721176" in str(warns[0]) and "O-OLD-5" in str(warns[0])
         m.generate_order_filled.assert_not_called()
+
+    # 2026-09-29 13:23Z/13:28Z: after a restart, `_order_last_status` starts empty,
+    # so the first status read sees orders that filled hours earlier in the previous
+    # process (already delivered then) and re-warns — 16 false positives per restart.
+    # Fix: only warn for a fill at/after this adapter instance's start; a fill that
+    # predates it gets an INFO line; missing/unparseable timestamps keep the WARNING.
+    _INSTANCE_STARTED_S = 1790686800.0  # 2026-09-29T13:00:00Z
+
+    @pytest.mark.asyncio
+    async def test_sse_fill_before_instance_start_does_not_warn(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        await TradeStationExecutionClient._process_order_event(
+            m,
+            {
+                "OrderID": "972721176",
+                "Status": "FLL",
+                "AveragePrice": "30664.00",
+                "ClosedDateTime": "2026-09-29T09:57:59Z",  # predates the 13:00Z start
+            },
+        )
+        assert self._uncached_warnings(m) == []
+        assert m._log.info.call_count == 1
+        assert "972721176" in str(m._log.info.call_args)
+        assert "predates this session" in str(m._log.info.call_args)
+        m.generate_order_filled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_poll_fill_before_instance_start_does_not_warn(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[
+                {
+                    "OrderID": "972721176",
+                    "Status": "FLP",
+                    "AveragePrice": "30664.00",
+                    "ClosedDateTime": "2026-09-29T09:57:59Z",
+                }
+            ]
+        )
+        await TradeStationExecutionClient._check_order_statuses(m)
+        assert self._uncached_warnings(m) == []
+        assert m._log.info.call_count == 1
+        assert "predates this session" in str(m._log.info.call_args)
+        m.generate_order_filled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sse_fill_after_instance_start_warns(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        await TradeStationExecutionClient._process_order_event(
+            m,
+            {
+                "OrderID": "972721176",
+                "Status": "FLL",
+                "AveragePrice": "30664.00",
+                "ClosedDateTime": "2026-09-29T13:23:47Z",  # after the 13:00Z start
+            },
+        )
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert m._log.info.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_poll_fill_after_instance_start_warns(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[
+                {
+                    "OrderID": "972721176",
+                    "Status": "FLP",
+                    "AveragePrice": "30664.00",
+                    "ClosedDateTime": "2026-09-29T13:23:47Z",
+                }
+            ]
+        )
+        await TradeStationExecutionClient._check_order_statuses(m)
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert m._log.info.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_sse_fill_no_closed_datetime_warns(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        await TradeStationExecutionClient._process_order_event(
+            m, {"OrderID": "972721176", "Status": "FLL", "AveragePrice": "30664.00"})
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert m._log.info.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_poll_fill_no_closed_datetime_warns(self):
+        m = self._client()
+        m._instance_started_s = self._INSTANCE_STARTED_S
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(
+            return_value=[{"OrderID": "972721176", "Status": "FLP", "AveragePrice": "30664.00"}])
+        await TradeStationExecutionClient._check_order_statuses(m)
+        warns = self._uncached_warnings(m)
+        assert len(warns) == 1
+        assert m._log.info.call_count == 0

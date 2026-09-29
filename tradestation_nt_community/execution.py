@@ -99,6 +99,41 @@ def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
     )
 
 
+def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id, instance_started_s) -> None:
+    """Log an FLL/FLP fill for a mapped TS order absent from the NT cache.
+
+    2026-09-29 13:23Z/13:28Z: after a restart the persisted order map is loaded but
+    `_order_last_status` starts empty, so the first status read sees orders that
+    filled HOURS EARLIER in the previous process — whose fills were already
+    delivered at the time (e.g. O-20260929-095755-001-000-8 filled/delivered at
+    09:57:59Z, warned again at 13:23:47Z). 16 false [UNCACHED-FILL] warnings per
+    node per restart.
+
+    Warn loudly only for a fill that happened at or after this adapter instance
+    started — that fill genuinely has nowhere else to go. A fill that predates the
+    instance is expected after a restart (delivered by the process this one
+    replaced) and gets an INFO line instead. Any uncertainty — no ClosedDateTime,
+    no recorded instance-start time, an unparseable timestamp — keeps the WARNING:
+    fail loud rather than silently swallow a real gap.
+    """
+    predates_session = False
+    closed_str = ts_order.get("ClosedDateTime", "")
+    if closed_str and instance_started_s is not None:
+        try:
+            closed_s = pd.Timestamp(closed_str, tz="UTC").timestamp()
+            predates_session = closed_s < instance_started_s
+        except Exception:
+            predates_session = False
+
+    if predates_session:
+        log.info(
+            f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) fill predates "
+            f"this session — already delivered by the previous process"
+        )
+    else:
+        log.warning(_uncached_fill_message(ts_order_id, client_order_id))
+
+
 class TradeStationExecutionClient(LiveExecutionClient):
     """
     Provide an execution client for TradeStation.
@@ -161,6 +196,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._client = client
         self._account_id = account_id
         self._base_url_ws = base_url_ws
+
+        # Wall-clock start of this adapter instance (UTC epoch seconds). Used to tell
+        # a fill that happened after this process started from one that predates it
+        # (already delivered by the previous process, before a restart) — see
+        # _log_uncached_fill.
+        self._instance_started_s = time.time()
 
         # Order tracking
         self._ts_order_id_to_client_order_id: dict[str, ClientOrderId] = {}
@@ -1182,7 +1223,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"Fill poll: order {client_order_id} not found in cache (status={status})"
                 )
                 if status in ("FLL", "FLP"):
-                    self._log.warning(_uncached_fill_message(ts_order_id, client_order_id))
+                    _log_uncached_fill(
+                        self._log,
+                        ts_order,
+                        ts_order_id,
+                        client_order_id,
+                        getattr(self, "_instance_started_s", None),
+                    )
                 continue
 
             # Skip if NautilusTrader already considers the order closed (idempotency guard).
@@ -1413,7 +1460,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # _order_last_status is already updated above, so the safety poll will
             # not see this change again — this is the only chance to make it loud.
             if status in ("FLL", "FLP"):
-                self._log.warning(_uncached_fill_message(ts_order_id, client_order_id))
+                _log_uncached_fill(
+                    self._log,
+                    ts_order,
+                    ts_order_id,
+                    client_order_id,
+                    getattr(self, "_instance_started_s", None),
+                )
             return
         if cached_order.is_closed:
             return
