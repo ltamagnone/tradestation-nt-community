@@ -27,6 +27,7 @@ from tradestation_nt_community.factories import TradeStationLiveDataClientFactor
 from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
 from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
 from tradestation_nt_community.http.client import OrderRejectedException
+from tradestation_nt_community.http.client import SymbolNotFoundException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.providers import TradeStationInstrumentProvider
 
@@ -37,6 +38,7 @@ __all__ = [
     "TRADESTATION_VENUE",
     "DuplicateOrderConfirmIdException",
     "OrderRejectedException",
+    "SymbolNotFoundException",
     "TradeStationDataClient",
     "TradeStationDataClientConfig",
     "TradeStationExecClientConfig",

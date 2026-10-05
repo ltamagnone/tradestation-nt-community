@@ -15,6 +15,7 @@ from tradestation_nt_community.common.enums import TradeStationBarUnit
 from tradestation_nt_community.http.client import (
     DuplicateOrderConfirmIdException,
     OrderRejectedException,
+    SymbolNotFoundException,
     TradeStationHttpClient,
 )
 
@@ -131,12 +132,55 @@ async def test_get_symbol_details_returns_parsed_data(http_client):
 
 @pytest.mark.asyncio
 async def test_get_symbol_details_handles_empty_response(http_client):
-    """Empty Symbols array returns {}."""
+    """Empty Symbols array with NO Errors entry still returns {}."""
     http_client._httpx.get = AsyncMock(
-        return_value=_mock_resp(200, {"Symbols": [], "Errors": ["No match"]})
+        return_value=_mock_resp(200, {"Symbols": [], "Errors": []})
     )
     result = await http_client.get_symbol_details("INVALID")
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_get_symbol_details_raises_on_ts_not_found(http_client):
+    """HTTP 200 + empty Symbols + an Errors entry = unlisted symbol (LESSONS §146).
+
+    Real TS payload for QIV26 (2026-10-05). Returning {} here made the node log
+    "Unsupported asset type ''" and the weekly roll check say UNVERIFIED.
+    """
+    payload = {
+        "Symbols": [],
+        "Errors": [{"Error": "NotFound", "Message": "invalid symbol", "Symbol": "QIV26"}],
+    }
+    http_client._httpx.get = AsyncMock(return_value=_mock_resp(200, payload))
+    with pytest.raises(SymbolNotFoundException, match="invalid symbol") as exc_info:
+        await http_client.get_symbol_details("QIV26")
+    err = exc_info.value
+    assert "QIV26" in str(err)
+    assert "NotFound" in str(err)
+    assert err.symbol == "QIV26"
+    assert err.ts_error == "NotFound"
+    assert err.ts_message == "invalid symbol"
+
+
+@pytest.mark.asyncio
+async def test_get_symbol_details_other_errors_are_not_not_found(http_client):
+    """Only TS's NotFound means 'not listed'. Any other Errors entry is a failed lookup:
+    a plain Exception, so callers report it as unverified, not as a dead contract."""
+    for payload in (
+        {"Symbols": [], "Errors": ["No match"]},
+        {"Symbols": [], "Errors": [{"Error": "Timeout", "Message": "upstream", "Symbol": "X"}]},
+    ):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(200, payload))
+        with pytest.raises(Exception) as exc_info:
+            await http_client.get_symbol_details("INVALID")
+        assert not isinstance(exc_info.value, SymbolNotFoundException)
+
+
+def test_symbol_not_found_exception_exported_from_package():
+    import tradestation_nt_community as pkg
+
+    assert pkg.SymbolNotFoundException is SymbolNotFoundException
+    assert "SymbolNotFoundException" in pkg.__all__
 
 
 

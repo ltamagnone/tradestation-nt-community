@@ -64,6 +64,32 @@ class OrderRejectedException(Exception):
         super().__init__(f"TradeStation order rejected: {ts_message}")
         self.ts_message = ts_message
 
+
+class SymbolNotFoundException(Exception):
+    """
+    Raised when TradeStation answers HTTP 200 for a symbol lookup but the body
+    has an empty ``Symbols`` list and an ``Errors`` entry — i.e. the broker does
+    not list that symbol (e.g. ``{"Error": "NotFound", "Message": "invalid symbol"}``).
+
+    Same "HTTP 200 != success" family as :class:`OrderRejectedException`.
+
+    Attributes
+    ----------
+    symbol : str
+        The symbol TradeStation reported (falls back to the requested symbol).
+    ts_error : str
+        TradeStation's ``Error`` code (e.g. ``"NotFound"``); may be empty.
+    ts_message : str
+        TradeStation's ``Message`` (e.g. ``"invalid symbol"``).
+    """
+
+    def __init__(self, symbol: str, ts_error: str, ts_message: str) -> None:
+        detail = ": ".join(p for p in (ts_error, ts_message) if p) or "unknown error"
+        super().__init__(f"TradeStation symbol not found: {symbol} ({detail})")
+        self.symbol = symbol
+        self.ts_error = ts_error
+        self.ts_message = ts_message
+
 from tradestation_nt_community.common.enums import TradeStationBarUnit
 
 _ALLOWED_HOSTS = frozenset({
@@ -355,6 +381,11 @@ class TradeStationHttpClient:
         dict[str, Any]
             Symbol details including contract specifications.
 
+        Raises
+        ------
+        SymbolNotFoundException
+            If TradeStation answers 200 with no symbol and an ``Errors`` entry.
+
         """
         url = f"{self.base_url}/marketdata/symbols/{symbol}"
         response = await self._request("GET", url)
@@ -364,7 +395,26 @@ class TradeStationHttpClient:
         data = response.json()
         if isinstance(data, dict) and "Symbols" in data:
             symbols = data.get("Symbols", [])
-            return symbols[0] if symbols else {}
+            if symbols:
+                return symbols[0]
+            errors = data.get("Errors") or []
+            if errors:
+                # HTTP 200 for an unlisted symbol (LESSONS §146): raise instead of
+                # returning {} so callers see "invalid symbol", not a blank payload.
+                # Only TS's NotFound means "not listed"; any other error is a failed
+                # lookup (callers report it as unverified, not as a dead contract).
+                first = errors[0]
+                if isinstance(first, dict) and (
+                    str(first.get("Error") or "").lower() == "notfound"
+                    or "invalid symbol" in str(first.get("Message") or "").lower()
+                ):
+                    raise SymbolNotFoundException(
+                        str(first.get("Symbol") or symbol),
+                        str(first.get("Error") or ""),
+                        str(first.get("Message") or ""),
+                    )
+                raise Exception(f"Get symbol details failed for {symbol}: {first}")
+            return {}
         return data[0] if isinstance(data, list) and data else data
 
     # =========================================================================

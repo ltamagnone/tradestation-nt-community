@@ -434,3 +434,26 @@ class TestLoadSingleTimeout:
                 await instrument_provider._load_single(iid)
         finally:
             instrument_provider._LOAD_TIMEOUT_S = original_timeout
+
+
+@pytest.mark.asyncio
+async def test_unlisted_symbol_logs_real_reason(instrument_provider, mock_http_client):
+    """A TS "invalid symbol" is logged as the load error, not "Failed to parse" (§146)."""
+    from unittest.mock import MagicMock
+
+    from tradestation_nt_community.http.client import SymbolNotFoundException
+
+    mock_http_client.get_symbol_details.side_effect = SymbolNotFoundException(
+        "QIV26", "NotFound", "invalid symbol",
+    )
+    log = MagicMock()
+    instrument_provider._log = log
+
+    iid = InstrumentId(Symbol("QIV26"), TRADESTATION_VENUE)
+    await instrument_provider.load_async(iid)  # must not raise
+
+    assert instrument_provider.find(iid) is None
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("Error loading instrument" in m and "invalid symbol" in m for m in errors), errors
+    warnings = [str(c.args[0]) for c in log.warning.call_args_list]
+    assert not any("Failed to parse" in m for m in warnings), warnings
