@@ -217,7 +217,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # §111: post-cancel zombie verification — orders this session already
         # reported cancelled, checked against the safety poll's own order fetch.
         # In-memory only: cross-restart zombies remain the agent orphan scan's job.
-        self._cancel_verify_pending: dict[str, tuple[float, int]] = {}
+        self._cancel_verify_pending: dict[str, tuple[float, int, bool]] = {}
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -1164,32 +1164,48 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
 
     def _register_cancel_verify(self, ts_order_id: str, requested: bool = True) -> None:
-        """Queue a cancelled order for §111 zombie verification (idempotent)."""
-        if ts_order_id and ts_order_id not in self._cancel_verify_pending:
-            self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0)
+        """Queue a cancelled order for §111 verification. `requested`: this session
+        sent the cancel (only those may be re-issued — §149)."""
+        if not ts_order_id:
+            return
+        prev = self._cancel_verify_pending.get(ts_order_id)
+        if prev is None:
+            self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0, requested)
+        elif requested and not prev[2]:
+            self._cancel_verify_pending[ts_order_id] = (prev[0], prev[1], True)
 
     async def _verify_pending_cancels(self, orders: list) -> None:
         """§111: re-check every order reported cancelled against the broker's own
         order list; if still ACK/OPN/FPR >=_CANCEL_VERIFY_MIN_AGE_S later, re-issue
-        the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Safe by construction:
-        only orders our session already decided/observed to cancel are targeted —
-        no new cancel decision is ever made here.  In-memory only: zombies from a
+        the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Only cancels this
+        session SENT are re-issued (§149: an observed-but-unrequested cancel that is
+        still live is logged as [CANCEL-MISMATCH], never cancelled).  In-memory only: zombies from a
         prior process (before restart) are out of scope here — the agent's own
         orphan scan is the cross-restart backstop.
         """
         if not self._cancel_verify_pending:
             return
         now = time.monotonic()
-        open_status = {
+        live = {
             o.get("OrderID"): o.get("Status")
             for o in orders
-            if o.get("Status") in ("ACK", "OPN", "FPR")
+            if o.get("Status") in _st.LIVE
         }
         for ts_order_id in list(self._cancel_verify_pending):
-            first_seen, attempts = self._cancel_verify_pending[ts_order_id]
+            first_seen, attempts, requested = self._cancel_verify_pending[ts_order_id]
             if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S:
                 continue
-            if ts_order_id not in open_status:
+            if ts_order_id not in live:
+                del self._cancel_verify_pending[ts_order_id]
+                continue
+            if live[ts_order_id] in ("UCN", "LAT"):
+                continue  # our cancel still pending / too late — a terminal status follows
+            if not requested:
+                self._log.error(
+                    f"[CANCEL-MISMATCH] Order {ts_order_id} was reported cancelled "
+                    f"(we never asked) but is still {live[ts_order_id]} at the broker — "
+                    f"NOT re-cancelling; NT thinks it is gone (§149)"
+                )
                 del self._cancel_verify_pending[ts_order_id]
                 continue
             if attempts >= self._CANCEL_VERIFY_MAX_ATTEMPTS:
@@ -1202,14 +1218,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 continue
             self._log.warning(
                 f"[CANCEL-ZOMBIE] Order {ts_order_id} was reported cancelled but is "
-                f"still {open_status[ts_order_id]} at the broker — re-issuing cancel "
+                f"still {live[ts_order_id]} at the broker — re-issuing cancel "
                 f"(attempt {attempts + 1}/{self._CANCEL_VERIFY_MAX_ATTEMPTS}, §111)"
             )
             try:
                 await self._client.cancel_order(order_id=ts_order_id)
             except Exception as e:
                 self._log.warning(f"[CANCEL-ZOMBIE] re-cancel failed for {ts_order_id}: {e}")
-            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1)
+            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1, requested)
 
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.

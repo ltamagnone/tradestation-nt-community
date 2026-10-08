@@ -30,19 +30,19 @@ def _open_order(oid="961146425", status="OPN"):
 class TestVerifyPendingCancels:
     async def test_still_open_after_min_age_reissues_cancel(self):
         old = time.monotonic() - 300
-        stub = _stub({"961146425": (old, 0)})
+        stub = _stub({"961146425": (old, 0, True)})
         await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
         stub._client.cancel_order.assert_awaited_once_with(order_id="961146425")
         assert stub._cancel_verify_pending["961146425"][1] == 1
 
     async def test_young_entry_not_checked_yet(self):
-        stub = _stub({"961146425": (time.monotonic(), 0)})
+        stub = _stub({"961146425": (time.monotonic(), 0, True)})
         await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
         stub._client.cancel_order.assert_not_awaited()
 
     async def test_gone_order_clears_entry(self):
         old = time.monotonic() - 300
-        stub = _stub({"961146425": (old, 0)})
+        stub = _stub({"961146425": (old, 0, True)})
         await TradeStationExecutionClient._verify_pending_cancels(
             stub, [_open_order(status="CAN")])
         assert "961146425" not in stub._cancel_verify_pending
@@ -50,7 +50,7 @@ class TestVerifyPendingCancels:
 
     async def test_gives_up_after_max_attempts(self):
         old = time.monotonic() - 300
-        stub = _stub({"961146425": (old, 3)})
+        stub = _stub({"961146425": (old, 3, True)})
         await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
         assert "961146425" not in stub._cancel_verify_pending
         stub._client.cancel_order.assert_not_awaited()
@@ -58,7 +58,43 @@ class TestVerifyPendingCancels:
 
     async def test_reissue_failure_is_swallowed_and_counted(self):
         old = time.monotonic() - 300
-        stub = _stub({"961146425": (old, 1)})
+        stub = _stub({"961146425": (old, 1, True)})
         stub._client.cancel_order = AsyncMock(side_effect=Exception("boom"))
         await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
         assert stub._cancel_verify_pending["961146425"][1] == 2
+
+
+class TestUnrequestedCancelIsNeverReissued:
+    """2026-10-08: TS UCN reported as cancelled -> §111 re-cancelled 8 live exits.
+    An observed-but-unrequested cancel must never become a real cancel."""
+
+    async def test_unrequested_still_open_is_logged_not_cancelled(self):
+        old = time.monotonic() - 300
+        stub = _stub({"973736851": (old, 0, False)})
+        await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order("973736851")])
+        stub._client.cancel_order.assert_not_awaited()
+        assert "973736851" not in stub._cancel_verify_pending
+        assert "[CANCEL-MISMATCH]" in stub._log.error.call_args.args[0]
+
+    async def test_requested_still_open_is_reissued(self):
+        old = time.monotonic() - 300
+        stub = _stub({"961146425": (old, 0, True)})
+        await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
+        stub._client.cancel_order.assert_awaited_once_with(order_id="961146425")
+
+    async def test_ucn_on_our_cancel_waits(self):
+        old = time.monotonic() - 300
+        stub = _stub({"961146425": (old, 0, True)})
+        await TradeStationExecutionClient._verify_pending_cancels(
+            stub, [_open_order(status="UCN")])
+        # UCN = our cancel still pending: not gone, but not re-cancelled either
+        stub._client.cancel_order.assert_not_awaited()
+        assert "961146425" in stub._cancel_verify_pending
+
+    def test_register_keeps_requested_flag(self):
+        stub = MagicMock()
+        stub._cancel_verify_pending = {}
+        TradeStationExecutionClient._register_cancel_verify(stub, "1", requested=False)
+        assert stub._cancel_verify_pending["1"][1:] == (0, False)
+        TradeStationExecutionClient._register_cancel_verify(stub, "1", requested=True)
+        assert stub._cancel_verify_pending["1"][2] is True   # requested wins
