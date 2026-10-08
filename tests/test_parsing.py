@@ -630,17 +630,13 @@ class TestParseOptionInstrument:
         assert instrument.option_kind == OptionKind.PUT
 
 
-from nautilus_trader.model.enums import OrderStatus as _OS  # noqa: E402
-from tradestation_nt_community.parsing.execution import parse_order_status  # noqa: E402
-
-
 def test_parse_order_status_follows_categories():
-    assert parse_order_status("UCN") == _OS.ACCEPTED   # open, not canceled
-    assert parse_order_status("DON") == _OS.ACCEPTED
-    assert parse_order_status("FPR") == _OS.PARTIALLY_FILLED
-    assert parse_order_status("OPN") == _OS.SUBMITTED
-    assert parse_order_status("TSC") == _OS.CANCELED
-    assert parse_order_status("EXP") == _OS.EXPIRED
-    assert parse_order_status("REJ") == _OS.REJECTED
-    assert parse_order_status("FLL") == _OS.FILLED
-    assert parse_order_status("XYZ") == _OS.ACCEPTED   # unknown: assume live
+    assert parse_order_status("UCN") == OrderStatus.ACCEPTED   # open, not canceled
+    assert parse_order_status("DON") == OrderStatus.ACCEPTED
+    assert parse_order_status("FPR") == OrderStatus.PARTIALLY_FILLED
+    assert parse_order_status("OPN") == OrderStatus.SUBMITTED
+    assert parse_order_status("TSC") == OrderStatus.CANCELED
+    assert parse_order_status("EXP") == OrderStatus.EXPIRED
+    assert parse_order_status("REJ") == OrderStatus.REJECTED
+    assert parse_order_status("FLL") == OrderStatus.FILLED
+    assert parse_order_status("XYZ") == OrderStatus.ACCEPTED   # unknown: assume live

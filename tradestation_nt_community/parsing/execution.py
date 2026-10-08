@@ -14,8 +14,9 @@ from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
-from tradestation_nt_community.common import order_status as _st
 from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLimitOrder, StopMarketOrder
+
+from tradestation_nt_community.common import order_status as _st
 
 
 _log = logging.getLogger(__name__)

@@ -108,7 +108,10 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 ## Order status categories (§149)
 
 - Source of truth: `tradestation_nt_community/common/order_status.py`, copied verbatim from the TS OpenAPI spec (never import status sets from elsewhere).
-- Four categories: Open (incl. ACK, DON, UCN, LAT, BRO), Canceled, Rejected, Filled; WATCH codes and unknown codes are held, not acted on.
+- Four categories: Open (incl. ACK, DON, UCN, LAT, BRO), Canceled, Rejected, Filled.
+- Held (no NT event; `[TS-STATUS-WATCH]`, then `[TS-STATUS-RECHECK]` for WATCH codes): Open-category codes including DON, UCN, LAT, BRO and RJC, plus FLP and unknown codes.
+- Acted on as cancels: Canceled-category codes. The WATCH members TSC/SCN/RJR/UCH (never observed in production) are additionally rechecked and alerted, and `[CANCEL-MISMATCH]` fires if one is still live at the broker.
+- `parse_order_status` also feeds NT reconciliation reports (mass status, in-flight check): Open and unknown codes map to ACCEPTED (assume live), Canceled codes to CANCELED.
 - UCN = Cancel Sent (Open) -- never a cancel. DON = Queued (Open) -- a pause for every TIF.
 - §111 re-cancels only cancels we requested; an unrequested cancel still live at the broker logs `[CANCEL-MISMATCH]` (ERROR) and is not re-cancelled.
 - Log tags: `[TS-STATUS-WATCH]`, `[TS-STATUS-RECHECK]` (5-min broker recheck), `[CANCEL-MISMATCH]`, `[FILL-AFTER-CANCEL]` (broker fill on an order NT closed as CANCELED/EXPIRED; observe-only).

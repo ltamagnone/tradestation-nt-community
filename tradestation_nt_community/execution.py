@@ -1304,7 +1304,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Also clean up any stale pending-amend record (e.g. SSE filled it first).
             if cached_order.is_closed:
                 self._pending_modify_trigger_price.pop(client_order_id, None)
-                _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
+                _log_fill_after_cancel(
+                    self._log, status, ts_order_id, client_order_id, cached_order)
                 continue
 
             # --- PENDING_UPDATE recovery ---
