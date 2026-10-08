@@ -973,6 +973,22 @@ class TestPendingUpdateRecovery:
         assert coid not in m._pending_modify_trigger_price
 
     @pytest.mark.asyncio
+    async def test_don_with_pending_amend_takes_price_comparison(self):
+        """R7: DON is a live status; a pending amend is compared, not discarded."""
+        coid = ClientOrderId("O-STOP")
+        m = _make_check_statuses_mock(
+            ts_orders=[{"OrderID": "TS-STOP", "Status": "DON", "StopPrice": "21050.0"}]
+        )
+        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
+
+        await TradeStationExecutionClient._check_order_statuses(m)
+
+        for call in m._log.info.call_args_list:
+            assert "no longer open" not in call.args[0]
+        m.generate_order_updated.assert_called_once()
+        m.generate_order_canceled.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_sse_fill_clears_tracking(self):
         """FLL via SSE (_process_order_event) pops the pending-amend entry (no leak)."""
         coid = ClientOrderId("O-STOP")

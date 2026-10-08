@@ -61,7 +61,8 @@ LIVE: frozenset[str] = OPEN
 # auto-cancelled), UCN (cancel already pending) and LAT (too late, a fill is coming).
 CANCELLABLE: frozenset[str] = OPEN - {"DON", "UCN", "LAT"}
 # Ambiguous or never observed in production: the adapter parks these for a broker
-# recheck and logs [TS-STATUS-RECHECK] so the operator learns what they mean.
+# recheck: it logs [TS-STATUS-WATCH] on arrival and [TS-STATUS-RECHECK] with the
+# outcome, so the operator learns what they mean.
 WATCH: frozenset[str] = frozenset({"UCN", "LAT", "BRO", "RJC", "UCH", "RJR", "SCN", "TSC"})
 
 

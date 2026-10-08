@@ -1115,9 +1115,53 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except Exception as e:
                 self._log.error(f"Error in status safety poll: {e}")
 
+    _STATUS_RECHECK_S = 300.0  # §149: broker recheck delay for an ambiguous status
+
     def _watch_status(self, ts_order_id: str, client_order_id, status: str) -> None:
-        """§149: park an ambiguous status for a broker recheck (body: Task 3)."""
-        raise NotImplementedError
+        """§149: park an ambiguous/unsolicited status (UCN, LAT, ...) for a broker
+        recheck. Never decides anything: the outcome is only logged as
+        [TS-STATUS-RECHECK], which the agent forwards to Telegram."""
+        if not ts_order_id or ts_order_id in self._status_watch:
+            return
+        self._status_watch[ts_order_id] = (time.monotonic(), status, str(client_order_id))
+        self._log.warning(
+            f"[TS-STATUS-WATCH] TS order {ts_order_id} ({client_order_id}) got {status} "
+            f"we did not request — no NT action, broker recheck in "
+            f"{self._STATUS_RECHECK_S:.0f}s"
+        )
+
+    def _recheck_watched_statuses(self, orders: list) -> None:
+        """§149: report what became of each watched order. Pure observation."""
+        if not self._status_watch:
+            return
+        now = time.monotonic()
+        by_id = {str(o.get("OrderID")): o for o in orders}
+        for ts_id in list(self._status_watch):
+            first_seen, status, coid = self._status_watch[ts_id]
+            if now - first_seen < self._STATUS_RECHECK_S:
+                continue
+            del self._status_watch[ts_id]
+            o = by_id.get(ts_id)
+            now_status = (o or {}).get("Status") or "-"
+            cat = _st.category(now_status)
+            if o is None:
+                verdict = "NOT FOUND in broker order list"
+            elif cat == "open":
+                verdict = "STILL LIVE - kept, NT state unchanged"
+            else:
+                verdict = f"CLOSED at broker ({cat})"
+            inst = "?"
+            try:
+                cached = self._cache.order(ClientOrderId(coid))
+                if cached is not None:
+                    inst = cached.instrument_id.symbol.value
+            except Exception:
+                pass
+            self._log.warning(
+                f"[TS-STATUS-RECHECK] TS order {ts_id} ({coid}, {inst}) got {status} "
+                f"unsolicited; {now - first_seen:.0f}s later broker status={now_status} "
+                f"-> {verdict}"
+            )
 
     def _register_cancel_verify(self, ts_order_id: str, requested: bool = True) -> None:
         """Queue a cancelled order for §111 zombie verification (idempotent)."""
@@ -1175,7 +1219,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
           CANCELED → cancel, REJECTED → reject; OPEN (incl. DON, UCN, LAT, BRO)
           → no event; WATCH codes and unknown codes → _watch_status
         """
-        if not self._ts_order_id_to_client_order_id and not self._cancel_verify_pending:
+        if (not self._ts_order_id_to_client_order_id and not self._cancel_verify_pending
+                and not self._status_watch):
             return  # Nothing tracked yet
 
         try:
@@ -1187,6 +1232,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return
 
         await self._verify_pending_cancels(orders)  # §111
+        self._recheck_watched_statuses(orders)      # §149
 
         for ts_order in orders:
             ts_order_id = ts_order.get("OrderID")
@@ -1235,7 +1281,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # An in-flight amend had a 5xx: the adapter emitted no event, leaving the
             # order stuck in PENDING_UPDATE. Compare TS's current stop price to the
             # requested new price to decide whether the modify actually went through.
-            _TS_OPEN_STATUSES = ("OPN", "ACK", "FPR")
+            _TS_OPEN_STATUSES = _st.LIVE
             if cached_order.status == OrderStatus.PENDING_UPDATE and has_pending_amend:
                 if status not in _TS_OPEN_STATUSES:
                     # Order closed/expired at TS (e.g. DAY order at market-close).
@@ -1383,6 +1429,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
             elif status in _st.OPEN:
                 if status in _st.WATCH:
                     self._watch_status(ts_order_id, client_order_id, status)
+
+            elif status in _st.FILLED:
+                # Reached only for non-FLL filled codes (FLP).
+                self._log.warning(
+                    f"[TS-STATUS-WATCH] {client_order_id} status={status} "
+                    f"(Partial Fill UROut) not handled by the adapter — rechecking"
+                )
+                self._watch_status(ts_order_id, client_order_id, status)
 
             else:
                 self._log.warning(
@@ -1561,6 +1615,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
         elif status in _st.OPEN:
             if status in _st.WATCH:
                 self._watch_status(ts_order_id, client_order_id, status)
+
+        elif status in _st.FILLED:
+            # Reached only for non-FLL filled codes (FLP).
+            self._log.warning(
+                f"[TS-STATUS-WATCH] {client_order_id} status={status} "
+                f"(Partial Fill UROut) not handled by the adapter — rechecking"
+            )
+            self._watch_status(ts_order_id, client_order_id, status)
 
         else:
             self._log.warning(
