@@ -70,19 +70,20 @@ class TradeStationOrderSide(str, Enum):
 class TradeStationOrderStatus(str, Enum):
     """
     Represents a TradeStation order status.
+    Categories live in common/order_status.py — use those, not this enum, to decide behaviour.
     """
 
-    ACK = "ACK"  # Acknowledged
+    ACK = "ACK"  # Received
     FLL = "FLL"  # Filled
-    FLP = "FLP"  # Partially Filled
-    FPR = "FPR"  # Filled Partial Replaced
+    FLP = "FLP"  # Partial Fill (UROut)
+    FPR = "FPR"  # Partial Fill (Alive)
     CAN = "CAN"  # Canceled
     EXP = "EXP"  # Expired
     REJ = "REJ"  # Rejected
     BRO = "BRO"  # Broken
-    LAT = "LAT"  # Too Late
-    DON = "DON"  # Done for Day
-    UCN = "UCN"  # User Canceled
-    TSC = "TSC"  # Trailing Stop Canceled
-    OPN = "OPN"  # Open
+    LAT = "LAT"  # Too Late to Cancel
+    DON = "DON"  # Queued
+    UCN = "UCN"  # Cancel Sent
+    TSC = "TSC"  # Trade Server Canceled
+    OPN = "OPN"  # Sent
     UPD = "UPD"  # Updated
