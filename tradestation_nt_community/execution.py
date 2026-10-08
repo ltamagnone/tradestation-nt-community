@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from tradestation_nt_community._attribution import order_attribution
+from tradestation_nt_community.common import order_status as _st
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
 from tradestation_nt_community.parsing.execution import convert_order_type
@@ -71,18 +72,6 @@ from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders import StopLimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
-
-
-def _is_gtc_session_pause(status: str, cached_order) -> bool:
-    """TradeStation 'DON' (done for day) on a GTC order is a session pause.
-
-    The order stays in the broker's working list (status=Open, LESSONS §49) and
-    resumes next session — it can still fill. Treating it as cancelled closed it in
-    NT (a later same-session fill would be dropped) and queued it for the §111
-    verifier, which re-cancelled the live exit once it returned to ACK (every
-    weekday close, e.g. #972249111 2026-09-23 21:02Z). DAY orders: a real expiry.
-    """
-    return status == "DON" and getattr(cached_order, "time_in_force", None) == TimeInForce.GTC
 
 
 def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
@@ -229,6 +218,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # reported cancelled, checked against the safety poll's own order fetch.
         # In-memory only: cross-restart zombies remain the agent orphan scan's job.
         self._cancel_verify_pending: dict[str, tuple[float, int]] = {}
+        # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
+        self._status_watch: dict[str, tuple[float, str, str]] = {}
 
         # Streaming configuration
         self._use_streaming = use_streaming
@@ -1124,7 +1115,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
             except Exception as e:
                 self._log.error(f"Error in status safety poll: {e}")
 
-    def _register_cancel_verify(self, ts_order_id: str) -> None:
+    def _watch_status(self, ts_order_id: str, client_order_id, status: str) -> None:
+        """§149: park an ambiguous status for a broker recheck (body: Task 3)."""
+        raise NotImplementedError
+
+    def _register_cancel_verify(self, ts_order_id: str, requested: bool = True) -> None:
         """Queue a cancelled order for §111 zombie verification (idempotent)."""
         if ts_order_id and ts_order_id not in self._cancel_verify_pending:
             self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0)
@@ -1176,11 +1171,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """Fetch current orders and emit events for any status changes.
 
         Status flow:
-          ACK / OPN → order is open
-          FLL       → fully filled   → generate_order_filled
-          CAN / UCN / OUT / EXP / DON → canceled/expired → generate_order_canceled
-          DON on a GTC order → session pause, no event (_is_gtc_session_pause)
-          REJ / BRO / LAT → rejected → generate_order_rejected
+          Terminal categories per common/order_status.py: FILLED → fill,
+          CANCELED → cancel, REJECTED → reject; OPEN (incl. DON, UCN, LAT, BRO)
+          → no event; WATCH codes and unknown codes → _watch_status
         """
         if not self._ts_order_id_to_client_order_id and not self._cancel_verify_pending:
             return  # Nothing tracked yet
@@ -1358,25 +1351,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
 
-            elif _is_gtc_session_pause(status, cached_order):
-                self._log.info(
-                    f"Order {client_order_id} GTC status=DON — session pause, kept open"
-                )
-
-            elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
-                # Canceled or expired
-                self.generate_order_canceled(
-                    strategy_id=cached_order.strategy_id,
-                    instrument_id=cached_order.instrument_id,
-                    client_order_id=client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=ts_now,
-                )
-                self._register_cancel_verify(ts_order_id)  # §111
-                self._log.info(f"Order canceled: {client_order_id} (status={status})")
-
-            elif status in ("REJ", "BRO", "LAT"):
-                # Rejected
+            elif status in _st.REJECTED:
                 reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
                 self.generate_order_rejected(
                     strategy_id=cached_order.strategy_id,
@@ -1386,6 +1361,35 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=ts_now,
                 )
                 self._log.error(f"Order rejected: {client_order_id} ({reason})")
+
+            elif status in _st.CANCELED:
+                self.generate_order_canceled(
+                    strategy_id=cached_order.strategy_id,
+                    instrument_id=cached_order.instrument_id,
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    ts_event=ts_now,
+                )
+                self._register_cancel_verify(ts_order_id, requested=False)  # §111
+                if status in _st.WATCH:
+                    self._watch_status(ts_order_id, client_order_id, status)
+                self._log.info(f"Order canceled: {client_order_id} (status={status})")
+
+            elif status == "DON":
+                self._log.info(
+                    f"Order {client_order_id} status=DON (Queued) — session pause, kept open"
+                )
+
+            elif status in _st.OPEN:
+                if status in _st.WATCH:
+                    self._watch_status(ts_order_id, client_order_id, status)
+
+            else:
+                self._log.warning(
+                    f"[TS-STATUS-WATCH] {client_order_id} unknown TS status {status!r} "
+                    f"— no NT event, rechecking"
+                )
+                self._watch_status(ts_order_id, client_order_id, status)
 
     async def _token_keepalive_loop(self) -> None:
         """Background task: keep the OAuth access token fresh in streaming mode.
@@ -1524,24 +1528,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px} [fill-source=sse]")
 
-        elif _is_gtc_session_pause(status, cached_order):
-            self._log.info(
-                f"Stream: order {client_order_id} GTC status=DON — session pause, kept open"
-            )
-
-        elif status in ("CAN", "UCN", "OUT", "EXP", "DON"):
-            self.generate_order_canceled(
-                strategy_id=cached_order.strategy_id,
-                instrument_id=cached_order.instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_now,
-            )
-            self._register_cancel_verify(ts_order_id)  # §111
-            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
-            self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
-
-        elif status in ("REJ", "BRO", "LAT"):
+        elif status in _st.REJECTED:
             reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
             self.generate_order_rejected(
                 strategy_id=cached_order.strategy_id,
@@ -1551,6 +1538,36 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_event=ts_now,
             )
             self._log.error(f"Stream: order rejected: {client_order_id} ({reason})")
+
+        elif status in _st.CANCELED:
+            self.generate_order_canceled(
+                strategy_id=cached_order.strategy_id,
+                instrument_id=cached_order.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=ts_now,
+            )
+            self._register_cancel_verify(ts_order_id, requested=False)  # §111
+            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
+            if status in _st.WATCH:
+                self._watch_status(ts_order_id, client_order_id, status)
+            self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
+
+        elif status == "DON":
+            self._log.info(
+                f"Stream: order {client_order_id} status=DON (Queued) — session pause, kept open"
+            )
+
+        elif status in _st.OPEN:
+            if status in _st.WATCH:
+                self._watch_status(ts_order_id, client_order_id, status)
+
+        else:
+            self._log.warning(
+                f"[TS-STATUS-WATCH] {client_order_id} unknown TS status {status!r} "
+                f"— no NT event, rechecking"
+            )
+            self._watch_status(ts_order_id, client_order_id, status)
 
     # -- INTERNAL METHODS -----------------------------------------------------------------
 

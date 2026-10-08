@@ -1229,10 +1229,13 @@ class TestDonIsASessionPauseForGtc:
         m._register_cancel_verify.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_day_don_is_still_a_cancel(self):
+    async def test_day_don_is_also_a_pause(self):
+        """Spec: "DON – Queued" is in the Open category for any TIF; 0 DAY-order DONs
+        observed since 2026-09-29. No cancel, no §111 verify (was: DAY DON -> cancel)."""
         m = self._client(TimeInForce.DAY)
         await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": "DON"})
-        m.generate_order_canceled.assert_called_once()
+        m.generate_order_canceled.assert_not_called()
+        m._register_cancel_verify.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_don_then_ack_emits_nothing_and_no_cancel_verify(self):
