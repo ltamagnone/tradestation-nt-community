@@ -127,7 +127,7 @@ class TestParsingExecutionModule:
         assert parse_order_status("FLP") == OrderStatus.PARTIALLY_FILLED
 
     def test_parse_order_status_unknown_defaults(self):
-        assert parse_order_status("???") == OrderStatus.PENDING_UPDATE
+        assert parse_order_status("???") == OrderStatus.ACCEPTED
 
     def test_parse_ts_order_type_all(self):
         assert parse_ts_order_type("Market") == OrderType.MARKET
@@ -628,3 +628,19 @@ class TestParseOptionInstrument:
         instrument = parse_instrument("AAPL 250321P00170000", data, TRADESTATION_VENUE)
         assert instrument is not None
         assert instrument.option_kind == OptionKind.PUT
+
+
+from nautilus_trader.model.enums import OrderStatus as _OS  # noqa: E402
+from tradestation_nt_community.parsing.execution import parse_order_status  # noqa: E402
+
+
+def test_parse_order_status_follows_categories():
+    assert parse_order_status("UCN") == _OS.ACCEPTED   # open, not canceled
+    assert parse_order_status("DON") == _OS.ACCEPTED
+    assert parse_order_status("FPR") == _OS.PARTIALLY_FILLED
+    assert parse_order_status("OPN") == _OS.SUBMITTED
+    assert parse_order_status("TSC") == _OS.CANCELED
+    assert parse_order_status("EXP") == _OS.EXPIRED
+    assert parse_order_status("REJ") == _OS.REJECTED
+    assert parse_order_status("FLL") == _OS.FILLED
+    assert parse_order_status("XYZ") == _OS.ACCEPTED   # unknown: assume live

@@ -99,8 +99,17 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 - TradeStation rejects FOK orders -- use `TimeInForce.DAY`
 - `reduce_only` is silently ignored (no broker-side effect)
 - Only full fills (FLL) trigger fill reports; no partial fill (FLP) handling
-- `DON` (done for day) on a **GTC** order is a session pause, not a cancel — the order stays working at the broker and resumes next session; only a **DAY** order's `DON` is a real cancel (§140)
+- `DON` ('Queued', Open category) is a session pause for every time-in-force, never a cancel (§149)
 - `[UNCACHED-FILL]` WARNING = a mapped TS order filled but NT's cache has no order (placed before a node restart — startup reconciliation rebuilds 0 orders), so the strategy never sees that fill; HEAL CASE-A / PERIODIC-RECON must reconcile it. Fills whose `ClosedDateTime` predates this adapter instance (already delivered by the previous process) log at INFO only (40b9a55).
 - Options: instrument loading works, but order submission is not implemented
 - TradeStation uses SSE (not WebSocket) for streaming
 - Instruments should be pre-loaded via `instrument_ids` config for reliable subscriptions
+
+## Order status categories (§149)
+
+- Source of truth: `tradestation_nt_community/common/order_status.py`, copied verbatim from the TS OpenAPI spec (never import status sets from elsewhere).
+- Four categories: Open (incl. ACK, DON, UCN, LAT, BRO), Canceled, Rejected, Filled; WATCH codes and unknown codes are held, not acted on.
+- UCN = Cancel Sent (Open) -- never a cancel. DON = Queued (Open) -- a pause for every TIF.
+- §111 re-cancels only cancels we requested; an unrequested cancel still live at the broker logs `[CANCEL-MISMATCH]` (ERROR) and is not re-cancelled.
+- Log tags: `[TS-STATUS-WATCH]`, `[TS-STATUS-RECHECK]` (5-min broker recheck), `[CANCEL-MISMATCH]`, `[FILL-AFTER-CANCEL]` (broker fill on an order NT closed as CANCELED/EXPIRED; observe-only).
+- Do not add status sets elsewhere -- import `common/order_status`.

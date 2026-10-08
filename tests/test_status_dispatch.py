@@ -109,3 +109,12 @@ class TestDispatch:
         await deliver(m, "UCN")
         m._watch_status.assert_not_called()
         m.generate_order_canceled.assert_not_called()
+
+
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+async def test_fill_on_cancelled_order_is_loud(deliver):
+    m = _client(closed=True)  # NT: CANCELED
+    await deliver(m, "FLL")
+    m.generate_order_filled.assert_not_called()  # observe only
+    msg = m._log.error.call_args.args[0]
+    assert "[FILL-AFTER-CANCEL] TS order TS-1 (O-EXIT, MNQZ26) filled at the broker" in msg

@@ -88,6 +88,19 @@ def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
     )
 
 
+def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_order) -> None:
+    """§149 observe-only: the broker filled an order NT already closed as
+    CANCELED/EXPIRED — the position may be untracked.  No fill is emitted."""
+    if status in _st.FILLED and cached_order.status in (
+            OrderStatus.CANCELED, OrderStatus.EXPIRED):
+        log.error(
+            f"[FILL-AFTER-CANCEL] TS order {ts_order_id} ({client_order_id}, "
+            f"{cached_order.instrument_id.symbol.value}) filled at the broker but "
+            f"NT closed it as {cached_order.status.name} — position may be "
+            f"untracked (§149)"
+        )
+
+
 def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id, instance_started_s) -> None:
     """Log an FLL/FLP fill for a mapped TS order absent from the NT cache.
 
@@ -1176,7 +1189,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     async def _verify_pending_cancels(self, orders: list) -> None:
         """§111: re-check every order reported cancelled against the broker's own
-        order list; if still ACK/OPN/FPR >=_CANCEL_VERIFY_MIN_AGE_S later, re-issue
+        order list; if still live (common/order_status.LIVE) >=_CANCEL_VERIFY_MIN_AGE_S later, re-issue
         the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Only cancels this
         session SENT are re-issued (§149: an observed-but-unrequested cancel that is
         still live is logged as [CANCEL-MISMATCH], never cancelled).  In-memory only: zombies from a
@@ -1291,6 +1304,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Also clean up any stale pending-amend record (e.g. SSE filled it first).
             if cached_order.is_closed:
                 self._pending_modify_trigger_price.pop(client_order_id, None)
+                _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
                 continue
 
             # --- PENDING_UPDATE recovery ---
@@ -1543,6 +1557,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
             return
         if cached_order.is_closed:
+            _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
             return
 
         venue_order_id = VenueOrderId(ts_order_id)

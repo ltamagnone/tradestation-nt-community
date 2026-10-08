@@ -65,8 +65,8 @@ class TestOrderStatusParsing:
     def test_flp_maps_to_partially_filled(self):
         assert parse_order_status("FLP") == OrderStatus.PARTIALLY_FILLED
 
-    def test_unknown_returns_pending_update(self):
-        assert parse_order_status("UNKNOWN_XYZ") == OrderStatus.PENDING_UPDATE
+    def test_unknown_assumed_live(self):
+        assert parse_order_status("UNKNOWN_XYZ") == OrderStatus.ACCEPTED
 
 
 class TestOrderTypeParsing:

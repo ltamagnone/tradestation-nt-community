@@ -14,6 +14,7 @@ from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
+from tradestation_nt_community.common import order_status as _st
 from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLimitOrder, StopMarketOrder
 
 
@@ -27,14 +28,15 @@ _TIF_TO_TS: dict[TimeInForce, str] = {
 }
 
 _TS_STATUS_TO_NT: dict[str, OrderStatus] = {
-    "ACK": OrderStatus.ACCEPTED,
+    **{c: OrderStatus.ACCEPTED for c in _st.OPEN},
+    **{c: OrderStatus.CANCELED for c in _st.CANCELED},
     "OPN": OrderStatus.SUBMITTED,
-    "FLL": OrderStatus.FILLED,
-    "FLP": OrderStatus.PARTIALLY_FILLED,
-    "OUT": OrderStatus.CANCELED,
-    "REJ": OrderStatus.REJECTED,
-    "CAN": OrderStatus.CANCELED,
+    "PLA": OrderStatus.SUBMITTED,
+    "FPR": OrderStatus.PARTIALLY_FILLED,
     "EXP": OrderStatus.EXPIRED,
+    "REJ": OrderStatus.REJECTED,
+    "FLL": OrderStatus.FILLED,
+    "FLP": OrderStatus.PARTIALLY_FILLED,  # unchanged: never observed (0 in logs 2026-10-08)
 }
 
 _TS_ORDER_TYPE_TO_NT: dict[str, OrderType] = {
@@ -125,8 +127,9 @@ def convert_order_to_ts_format(order: Order, account_id: str) -> dict[str, Any]:
 
 
 def parse_order_status(ts_status: str) -> OrderStatus:
-    """Parse a TradeStation order status string to NautilusTrader OrderStatus."""
-    return _TS_STATUS_TO_NT.get(ts_status, OrderStatus.PENDING_UPDATE)
+    """TS status -> NT OrderStatus by spec category (common/order_status.py).
+    Unknown codes are assumed live (ACCEPTED) — never invent a terminal state."""
+    return _TS_STATUS_TO_NT.get(ts_status, OrderStatus.ACCEPTED)
 
 
 def parse_ts_order_type(ts_order_type: str) -> OrderType:

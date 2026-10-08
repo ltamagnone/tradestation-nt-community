@@ -98,3 +98,34 @@ class TestUnrequestedCancelIsNeverReissued:
         assert stub._cancel_verify_pending["1"][1:] == (0, False)
         TradeStationExecutionClient._register_cancel_verify(stub, "1", requested=True)
         assert stub._cancel_verify_pending["1"][2] is True   # requested wins
+
+
+class TestStatusAwareVerify:
+    """R11: pin the §149 requested/unrequested x UCN/LAT/DON matrix."""
+
+    async def _run(self, status, requested):
+        old = time.monotonic() - 300
+        stub = _stub({"961146425": (old, 0, requested)})
+        await TradeStationExecutionClient._verify_pending_cancels(
+            stub, [_open_order(status=status)])
+        return stub
+
+    async def test_unrequested_ucn_kept_silent(self):
+        stub = await self._run("UCN", False)
+        stub._client.cancel_order.assert_not_awaited()
+        assert "961146425" in stub._cancel_verify_pending
+        stub._log.error.assert_not_called()
+
+    async def test_requested_lat_not_recancelled(self):
+        stub = await self._run("LAT", True)
+        stub._client.cancel_order.assert_not_awaited()
+
+    async def test_requested_don_is_recancelled(self):
+        stub = await self._run("DON", True)
+        stub._client.cancel_order.assert_awaited_once_with(order_id="961146425")
+
+    async def test_unrequested_don_is_mismatch_not_cancelled(self):
+        stub = await self._run("DON", False)
+        stub._client.cancel_order.assert_not_awaited()
+        assert "[CANCEL-MISMATCH]" in stub._log.error.call_args.args[0]
+        assert "961146425" not in stub._cancel_verify_pending
