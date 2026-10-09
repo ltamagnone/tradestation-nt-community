@@ -1176,18 +1176,26 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if cat == "canceled" and cached is not None and not cached.is_closed:
                     # R24: the broker confirmed a terminal Canceled status for an
                     # order we held; close NT's side. Never re-cancelled (§149).
-                    try:
-                        self.generate_order_canceled(
-                            strategy_id=cached.strategy_id,
-                            instrument_id=cached.instrument_id,
-                            client_order_id=ClientOrderId(coid),
-                            venue_order_id=VenueOrderId(ts_id),
-                            ts_event=self._clock.timestamp_ns(),
-                        )
-                        self._register_cancel_verify(ts_id, requested=False)
-                        verdict += " - NT order closed"
-                    except Exception as e:
-                        self._log.error(f"[TS-STATUS-RECHECK] cancel emit failed for {coid}: {e}")
+                    # R28: only if ts_id is still this order's venue id (a replace
+                    # may have remapped it) and the status is a plain cancel.
+                    if (self._ts_order_id_to_client_order_id.get(ts_id)
+                            != ClientOrderId(coid)):
+                        verdict += " - id remapped, NT order untouched"
+                    elif now_status not in (_st.CANCELED - _st.WATCH):
+                        verdict += f" - still {now_status}, NT order kept open (held)"
+                    else:
+                        try:
+                            self.generate_order_canceled(
+                                strategy_id=cached.strategy_id,
+                                instrument_id=cached.instrument_id,
+                                client_order_id=ClientOrderId(coid),
+                                venue_order_id=VenueOrderId(ts_id),
+                                ts_event=self._clock.timestamp_ns(),
+                            )
+                            self._register_cancel_verify(ts_id, requested=False)
+                            verdict += " - NT order closed"
+                        except Exception as e:
+                            self._log.error(f"[TS-STATUS-RECHECK] cancel emit failed for {coid}: {e}")
             self._log.warning(
                 f"[TS-STATUS-RECHECK] TS order {ts_id} ({coid}, {inst}) got {status} "
                 f"unsolicited; {now - first_seen:.0f}s later broker status={now_status} "

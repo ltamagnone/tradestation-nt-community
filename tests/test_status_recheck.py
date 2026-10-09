@@ -1,6 +1,8 @@
 import time
 from unittest.mock import MagicMock
 
+from nautilus_trader.model.identifiers import ClientOrderId
+
 from tradestation_nt_community.execution import TradeStationExecutionClient as C
 
 
@@ -67,6 +69,7 @@ def _stub_cached(watch, closed=False):
     m._cache.order.return_value = cached
     m._clock = MagicMock()
     m._clock.timestamp_ns.return_value = 123
+    m._ts_order_id_to_client_order_id = {"9": ClientOrderId("O-1")}
     return m, cached
 
 
@@ -103,3 +106,25 @@ def test_recheck_missing_status_is_unknown_not_closed():
     m = _stub({"9": (time.monotonic() - 400, "UCN", "O-1")})
     C._recheck_watched_statuses(m, [{"OrderID": "9"}])
     assert _line(m).endswith("-> STATUS UNKNOWN at broker")
+
+
+import pytest
+
+
+@pytest.mark.parametrize("idmap", [{"9": ClientOrderId("O-2")}, {}])
+def test_recheck_remapped_id_does_not_close_nt(idmap):
+    m, _ = _stub_cached({"9": (time.monotonic() - 400, "UCH", "O-1")})
+    m._ts_order_id_to_client_order_id = idmap
+    C._recheck_watched_statuses(m, [{"OrderID": "9", "Status": "OUT"}])
+    m.generate_order_canceled.assert_not_called()
+    m._register_cancel_verify.assert_not_called()
+    assert _line(m).endswith("-> CLOSED at broker (canceled) - id remapped, NT order untouched")
+
+
+def test_recheck_broker_still_held_code_does_not_close_nt():
+    m, _ = _stub_cached({"9": (time.monotonic() - 400, "UCH", "O-1")})
+    C._recheck_watched_statuses(m, [{"OrderID": "9", "Status": "UCH"}])
+    m.generate_order_canceled.assert_not_called()
+    m._register_cancel_verify.assert_not_called()
+    assert _line(m).endswith(
+        "-> CLOSED at broker (canceled) - still UCH, NT order kept open (held)")
