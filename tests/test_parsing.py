@@ -635,7 +635,9 @@ def test_parse_order_status_follows_categories():
     assert parse_order_status("DON") == OrderStatus.ACCEPTED
     assert parse_order_status("FPR") == OrderStatus.PARTIALLY_FILLED
     assert parse_order_status("OPN") == OrderStatus.SUBMITTED
-    assert parse_order_status("TSC") == OrderStatus.CANCELED
+    for held in ("TSC", "SCN", "RJR", "UCH"):  # R24: held = assume live
+        assert parse_order_status(held) == OrderStatus.ACCEPTED
+    assert parse_order_status("OUT") == OrderStatus.CANCELED
     assert parse_order_status("EXP") == OrderStatus.EXPIRED
     assert parse_order_status("REJ") == OrderStatus.REJECTED
     assert parse_order_status("FLL") == OrderStatus.FILLED

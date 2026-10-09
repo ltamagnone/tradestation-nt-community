@@ -1157,19 +1157,37 @@ class TradeStationExecutionClient(LiveExecutionClient):
             o = by_id.get(ts_id)
             now_status = (o or {}).get("Status") or "-"
             cat = _st.category(now_status)
-            if o is None:
-                verdict = "NOT FOUND in broker order list"
-            elif cat == "open":
-                verdict = "STILL LIVE - kept, NT state unchanged"
-            else:
-                verdict = f"CLOSED at broker ({cat})"
+            cached = None
             inst = "?"
             try:
                 cached = self._cache.order(ClientOrderId(coid))
                 if cached is not None:
                     inst = cached.instrument_id.symbol.value
             except Exception:
-                pass
+                cached = None
+            if o is None:
+                verdict = "NOT FOUND in broker order list"
+            elif now_status == "-":
+                verdict = "STATUS UNKNOWN at broker"
+            elif cat == "open":
+                verdict = "STILL LIVE - kept, NT state unchanged"
+            else:
+                verdict = f"CLOSED at broker ({cat})"
+                if cat == "canceled" and cached is not None and not cached.is_closed:
+                    # R24: the broker confirmed a terminal Canceled status for an
+                    # order we held; close NT's side. Never re-cancelled (§149).
+                    try:
+                        self.generate_order_canceled(
+                            strategy_id=cached.strategy_id,
+                            instrument_id=cached.instrument_id,
+                            client_order_id=ClientOrderId(coid),
+                            venue_order_id=VenueOrderId(ts_id),
+                            ts_event=self._clock.timestamp_ns(),
+                        )
+                        self._register_cancel_verify(ts_id, requested=False)
+                        verdict += " - NT order closed"
+                    except Exception as e:
+                        self._log.error(f"[TS-STATUS-RECHECK] cancel emit failed for {coid}: {e}")
             self._log.warning(
                 f"[TS-STATUS-RECHECK] TS order {ts_id} ({coid}, {inst}) got {status} "
                 f"unsolicited; {now - first_seen:.0f}s later broker status={now_status} "
@@ -1211,7 +1229,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if ts_order_id not in live:
                 del self._cancel_verify_pending[ts_order_id]
                 continue
-            if live[ts_order_id] in ("UCN", "LAT"):
+            if live[ts_order_id] in _st.CANCEL_PENDING:
                 continue  # our cancel still pending / too late — a terminal status follows
             if not requested:
                 self._log.error(
@@ -1439,7 +1457,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
                 self._log.error(f"Order rejected: {client_order_id} ({reason})")
 
-            elif status in _st.CANCELED:
+            elif status in _st.CANCELED and status not in _st.WATCH:
                 self.generate_order_canceled(
                     strategy_id=cached_order.strategy_id,
                     instrument_id=cached_order.instrument_id,
@@ -1448,8 +1466,6 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=ts_now,
                 )
                 self._register_cancel_verify(ts_order_id, requested=False)  # §111
-                if status in _st.WATCH:
-                    self._watch_status(ts_order_id, client_order_id, status)
                 self._log.info(f"Order canceled: {client_order_id} (status={status})")
 
             elif status == "DON":
@@ -1457,8 +1473,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"Order {client_order_id} status=DON (Queued) — session pause, kept open"
                 )
 
-            elif status in _st.OPEN:
-                if status in _st.WATCH:
+            elif status in _st.OPEN or status in _st.CANCELED:
+                # R24: CANCELED∩WATCH codes land here too (held, no NT event).
+                # R25: our own in-flight cancel's echo is expected, not watched.
+                if (status in _st.WATCH
+                        and cached_order.status != OrderStatus.PENDING_CANCEL):
                     self._watch_status(ts_order_id, client_order_id, status)
 
             elif status in _st.FILLED:
@@ -1625,7 +1644,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             self._log.error(f"Stream: order rejected: {client_order_id} ({reason})")
 
-        elif status in _st.CANCELED:
+        elif status in _st.CANCELED and status not in _st.WATCH:
             self.generate_order_canceled(
                 strategy_id=cached_order.strategy_id,
                 instrument_id=cached_order.instrument_id,
@@ -1635,8 +1654,6 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             self._register_cancel_verify(ts_order_id, requested=False)  # §111
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
-            if status in _st.WATCH:
-                self._watch_status(ts_order_id, client_order_id, status)
             self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
 
         elif status == "DON":
@@ -1644,8 +1661,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"Stream: order {client_order_id} status=DON (Queued) — session pause, kept open"
             )
 
-        elif status in _st.OPEN:
-            if status in _st.WATCH:
+        elif status in _st.OPEN or status in _st.CANCELED:
+            # R24: CANCELED∩WATCH codes land here too (held, no NT event).
+            # R25: our own in-flight cancel's echo is expected, not watched.
+            if status in _st.WATCH and cached_order.status != OrderStatus.PENDING_CANCEL:
                 self._watch_status(ts_order_id, client_order_id, status)
 
         elif status in _st.FILLED:

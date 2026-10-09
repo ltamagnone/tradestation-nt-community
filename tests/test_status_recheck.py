@@ -55,3 +55,51 @@ def test_recheck_reports_not_found():
     C._recheck_watched_statuses(m, [])
     assert "broker status=- -> NOT FOUND in broker order list" in _line(m)
     assert "9" not in m._status_watch
+
+
+def _stub_cached(watch, closed=False):
+    m = _stub(watch)
+    cached = MagicMock()
+    cached.is_closed = closed
+    cached.strategy_id = "S-001"
+    cached.instrument_id = MagicMock()
+    cached.instrument_id.symbol.value = "MNQZ26"
+    m._cache.order.return_value = cached
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 123
+    return m, cached
+
+
+def test_recheck_canceled_at_broker_closes_open_nt_order():
+    m, cached = _stub_cached({"9": (time.monotonic() - 400, "UCH", "O-1")})
+    C._recheck_watched_statuses(m, [{"OrderID": "9", "Status": "OUT"}])
+    m.generate_order_canceled.assert_called_once()
+    kw = m.generate_order_canceled.call_args.kwargs
+    assert kw["strategy_id"] == "S-001"
+    assert kw["instrument_id"] is cached.instrument_id
+    assert kw["ts_event"] == 123
+    m._register_cancel_verify.assert_called_once_with("9", requested=False)
+    line = _line(m)
+    assert line.startswith("[TS-STATUS-RECHECK]")
+    assert line.endswith("-> CLOSED at broker (canceled) - NT order closed")
+
+
+def test_recheck_canceled_at_broker_nt_already_closed_no_event():
+    m, _ = _stub_cached({"9": (time.monotonic() - 400, "UCH", "O-1")}, closed=True)
+    C._recheck_watched_statuses(m, [{"OrderID": "9", "Status": "OUT"}])
+    m.generate_order_canceled.assert_not_called()
+    m._register_cancel_verify.assert_not_called()
+    assert _line(m).endswith("-> CLOSED at broker (canceled)")
+
+
+def test_recheck_still_live_emits_nothing():
+    m, _ = _stub_cached({"9": (time.monotonic() - 400, "UCH", "O-1")})
+    C._recheck_watched_statuses(m, [{"OrderID": "9", "Status": "OPN"}])
+    m.generate_order_canceled.assert_not_called()
+    m._register_cancel_verify.assert_not_called()
+
+
+def test_recheck_missing_status_is_unknown_not_closed():
+    m = _stub({"9": (time.monotonic() - 400, "UCN", "O-1")})
+    C._recheck_watched_statuses(m, [{"OrderID": "9"}])
+    assert _line(m).endswith("-> STATUS UNKNOWN at broker")

@@ -64,6 +64,8 @@ CANCELLABLE: frozenset[str] = OPEN - {"DON", "UCN", "LAT"}
 # recheck: it logs [TS-STATUS-WATCH] on arrival and [TS-STATUS-RECHECK] with the
 # outcome, so the operator learns what they mean.
 WATCH: frozenset[str] = frozenset({"UCN", "LAT", "BRO", "RJC", "UCH", "RJR", "SCN", "TSC"})
+# A cancel is already in flight (UCN) or too late (LAT): never re-cancel, never treat as gone.
+CANCEL_PENDING: frozenset[str] = frozenset({"UCN", "LAT"})
 
 
 def category(code: str) -> str:

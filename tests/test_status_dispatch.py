@@ -9,10 +9,10 @@ from nautilus_trader.model.identifiers import (ClientOrderId, InstrumentId, Stra
 from tradestation_nt_community.execution import TradeStationExecutionClient
 
 
-def _client(tif=TimeInForce.GTC, closed=False):
+def _client(tif=TimeInForce.GTC, closed=False, status=None):
     cached = MagicMock()
     cached.is_closed = closed
-    cached.status = OrderStatus.CANCELED if closed else OrderStatus.ACCEPTED
+    cached.status = status or (OrderStatus.CANCELED if closed else OrderStatus.ACCEPTED)
     cached.time_in_force = tif
     cached.strategy_id = StrategyId("S-001")
     cached.instrument_id = InstrumentId(Symbol("MNQZ26"), Venue("TRADESTATION"))
@@ -72,11 +72,29 @@ class TestDispatch:
         m._register_cancel_verify.assert_called_once_with("TS-1", requested=False)
         m._watch_status.assert_not_called()
 
-    async def test_tsc_cancels_and_is_watched(self, deliver):
+    @pytest.mark.parametrize("code", ["TSC", "SCN", "RJR", "UCH"])
+    async def test_tsc_is_held_and_watched(self, deliver, code):
+        # R24: Canceled-category codes that are also WATCH are held (assume live).
         m = _client()
-        await deliver(m, "TSC")
-        m.generate_order_canceled.assert_called_once()
+        await deliver(m, code)
+        m.generate_order_canceled.assert_not_called()
+        m._register_cancel_verify.assert_not_called()
         m._watch_status.assert_called_once()
+
+    @pytest.mark.parametrize("code", ["CAN", "EXP", "OUT"])
+    async def test_plain_canceled_codes_still_cancel(self, deliver, code):
+        m = _client()
+        await deliver(m, code)
+        m.generate_order_canceled.assert_called_once()
+        m._register_cancel_verify.assert_called_once_with("TS-1", requested=False)
+
+    @pytest.mark.parametrize("code", ["UCN", "UCH", "RJR"])
+    async def test_pending_cancel_order_is_not_watched(self, deliver, code):
+        # R25: our own cancel is in flight; the echo is expected.
+        m = _client(status=OrderStatus.PENDING_CANCEL)
+        await deliver(m, code)
+        m._watch_status.assert_not_called()
+        m.generate_order_canceled.assert_not_called()
 
     async def test_rej_rejects(self, deliver):
         m = _client()

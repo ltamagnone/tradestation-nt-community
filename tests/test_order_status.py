@@ -50,3 +50,9 @@ def test_flp_is_terminal_fpr_is_live():
 
 def test_watch_set():
     assert st.WATCH == {"UCN", "LAT", "BRO", "RJC", "UCH", "RJR", "SCN", "TSC"}
+
+
+def test_cancel_pending_is_live_and_not_cancellable():
+    assert st.CANCEL_PENDING == {"UCN", "LAT"}
+    assert st.CANCEL_PENDING <= st.LIVE
+    assert st.CANCEL_PENDING.isdisjoint(st.CANCELLABLE)

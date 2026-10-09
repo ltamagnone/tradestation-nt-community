@@ -109,10 +109,11 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 
 - Source of truth: `tradestation_nt_community/common/order_status.py`, copied verbatim from the TS OpenAPI spec (never import status sets from elsewhere).
 - Four categories: Open (incl. ACK, DON, UCN, LAT, BRO), Canceled, Rejected, Filled.
-- Held (no NT event; `[TS-STATUS-WATCH]`, then `[TS-STATUS-RECHECK]` for WATCH codes): Open-category codes including DON, UCN, LAT, BRO and RJC, plus FLP and unknown codes.
-- Acted on as cancels: Canceled-category codes. The WATCH members TSC/SCN/RJR/UCH (never observed in production) are additionally rechecked and alerted, and `[CANCEL-MISMATCH]` fires if one is still live at the broker.
-- `parse_order_status` also feeds NT reconciliation reports (mass status, in-flight check): Open and unknown codes map to ACCEPTED (assume live), Canceled codes to CANCELED.
+- Held (no NT event; `[TS-STATUS-WATCH]`, then `[TS-STATUS-RECHECK]` for WATCH codes): Open-category codes (incl. DON, UCN, LAT, BRO, RJC), plus the Canceled-category WATCH codes TSC/SCN/RJR/UCH (R24: held, assume live), plus FLP and unknown codes. Orders whose NT status is PENDING_CANCEL are NOT watched (R25: our own cancel is in flight; the UCN echo is expected).
+- Acted on as cancels immediately: the remaining Canceled-category codes (CAN, EXP, OUT). The held TSC/SCN/RJR/UCH are closed only by the recheck: when the broker then shows a terminal Canceled status and the NT order is still open, it emits `generate_order_canceled` and registers `_register_cancel_verify(requested=False)` (never re-cancelled); the verdict gains ` - NT order closed`. A broker order with no Status gives `STATUS UNKNOWN at broker`. The old adapter never logged these codes, so their real frequency is unknown.
+- `parse_order_status` also feeds NT reconciliation reports (mass status, in-flight check): Open, unknown and TSC/SCN/RJR/UCH codes map to ACCEPTED (assume live, agreeing with the live paths); other Canceled codes (CAN, OUT) to CANCELED, EXP to EXPIRED.
 - UCN = Cancel Sent (Open) -- never a cancel. DON = Queued (Open) -- a pause for every TIF.
+- `CANCEL_PENDING = {UCN, LAT}` (`common/order_status.py`): a cancel is already in flight or too late; never re-cancel, never treat as gone. Used by `_verify_pending_cancels`.
 - §111 re-cancels only cancels we requested; an unrequested cancel still live at the broker logs `[CANCEL-MISMATCH]` (ERROR) and is not re-cancelled.
 - Log tags: `[TS-STATUS-WATCH]`, `[TS-STATUS-RECHECK]` (5-min broker recheck), `[CANCEL-MISMATCH]`, `[FILL-AFTER-CANCEL]` (broker fill on an order NT closed as CANCELED/EXPIRED; observe-only).
 - Do not add status sets elsewhere -- import `common/order_status`.

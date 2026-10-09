@@ -31,6 +31,9 @@ _TIF_TO_TS: dict[TimeInForce, str] = {
 _TS_STATUS_TO_NT: dict[str, OrderStatus] = {
     **{c: OrderStatus.ACCEPTED for c in _st.OPEN},
     **{c: OrderStatus.CANCELED for c in _st.CANCELED},
+    # R24: Canceled-category codes the adapter holds (assume live) so NT
+    # reconciliation agrees with the live dispatch paths.
+    **{c: OrderStatus.ACCEPTED for c in _st.CANCELED & _st.WATCH},
     "OPN": OrderStatus.SUBMITTED,
     "PLA": OrderStatus.SUBMITTED,
     "FPR": OrderStatus.PARTIALLY_FILLED,
