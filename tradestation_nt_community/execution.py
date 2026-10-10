@@ -165,6 +165,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
     # cancel but kept the order live on its book).
     _CANCEL_VERIFY_MIN_AGE_S = 120.0
     _CANCEL_VERIFY_MAX_ATTEMPTS = 3
+    _CANCEL_STUCK_ALERT_S = 600.0  # §150: requested cancel still UCN/LAT this long -> alert once
 
     def __init__(
         self,
@@ -230,7 +231,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # §111: post-cancel zombie verification — orders this session already
         # reported cancelled, checked against the safety poll's own order fetch.
         # In-memory only: cross-restart zombies remain the agent orphan scan's job.
-        self._cancel_verify_pending: dict[str, tuple[float, int, bool]] = {}
+        self._cancel_verify_pending: dict[str, tuple[float, int, bool, bool]] = {}
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -1209,9 +1210,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return
         prev = self._cancel_verify_pending.get(ts_order_id)
         if prev is None:
-            self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0, requested)
+            self._cancel_verify_pending[ts_order_id] = (time.monotonic(), 0, requested, False)
         elif requested and not prev[2]:
-            self._cancel_verify_pending[ts_order_id] = (prev[0], prev[1], True)
+            self._cancel_verify_pending[ts_order_id] = (prev[0], prev[1], True, prev[3])
 
     async def _verify_pending_cancels(self, orders: list) -> None:
         """§111: re-check every order reported cancelled against the broker's own
@@ -1231,14 +1232,26 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if o.get("Status") in _st.LIVE
         }
         for ts_order_id in list(self._cancel_verify_pending):
-            first_seen, attempts, requested = self._cancel_verify_pending[ts_order_id]
+            first_seen, attempts, requested, alerted = self._cancel_verify_pending[ts_order_id]
             if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S:
                 continue
             if ts_order_id not in live:
                 del self._cancel_verify_pending[ts_order_id]
                 continue
             if live[ts_order_id] in _st.CANCEL_PENDING:
-                continue  # our cancel still pending / too late — a terminal status follows
+                # our cancel still pending / too late — a terminal status normally follows.
+                # §150: but if it never does, say so once (never re-cancel).
+                if (requested and not alerted
+                        and now - first_seen >= self._CANCEL_STUCK_ALERT_S):
+                    self._log.error(
+                        f"[CANCEL-STUCK] Order {ts_order_id} cancel requested "
+                        f"{(now - first_seen) / 60:.0f} min ago but still "
+                        f"{live[ts_order_id]} at the broker — position protection "
+                        f"may be in doubt (§150)"
+                    )
+                    self._cancel_verify_pending[ts_order_id] = (
+                        first_seen, attempts, requested, True)
+                continue
             if not requested:
                 self._log.error(
                     f"[CANCEL-MISMATCH] Order {ts_order_id} was reported cancelled "
@@ -1264,7 +1277,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 await self._client.cancel_order(order_id=ts_order_id)
             except Exception as e:
                 self._log.warning(f"[CANCEL-ZOMBIE] re-cancel failed for {ts_order_id}: {e}")
-            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1, requested)
+            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1, requested, alerted)
 
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.

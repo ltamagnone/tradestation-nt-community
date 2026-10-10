@@ -115,5 +115,5 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 - UCN = Cancel Sent (Open) -- never a cancel. DON = Queued (Open) -- a pause for every TIF.
 - `CANCEL_PENDING = {UCN, LAT}` (`common/order_status.py`): a cancel is already in flight or too late; never re-cancel, never treat as gone. Used by `_verify_pending_cancels`.
 - §111 re-cancels only cancels we requested; an unrequested cancel still live at the broker logs `[CANCEL-MISMATCH]` (ERROR) and is not re-cancelled.
-- Log tags: `[TS-STATUS-WATCH]`, `[TS-STATUS-RECHECK]` (5-min broker recheck), `[CANCEL-MISMATCH]`, `[FILL-AFTER-CANCEL]` (broker fill on an order NT closed as CANCELED/EXPIRED; observe-only).
+- Log tags: `[TS-STATUS-WATCH]`, `[TS-STATUS-RECHECK]` (5-min broker recheck), `[CANCEL-MISMATCH]`, `[CANCEL-STUCK]` (ERROR once per order: a cancel we requested still UCN/LAT after 600 s; never re-cancelled, §150), `[FILL-AFTER-CANCEL]` (broker fill on an order NT closed as CANCELED/EXPIRED; observe-only).
 - Do not add status sets elsewhere -- import `common/order_status`.
