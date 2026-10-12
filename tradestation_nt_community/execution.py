@@ -202,6 +202,63 @@ def _float_or_none(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
+                       client_order_id, cached_order, venue_order_id, ts_now: int,
+                       *, stream: bool) -> None:
+    """Non-FLL status dispatch shared by the SSE path (_process_order_event) and the
+    poll path (_check_order_statuses).  Module-level (like _handle_uncached_fill) so
+    both paths call one body.  Terminal REJ/CAN-class codes emit NT events; DON and
+    held (WATCH/open/unknown/FLP) codes emit nothing and go to ``_watch_status``."""
+    lead = "Stream: order" if stream else "Order"
+    log = client._log
+    if status in _st.REJECTED:
+        reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
+        client.generate_order_rejected(
+            strategy_id=cached_order.strategy_id,
+            instrument_id=cached_order.instrument_id,
+            client_order_id=client_order_id,
+            reason=reason,
+            ts_event=ts_now,
+        )
+        log.error(f"{lead} rejected: {client_order_id} ({reason})")
+
+    elif status in _st.CANCELED and status not in _st.WATCH:
+        # EXP (Expired) is reported as canceled, not OrderExpired: this adapter has
+        # no generate_order_expired path anywhere, and the §111 cancel verifier plus
+        # strategies only know the canceled event.  Reports for EXP map to
+        # OrderStatus.EXPIRED (parsing/execution.py) on reconciliation.
+        client.generate_order_canceled(
+            strategy_id=cached_order.strategy_id,
+            instrument_id=cached_order.instrument_id,
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            ts_event=ts_now,
+        )
+        client._register_cancel_verify(ts_order_id, requested=False)  # §111
+        client._pending_modify_trigger_price.pop(client_order_id, None)  # no stale entry
+        log.info(f"{lead} canceled: {client_order_id} (status={status})")
+
+    elif status == "DON":
+        log.info(f"{lead} {client_order_id} status=DON (Queued) — session pause, kept open")
+
+    elif status in _st.OPEN or status in _st.CANCELED:
+        # R24: CANCELED∩WATCH codes land here too (held, no NT event).
+        # R25: our own in-flight cancel's echo is expected, not watched.
+        if status in _st.WATCH and cached_order.status != OrderStatus.PENDING_CANCEL:
+            client._watch_status(ts_order_id, client_order_id, status)
+
+    elif status in _st.FILLED:
+        # Reached only for non-FLL filled codes (FLP).
+        client._watch_status(
+            ts_order_id, client_order_id, status,
+            note="(Partial Fill UROut) not handled by the adapter")
+
+    else:
+        client._watch_status(
+            ts_order_id, client_order_id, status or "UNKNOWN",
+            note=f"unknown TS status {status or 'UNKNOWN'!r}")
+
+
 def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order_id) -> str:
     """Classify + log an uncached fill, then notify the registered callback (§151).
 
@@ -620,7 +677,18 @@ class TradeStationExecutionClient(LiveExecutionClient):
         poll/SSE events (different TradeId scheme -> possible double fill).
         Logged at DEBUG once per order.
         """
-        if client_order_id is None or self._cache.order(client_order_id) is None:
+        own = client_order_id is not None and self._cache.order(client_order_id) is not None
+        if not own and ts_order_id:
+            # A missing ts->coid mapping makes the caller mint ``TS-<id>``, which is
+            # never in the cache: fall back to NT's venue-order-id index so the guard
+            # cannot be bypassed for an order NT does track.
+            try:
+                cached_coid = self._cache.client_order_id(VenueOrderId(str(ts_order_id)))
+            except Exception:
+                cached_coid = None
+            if cached_coid is not None and self._cache.order(cached_coid) is not None:
+                client_order_id, own = cached_coid, True
+        if not own:
             return False
         seen = self.__dict__.setdefault("_own_order_report_skip_logged", set())
         if client_order_id not in seen:
@@ -1384,17 +1452,19 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     _STATUS_RECHECK_S = 300.0  # §149: broker recheck delay for an ambiguous status
 
-    def _watch_status(self, ts_order_id: str, client_order_id, status: str) -> None:
+    def _watch_status(self, ts_order_id: str, client_order_id, status: str,
+                      note: str = "") -> None:
         """§149: park an ambiguous/unsolicited status (UCN, LAT, ...) for a broker
         recheck. Never decides anything: the outcome is only logged as
-        [TS-STATUS-RECHECK], which the agent forwards to Telegram."""
+        [TS-STATUS-RECHECK], which the agent forwards to Telegram.  Warns once per
+        (order, status): a parked order is not re-logged."""
         if not ts_order_id or ts_order_id in self._status_watch:
             return
         self._status_watch[ts_order_id] = (time.monotonic(), status, str(client_order_id))
         self._log.warning(
             f"[TS-STATUS-WATCH] TS order {ts_order_id} ({client_order_id}) got {status} "
-            f"we did not request — no NT action, broker recheck in "
-            f"{self._STATUS_RECHECK_S:.0f}s"
+            f"we did not request{' ' + note if note else ''} — no NT action, "
+            f"broker recheck in {self._STATUS_RECHECK_S:.0f}s"
         )
 
     def _recheck_watched_statuses(self, orders: list) -> None:
@@ -1409,7 +1479,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 continue
             del self._status_watch[ts_id]
             o = by_id.get(ts_id)
-            now_status = (o or {}).get("Status") or "-"
+            now_status = "-" if o is None else (o.get("Status") or "UNKNOWN")
             cat = _st.category(now_status)
             cached = None
             inst = "?"
@@ -1421,8 +1491,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 cached = None
             if o is None:
                 verdict = "NOT FOUND in broker order list"
-            elif now_status == "-":
-                verdict = "STATUS UNKNOWN at broker"
+            elif now_status == "UNKNOWN":
+                verdict = "no Status reported at broker"
             elif cat == "open":
                 verdict = "STILL LIVE - kept, NT state unchanged"
             else:
@@ -1714,54 +1784,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
 
-            elif status in _st.REJECTED:
-                reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
-                self.generate_order_rejected(
-                    strategy_id=cached_order.strategy_id,
-                    instrument_id=cached_order.instrument_id,
-                    client_order_id=client_order_id,
-                    reason=reason,
-                    ts_event=ts_now,
-                )
-                self._log.error(f"Order rejected: {client_order_id} ({reason})")
-
-            elif status in _st.CANCELED and status not in _st.WATCH:
-                self.generate_order_canceled(
-                    strategy_id=cached_order.strategy_id,
-                    instrument_id=cached_order.instrument_id,
-                    client_order_id=client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=ts_now,
-                )
-                self._register_cancel_verify(ts_order_id, requested=False)  # §111
-                self._log.info(f"Order canceled: {client_order_id} (status={status})")
-
-            elif status == "DON":
-                self._log.info(
-                    f"Order {client_order_id} status=DON (Queued) — session pause, kept open"
-                )
-
-            elif status in _st.OPEN or status in _st.CANCELED:
-                # R24: CANCELED∩WATCH codes land here too (held, no NT event).
-                # R25: our own in-flight cancel's echo is expected, not watched.
-                if (status in _st.WATCH
-                        and cached_order.status != OrderStatus.PENDING_CANCEL):
-                    self._watch_status(ts_order_id, client_order_id, status)
-
-            elif status in _st.FILLED:
-                # Reached only for non-FLL filled codes (FLP).
-                self._log.warning(
-                    f"[TS-STATUS-WATCH] {client_order_id} status={status} "
-                    f"(Partial Fill UROut) not handled by the adapter — rechecking"
-                )
-                self._watch_status(ts_order_id, client_order_id, status)
-
             else:
-                self._log.warning(
-                    f"[TS-STATUS-WATCH] {client_order_id} unknown TS status {status!r} "
-                    f"— no NT event, rechecking"
-                )
-                self._watch_status(ts_order_id, client_order_id, status)
+                _apply_status_tail(
+                    self, status, ts_order, ts_order_id, client_order_id,
+                    cached_order, venue_order_id, ts_now, stream=False)
 
     async def _token_keepalive_loop(self) -> None:
         """Background task: keep the OAuth access token fresh in streaming mode.
@@ -1895,54 +1921,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
             self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px} [fill-source=sse]")
 
-        elif status in _st.REJECTED:
-            reason = ts_order.get("RejectReason", f"TradeStation status: {status}")
-            self.generate_order_rejected(
-                strategy_id=cached_order.strategy_id,
-                instrument_id=cached_order.instrument_id,
-                client_order_id=client_order_id,
-                reason=reason,
-                ts_event=ts_now,
-            )
-            self._log.error(f"Stream: order rejected: {client_order_id} ({reason})")
-
-        elif status in _st.CANCELED and status not in _st.WATCH:
-            self.generate_order_canceled(
-                strategy_id=cached_order.strategy_id,
-                instrument_id=cached_order.instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                ts_event=ts_now,
-            )
-            self._register_cancel_verify(ts_order_id, requested=False)  # §111
-            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
-            self._log.info(f"Stream: order canceled: {client_order_id} (status={status})")
-
-        elif status == "DON":
-            self._log.info(
-                f"Stream: order {client_order_id} status=DON (Queued) — session pause, kept open"
-            )
-
-        elif status in _st.OPEN or status in _st.CANCELED:
-            # R24: CANCELED∩WATCH codes land here too (held, no NT event).
-            # R25: our own in-flight cancel's echo is expected, not watched.
-            if status in _st.WATCH and cached_order.status != OrderStatus.PENDING_CANCEL:
-                self._watch_status(ts_order_id, client_order_id, status)
-
-        elif status in _st.FILLED:
-            # Reached only for non-FLL filled codes (FLP).
-            self._log.warning(
-                f"[TS-STATUS-WATCH] {client_order_id} status={status} "
-                f"(Partial Fill UROut) not handled by the adapter — rechecking"
-            )
-            self._watch_status(ts_order_id, client_order_id, status)
-
         else:
-            self._log.warning(
-                f"[TS-STATUS-WATCH] {client_order_id} unknown TS status {status!r} "
-                f"— no NT event, rechecking"
-            )
-            self._watch_status(ts_order_id, client_order_id, status)
+            _apply_status_tail(
+                self, status, ts_order, ts_order_id, client_order_id,
+                cached_order, venue_order_id, ts_now, stream=True)
 
     # -- INTERNAL METHODS -----------------------------------------------------------------
 

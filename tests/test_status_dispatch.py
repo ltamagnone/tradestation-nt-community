@@ -107,7 +107,7 @@ class TestDispatch:
         m.generate_order_canceled.assert_not_called()
         m.generate_order_rejected.assert_not_called()
         m._watch_status.assert_called_once()
-        m._log.warning.assert_called()
+        assert "unknown TS status" in m._watch_status.call_args.kwargs["note"]
 
     async def test_flp_is_held_and_watched(self, deliver):
         # R6: FLP is in _st.FILLED but is not FLL; the adapter does not handle it.
@@ -117,8 +117,7 @@ class TestDispatch:
         m.generate_order_rejected.assert_not_called()
         m.generate_order_filled.assert_not_called()
         m._watch_status.assert_called_once()
-        assert "[TS-STATUS-WATCH]" in m._log.warning.call_args.args[0]
-        assert "Partial Fill UROut" in m._log.warning.call_args.args[0]
+        assert "Partial Fill UROut" in m._watch_status.call_args.kwargs["note"]
 
     async def test_ucn_on_already_closed_order_is_ignored(self, deliver):
         # Our own cancel: _cancel_order already emitted OrderCanceled, so NT has

@@ -86,4 +86,4 @@ class TradeStationOrderStatus(str, Enum):
     UCN = "UCN"  # Cancel Sent
     TSC = "TSC"  # Trade Server Canceled
     OPN = "OPN"  # Sent
-    UPD = "UPD"  # Updated
+    UPD = "UPD"  # Updated -- NOT a spec status code; unused (see common/order_status.py)

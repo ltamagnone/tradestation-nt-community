@@ -105,7 +105,7 @@ def test_recheck_still_live_emits_nothing():
 def test_recheck_missing_status_is_unknown_not_closed():
     m = _stub({"9": (time.monotonic() - 400, "UCN", "O-1")})
     C._recheck_watched_statuses(m, [{"OrderID": "9"}])
-    assert _line(m).endswith("-> STATUS UNKNOWN at broker")
+    assert "broker status=UNKNOWN -> no Status reported at broker" in _line(m)
 
 
 import pytest

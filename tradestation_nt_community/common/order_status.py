@@ -20,6 +20,7 @@ OPEN: frozenset[str] = frozenset({
     "CHG",    # Change
     "CND",    # Condition Met
     "COR",    # Fill Corrected
+    "CSN",    # Cancel Sent (DEPRECATED in the spec; same meaning as UCN)
     "DIS",    # Dispatched
     "DOA",    # Dead
     "DON",    # Queued (GTC session pause at the daily close)
@@ -58,14 +59,15 @@ FILLED: frozenset[str] = frozenset({
 # Still on the broker's book and able to fill.
 LIVE: frozenset[str] = OPEN
 # Safe for automation to cancel. Excludes DON (GTC session pause, §140 — never
-# auto-cancelled), UCN (cancel already pending) and LAT (too late, a fill is coming).
-CANCELLABLE: frozenset[str] = OPEN - {"DON", "UCN", "LAT"}
+# auto-cancelled), UCN/CSN (cancel already pending) and LAT (too late, a fill is coming).
+CANCELLABLE: frozenset[str] = OPEN - {"DON", "UCN", "CSN", "LAT"}
 # Ambiguous or never observed in production: the adapter parks these for a broker
 # recheck: it logs [TS-STATUS-WATCH] on arrival and [TS-STATUS-RECHECK] with the
 # outcome, so the operator learns what they mean.
-WATCH: frozenset[str] = frozenset({"UCN", "LAT", "BRO", "RJC", "UCH", "RJR", "SCN", "TSC"})
-# A cancel is already in flight (UCN) or too late (LAT): never re-cancel, never treat as gone.
-CANCEL_PENDING: frozenset[str] = frozenset({"UCN", "LAT"})
+WATCH: frozenset[str] = frozenset({"UCN", "CSN", "LAT", "BRO", "RJC", "UCH", "RJR", "SCN", "TSC"})
+# A cancel is already in flight (UCN, or its deprecated alias CSN) or too late (LAT):
+# never re-cancel, never treat as gone.
+CANCEL_PENDING: frozenset[str] = frozenset({"UCN", "CSN", "LAT"})
 
 
 def category(code: str) -> str:
