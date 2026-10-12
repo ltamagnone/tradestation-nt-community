@@ -259,12 +259,26 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             note=f"unknown TS status {status or 'UNKNOWN'!r}")
 
 
+def _stamp_group_if_missing(client, ts_order_id) -> None:
+    """Final-review fix: a legacy order-map entry (no ``group``) whose order is in THIS
+    process's NT cache was submitted by this process, so stamp the current node group
+    (in memory; _persist_order_map writes it). Shrinks the ``unknown`` fill population."""
+    try:
+        node_group = _str_or_none(getattr(client, "_node_group", None))
+        groups = getattr(client, "_ts_id_to_group", None)
+        if node_group and isinstance(groups, dict) and not groups.get(ts_order_id):
+            groups[ts_order_id] = node_group
+    except Exception:
+        pass
+
+
 def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order_id) -> str:
     """Classify + log an uncached fill, then notify the registered callback (§151).
 
     Both fill paths (poll + SSE) call this. The callback fires for every kind except
     ``delivered`` / ``delivered_other``; it is scheduled with ``call_soon`` and wrapped
-    so it can never break (or block) the status poll. Returns the kind.
+    so it can never break the status poll. The callback runs ON the loop, so it must
+    not block: the runner offloads HTTP/Telegram to executors. Returns the kind.
     """
     node_group = _str_or_none(getattr(client, "_node_group", None))
     groups = getattr(client, "_ts_id_to_group", None)
@@ -1655,6 +1669,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if status in ("FLL", "FLP"):
                     _handle_uncached_fill(self, ts_order, ts_order_id, client_order_id)
                 continue
+            _stamp_group_if_missing(self, ts_order_id)
 
             # Skip if NautilusTrader already considers the order closed (idempotency guard).
             # Also clean up any stale pending-amend record (e.g. SSE filled it first).
@@ -1864,6 +1879,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if status in ("FLL", "FLP"):
                 _handle_uncached_fill(self, ts_order, ts_order_id, client_order_id)
             return
+        _stamp_group_if_missing(self, ts_order_id)
         if cached_order.is_closed:
             _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
             return

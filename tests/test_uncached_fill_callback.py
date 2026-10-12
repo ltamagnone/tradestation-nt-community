@@ -244,3 +244,36 @@ class TestOrderMapGroupAndAlive:
         n = _stub(p, "stable")
         C._load_order_map(n)
         assert "T1" in n._ts_order_id_to_client_order_id and n._ts_id_to_group == {}
+
+
+class TestLegacyGroupStamp:
+    """Final review: legacy (group-less) entries seen in this process's own cache get stamped."""
+
+    def test_legacy_entry_stamped_when_in_own_cache_and_persisted(self, tmp_path):
+        from tradestation_nt_community.execution import _stamp_group_if_missing
+        p = tmp_path / "map.json"
+        import time
+        p.write_text(json.dumps({"T9": {"client_order_id": "O-9", "submitted_ts": time.time()}}))
+        a = _stub(p, "stable")
+        C._load_order_map(a)
+        assert "T9" not in a._ts_id_to_group              # legacy entry kept as-is on load
+        _stamp_group_if_missing(a, "T9")                   # status poll saw it in the cache
+        assert a._ts_id_to_group["T9"] == "stable"
+        C._persist_order_map(a)
+        assert json.loads(p.read_text())["T9"]["group"] == "stable"
+
+    def test_existing_group_not_overwritten(self):
+        from tradestation_nt_community.execution import _stamp_group_if_missing
+        a = MagicMock()
+        a._node_group = "stable"
+        a._ts_id_to_group = {"T1": "rolling"}
+        _stamp_group_if_missing(a, "T1")
+        assert a._ts_id_to_group["T1"] == "rolling"
+
+    @pytest.mark.asyncio
+    async def test_poll_stamps_cached_legacy_order(self):
+        m = _client(entry_group=None)
+        m._cache.order.return_value = MagicMock(is_closed=True)   # own cached order
+        from tradestation_nt_community.execution import _stamp_group_if_missing
+        _stamp_group_if_missing(m, "972944192")
+        assert m._ts_id_to_group["972944192"] == "stable"
