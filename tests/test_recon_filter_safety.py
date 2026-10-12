@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock, MessageBus
 from nautilus_trader.config import LiveExecEngineConfig
@@ -108,3 +110,105 @@ def test_control_without_filter_would_create_external_orders():
     eng._reconcile_execution_mass_status(_mass_status(True, None))
     assert len(cache.orders()) > 0
     assert all(str(o.strategy_id) == "EXTERNAL" for o in cache.orders())
+
+
+# ---------------------------------------------------------------------------
+# Own cached orders: the adapter must withhold reports (Task 14 fix round 1)
+# ---------------------------------------------------------------------------
+import copy
+from unittest.mock import AsyncMock, MagicMock
+
+from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.model.enums import OrderSide as _OS
+from nautilus_trader.model.identifiers import StrategyId, VenueOrderId
+from nautilus_trader.model.objects import Price
+from nautilus_trader.test_kit.stubs.events import TestEventStubs
+
+from tradestation_nt_community.execution import TradeStationExecutionClient
+
+OWN_TS_ID = "286179863"  # SPEC_OCO_LIMIT_SELL OrderID
+
+
+def _own_order_engine(loop):
+    clock = LiveClock()
+    trader = TraderId("TESTER-001")
+    cache = Cache()
+    cache.add_instrument(TSTestInstrumentStubs.gc_futures_contract())
+    eng = LiveExecutionEngine(loop=loop, msgbus=MessageBus(trader_id=trader, clock=clock), cache=cache,
+                              clock=clock, config=LiveExecEngineConfig(
+                                  reconciliation=True, filter_unclaimed_external_orders=True))
+    order = OrderFactory(trader_id=trader, strategy_id=StrategyId("S-001"), clock=clock).limit(
+        IID, _OS.SELL, Quantity.from_int(10), Price.from_str("230.0"))
+    cache.add_order(order)
+    order.apply(TestEventStubs.order_submitted(order))
+    order.apply(TestEventStubs.order_accepted(order, venue_order_id=VenueOrderId(OWN_TS_ID)))
+    cache.update_order(order)
+    return eng, cache, order
+
+
+def _adapter_stub(cache, ts_orders):
+    stub = MagicMock()
+    stub._client.get_orders = AsyncMock(return_value=ts_orders)
+    stub._account_id = "SIM0000001F"
+    stub._account_id_nautilus = ACCT
+    stub._clock.timestamp_ns = lambda: 1
+    stub._cache = cache
+    stub._log = MagicMock()
+    stub._ts_order_id_to_client_order_id = {}
+    stub._client_order_id_to_ts_order_id = {}
+    stub._parse_order_status = lambda s: __import__(
+        "tradestation_nt_community.parsing.execution", fromlist=["x"]).parse_order_status(s)
+    stub._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, 1)
+    stub._is_own_cached_order = lambda c, t=None: TradeStationExecutionClient._is_own_cached_order(stub, c, t)
+    return stub
+
+
+def _cmds(coid):
+    from types import SimpleNamespace as NS
+    return (NS(instrument_id=None, open_only=False, start=None, end=None),
+            NS(instrument_id=None, venue_order_id=None, start=None, end=None),
+            NS(instrument_id=IID, client_order_id=coid, venue_order_id=VenueOrderId(OWN_TS_ID)))
+
+
+@pytest.mark.parametrize("status", ["FLL", "CAN", "OUT", "DON", "UCN"])
+def test_own_cached_order_gets_no_reports_and_no_events(status):
+    loop = asyncio.new_event_loop()
+    eng, cache, order = _own_order_engine(loop)
+    ts = copy.deepcopy(SPEC_OCO_LIMIT_SELL)
+    ts["Status"] = status
+    if status == "FLL":
+        ts["Legs"][0]["ExecQuantity"] = "10"
+        ts["FilledPrice"] = "230"
+        ts["ClosedDateTime"] = "2020-11-17T17:00:00Z"
+    stub = _adapter_stub(cache, [ts])
+    stub._ts_order_id_to_client_order_id = {OWN_TS_ID: order.client_order_id}
+    stub._client_order_id_to_ts_order_id = {order.client_order_id: OWN_TS_ID}
+    c_orders, c_fills, c_single = _cmds(order.client_order_id)
+    run = loop.run_until_complete
+    reports = run(TradeStationExecutionClient.generate_order_status_reports(stub, c_orders))
+    fills = run(TradeStationExecutionClient.generate_fill_reports(stub, c_fills))
+    single = run(TradeStationExecutionClient.generate_order_status_report(stub, c_single))
+    assert reports == [] and fills == [] and single is None
+
+    n_events, st = order.event_count, order.status
+    ms = _EMS(client_id=ClientId("TRADESTATION"), account_id=ACCT, venue=Venue("TRADESTATION"),
+              report_id=UUID4(), ts_init=0)
+    ms.add_order_reports(reports=reports)
+    ms.add_fill_reports(reports=fills)
+    eng._reconcile_execution_mass_status(ms)
+    assert order.event_count == n_events and order.status == st == cache.order(order.client_order_id).status
+    assert len(cache.orders()) == 1
+
+
+def test_control_unguarded_reports_would_move_the_own_order():
+    """Teeth: feeding the parsed FLL report for the own order DOES change NT state."""
+    loop = asyncio.new_event_loop()
+    eng, cache, order = _own_order_engine(loop)
+    ts = copy.deepcopy(SPEC_OCO_LIMIT_SELL)
+    ts["Status"] = "FLL"
+    ts["Legs"][0]["ExecQuantity"] = "10"
+    ts["FilledPrice"] = "230"
+    rep = parse_order_status_report(ts, IID, order.client_order_id, ACCT, 1)
+    n = order.event_count
+    eng._reconcile_order_report(rep, [])
+    assert order.event_count > n

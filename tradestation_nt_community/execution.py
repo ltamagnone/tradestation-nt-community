@@ -611,6 +611,26 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     # -- EXECUTION REPORTS ----------------------------------------------------------------
 
+    def _is_own_cached_order(self, client_order_id, ts_order_id=None) -> bool:
+        """True if NT already tracks this order in its cache (an order we own).
+
+        Reports for such orders are withheld (None / skipped, exactly as when the
+        parser could not read the v3 shape): NT's reconciliation would otherwise
+        emit status events or FILL-<id> trades that race this adapter's own
+        poll/SSE events (different TradeId scheme -> possible double fill).
+        Logged at DEBUG once per order.
+        """
+        if client_order_id is None or self._cache.order(client_order_id) is None:
+            return False
+        seen = self.__dict__.setdefault("_own_order_report_skip_logged", set())
+        if client_order_id not in seen:
+            seen.add(client_order_id)
+            self._log.debug(
+                f"Not reporting own cached order {client_order_id} "
+                f"(ts_order_id={ts_order_id}) to NT reconciliation"
+            )
+        return True
+
     async def generate_order_status_report(
         self,
         command: GenerateOrderStatusReport,
@@ -629,6 +649,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         if not ts_order_id and venue_order_id:
             ts_order_id = str(venue_order_id)
+
+        if self._is_own_cached_order(client_order_id, ts_order_id):
+            return None
 
         if not ts_order_id:
             self._log.warning(f"Cannot find TradeStation order ID for {client_order_id}")
@@ -680,6 +703,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if not client_order_id:
                     # Create a client order ID for unknown orders
                     client_order_id = ClientOrderId(f"TS-{ts_order_id}")
+
+                if self._is_own_cached_order(client_order_id, ts_order_id):
+                    continue
 
                 # Get instrument ID — TS futures orders don't have a top-level Symbol;
                 # the symbol is inside Legs[0]['Symbol']. Fall back to Legs if needed.
@@ -801,6 +827,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Look up client order ID from our tracking dict
                 ts_order_id = ts_order.get("OrderID")
                 coid = self._ts_order_id_to_client_order_id.get(ts_order_id)
+                if self._is_own_cached_order(coid, ts_order_id):
+                    continue
 
                 report = parse_fill_report(
                     ts_order,

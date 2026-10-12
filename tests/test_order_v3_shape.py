@@ -169,7 +169,11 @@ class TestSpecShapeOrderStatusReport:
         for o in (TSTestOrderStubs.market_order_filled(), TSTestOrderStubs.limit_order_open(),
                   TSTestOrderStubs.stop_order_filled(), TSTestOrderStubs.order_canceled()):
             assert "Quantity" not in o and "TradeAction" not in o and "FilledQuantity" not in o
-            assert _report(o) is not None or o["Status"] == "CAN"
+            assert _report(o) is not None
+
+    def test_canceled_fixture_parses_as_canceled_with_qty_1(self):
+        r = _report(TSTestOrderStubs.order_canceled())
+        assert r is not None and r.quantity == 1 and r.order_status == OrderStatus.CANCELED
 
 
 class TestSpecShapeFillReport:

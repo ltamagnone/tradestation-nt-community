@@ -212,7 +212,12 @@ def parse_time_in_force(ts_order: dict) -> TimeInForce:
     if not dur:
         tif = ts_order.get("TimeInForce")
         dur = tif.get("Duration") if isinstance(tif, dict) else None
-    return _TS_DURATION_TO_NT.get(str(dur or "").strip().upper(), TimeInForce.DAY)
+    key = str(dur or "").strip().upper()
+    tif = _TS_DURATION_TO_NT.get(key)
+    if tif is None:
+        _log.debug(f"Unmapped TS Duration {dur!r} for order {ts_order.get('OrderID')}: using DAY")
+        return TimeInForce.DAY
+    return tif
 
 
 def parse_order_status_report(

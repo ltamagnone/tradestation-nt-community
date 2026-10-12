@@ -72,6 +72,9 @@ def _make_stub(orders: list[dict]) -> MagicMock:
     from nautilus_trader.model.enums import OrderStatus
     stub._parse_order_status = MagicMock(return_value=OrderStatus.SUBMITTED)
 
+    # real own-order guard bound to the stub (cache.order -> None => not own)
+    stub._is_own_cached_order = lambda c, t=None: TradeStationExecutionClient._is_own_cached_order(stub, c, t)
+
     return stub
 
 
