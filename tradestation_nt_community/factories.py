@@ -250,4 +250,5 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             streaming_status_poll_secs=config.streaming_status_poll_secs,
             extended_hours=config.extended_hours,
             order_map_path=config.order_map_path,
+            node_group=config.node_group,
         )

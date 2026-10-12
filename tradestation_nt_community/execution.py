@@ -74,7 +74,49 @@ from nautilus_trader.model.orders import StopLimitOrder
 from nautilus_trader.model.orders import StopMarketOrder
 
 
-def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
+# §151: tolerance band around the previous process's last-alive stamp (see
+# classify_uncached_fill). Absorbs the 60 s stamp resolution and clock skew.
+_ALIVE_TOLERANCE_S = 60.0
+_ALIVE_STAMP_EVERY_S = 60.0
+_ORDER_MAP_META = "_meta"
+
+
+def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
+                           alive_prev_s) -> str:
+    """§151 classification of an FLL/FLP on a mapped TS order absent from the NT cache.
+
+    Returns one of:
+      ``live``            fill at/after this instance started, order owned by this group
+      ``downtime``        fill between the group's last-alive stamp (-60 s) and this
+                          instance's start: nobody was alive to deliver it
+      ``delivered``       fill well before the group's last-alive stamp: the previous
+                          process (alive then) delivered it
+      ``delivered_other`` the order belongs to the other node's group; its own adapter
+                          classifies it
+      ``unknown``         anything we cannot place (no/unparseable ClosedDateTime, no
+                          group info on the order or this node, no alive stamp): fail loud
+
+    A fill was delivered only if the process that OWNED the order was alive when it
+    filled — the old "predates this instance" test missed the case where the owner was
+    down, and the case where the "previous process" was not the owner at all.
+    """
+    if closed_s is None or instance_started_s is None:
+        return "unknown"
+    if not entry_group or not node_group:
+        return "unknown"
+    if entry_group != node_group:
+        return "delivered_other"
+    if closed_s >= instance_started_s:
+        return "live"
+    if alive_prev_s is None:
+        return "unknown"
+    if closed_s < alive_prev_s - _ALIVE_TOLERANCE_S:
+        return "delivered"
+    return "downtime"
+
+
+def _uncached_fill_message(ts_order_id: str, client_order_id, tag: str = "[UNCACHED-FILL-LIVE]",
+                           note: str = "") -> str:
     """Greppable warning for a fill on a mapped order that NT's cache does not hold.
 
     Happens for orders placed before a node restart: the persisted order map knows
@@ -82,8 +124,8 @@ def _uncached_fill_message(ts_order_id: str, client_order_id) -> str:
     (2026-09-28 NQZ26 #972721176), so the fill cannot be delivered to the strategy.
     """
     return (
-        f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) filled but is not "
-        f"in the NT cache (placed before a restart?) — the strategy will not see this "
+        f"{tag} TS order {ts_order_id} ({client_order_id}) filled but is not "
+        f"in the NT cache (placed before a restart?){note} — the strategy will not see this "
         f"fill; HEAL CASE-A/PERIODIC-RECON must reconcile"
     )
 
@@ -101,39 +143,108 @@ def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_ord
         )
 
 
-def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id, instance_started_s) -> None:
-    """Log an FLL/FLP fill for a mapped TS order absent from the NT cache.
+def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
+                       instance_started_s, entry_group=None, node_group=None,
+                       alive_prev_s=None) -> str:
+    """Log (and classify) an FLL/FLP fill for a mapped TS order absent from the NT cache.
 
     2026-09-29 13:23Z/13:28Z: after a restart the persisted order map is loaded but
     `_order_last_status` starts empty, so the first status read sees orders that
     filled HOURS EARLIER in the previous process — whose fills were already
-    delivered at the time (e.g. O-20260929-095755-001-000-8 filled/delivered at
-    09:57:59Z, warned again at 13:23:47Z). 16 false [UNCACHED-FILL] warnings per
-    node per restart.
-
-    Warn loudly only for a fill that happened at or after this adapter instance
-    started — that fill genuinely has nowhere else to go. A fill that predates the
-    instance is expected after a restart (delivered by the process this one
-    replaced) and gets an INFO line instead. Any uncertainty — no ClosedDateTime,
-    no recorded instance-start time, an unparseable timestamp — keeps the WARNING:
-    fail loud rather than silently swallow a real gap.
+    delivered at the time. §151 classifies via classify_uncached_fill and returns
+    the kind. WARNING tags: `[UNCACHED-FILL-LIVE]` (live/unknown) and
+    `[DOWNTIME-FILL]`; the INFO lines (delivered / other node) carry the bare
+    `[UNCACHED-FILL]` text, which the agent forwarder must NOT match.
     """
-    predates_session = False
+    closed_s = None
     closed_str = ts_order.get("ClosedDateTime", "")
-    if closed_str and instance_started_s is not None:
+    if closed_str:
         try:
             closed_s = pd.Timestamp(closed_str, tz="UTC").timestamp()
-            predates_session = closed_s < instance_started_s
         except Exception:
-            predates_session = False
-
-    if predates_session:
+            closed_s = None
+    kind = classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
+                                  alive_prev_s)
+    if kind == "delivered":
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) fill predates "
             f"this session — already delivered by the previous process"
         )
+    elif kind == "delivered_other":
+        log.info(
+            f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) owned by the "
+            f"other node (group {entry_group}) — its adapter classifies this fill"
+        )
+    elif kind == "downtime":
+        log.warning(_uncached_fill_message(
+            ts_order_id, client_order_id, "[DOWNTIME-FILL]",
+            f" (filled while group {node_group} was not running)"))
     else:
-        log.warning(_uncached_fill_message(ts_order_id, client_order_id))
+        log.warning(_uncached_fill_message(
+            ts_order_id, client_order_id, "[UNCACHED-FILL-LIVE]",
+            " (attribution unknown)" if kind == "unknown" else ""))
+    return kind
+
+
+def _str_or_none(v):
+    return v if isinstance(v, str) and v else None
+
+
+def _float_or_none(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order_id) -> str:
+    """Classify + log an uncached fill, then notify the registered callback (§151).
+
+    Both fill paths (poll + SSE) call this. The callback fires for every kind except
+    ``delivered`` / ``delivered_other``; it is scheduled with ``call_soon`` and wrapped
+    so it can never break (or block) the status poll. Returns the kind.
+    """
+    node_group = _str_or_none(getattr(client, "_node_group", None))
+    groups = getattr(client, "_ts_id_to_group", None)
+    entry_group = _str_or_none(groups.get(ts_order_id)) if isinstance(groups, dict) else None
+    alive_map = getattr(client, "_previous_alive", None)
+    alive_prev = (_float_or_none(alive_map.get(node_group))
+                  if isinstance(alive_map, dict) and node_group else None)
+    kind = _log_uncached_fill(
+        client._log, ts_order, ts_order_id, client_order_id,
+        getattr(client, "_instance_started_s", None),
+        entry_group=entry_group, node_group=node_group, alive_prev_s=alive_prev,
+    )
+    if kind in ("delivered", "delivered_other"):
+        return kind
+    cb = getattr(client, "_uncached_fill_callback", None)
+    if cb is None or not callable(cb):
+        return kind
+    leg = (ts_order.get("Legs") or [{}])[0] if isinstance(ts_order, dict) else {}
+    payload = {
+        "ts_order_id": str(ts_order_id),
+        "client_order_id": str(client_order_id),
+        "status": ts_order.get("Status"),
+        "closed": ts_order.get("ClosedDateTime"),
+        "kind": kind,
+        "exec_qty": leg.get("ExecQuantity") if isinstance(leg, dict) else None,
+        "group": entry_group,
+    }
+
+    def _run():
+        try:
+            cb(payload)
+        except Exception as exc:  # never raise into the loop
+            try:
+                client._log.error(f"[UNCACHED-FILL] callback failed for {ts_order_id}: {exc}")
+            except Exception:
+                pass
+
+    try:
+        client._loop.call_soon(_run)
+    except Exception as exc:
+        try:
+            client._log.error(f"[UNCACHED-FILL] could not schedule callback: {exc}")
+        except Exception:
+            pass
+    return kind
 
 
 class TradeStationExecutionClient(LiveExecutionClient):
@@ -182,6 +293,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         streaming_status_poll_secs: float = 60.0,
         extended_hours: bool = False,
         order_map_path: str | None = None,
+        node_group: str | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -253,9 +365,74 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # Order-map persistence (T-2)
         self._order_map_path: str | None = order_map_path
 
+        # §151: which node group (stable/rolling) this adapter serves. Stamped on every
+        # order-map entry it submits and used to key the last-alive stamp.
+        self._node_group: str | None = node_group or None
+        self._ts_id_to_group: dict[str, str] = {}      # ts_order_id -> submitting group
+        self._previous_alive: dict[str, float] = {}    # group -> last-alive epoch of the PREVIOUS process
+        self._alive_loaded = False                      # stamp only after the previous value is read
+        self._last_alive_stamp_s = 0.0
+        self._uncached_fill_callback = None
+
         # Account setup
         self._account_id_nautilus = AccountId(f"{self.id}-{account_id}")
 
+
+    def set_uncached_fill_callback(self, callback) -> None:
+        """§151: register ``callback(payload: dict)`` for a genuine uncached fill.
+
+        Called (via ``loop.call_soon``, exceptions swallowed) for kinds live /
+        downtime / unknown — not for fills the previous process delivered. Payload:
+        ts_order_id, client_order_id, status, closed, kind, exec_qty, group.
+        Mirrors ``TradeStationHttpClient.set_token_rotation_callback``.
+        """
+        self._uncached_fill_callback = callback
+
+    def _read_order_map_file(self) -> dict:
+        import json as _json
+        try:
+            with open(self._order_map_path, "r") as _f:
+                raw = _json.load(_f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_order_map_file(self, data: dict) -> None:
+        import json as _json, os as _os
+        tmp = self._order_map_path + f".{_os.getpid()}.tmp"
+        with open(tmp, "w") as _f:
+            _json.dump(data, _f)
+        _os.replace(tmp, self._order_map_path)
+
+    def _stamp_alive(self, force: bool = False) -> None:
+        """§151: record "this group was alive at T" in the order map (``_meta.alive``).
+
+        Read-merge-replace (same race profile as _persist_order_map: worst case one
+        stale stamp, which classifies as downtime/unknown — the loud side). Throttled to
+        once per _ALIVE_STAMP_EVERY_S; ``force`` for _disconnect. Never stamps before the
+        previous process's value has been read by _load_order_map.
+        """
+        if not self._order_map_path or not self._node_group or not self._alive_loaded:
+            return
+        import time as _time
+        now_s = _time.time()
+        if not force and now_s - self._last_alive_stamp_s < _ALIVE_STAMP_EVERY_S:
+            return
+        try:
+            data = self._read_order_map_file()
+            meta = data.get(_ORDER_MAP_META)
+            if not isinstance(meta, dict):
+                meta = {}
+            alive = meta.get("alive")
+            if not isinstance(alive, dict):
+                alive = {}
+            alive[self._node_group] = now_s
+            meta["alive"] = alive
+            data[_ORDER_MAP_META] = meta
+            self._write_order_map_file(data)
+            self._last_alive_stamp_s = now_s
+        except Exception as exc:
+            self._log.warning(f"[ORDER-MAP] Failed to stamp alive: {exc}")
 
     def _persist_order_map(self) -> None:
         """Persist _ts_order_id_to_client_order_id to disk for cross-restart recovery."""
@@ -272,10 +449,21 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 existing = {}
             # Update with current in-memory entries (add submitted_ts if missing)
             for ts_id, coid in self._ts_order_id_to_client_order_id.items():
-                existing[ts_id] = {
-                    "client_order_id": str(coid),
-                    "submitted_ts": existing.get(ts_id, {}).get("submitted_ts", now_s),
-                }
+                # §151: merge into the existing entry so per-entry fields written by
+                # either node (``group``) survive; a brand-new entry was submitted by
+                # THIS node, so it gets this node's group.
+                prev = existing.get(ts_id)
+                entry = dict(prev) if isinstance(prev, dict) else {}
+                entry["client_order_id"] = str(coid)
+                entry["submitted_ts"] = entry.get("submitted_ts", now_s)
+                grp = self._ts_id_to_group.get(ts_id)
+                if grp is None and not entry.get("group") and not isinstance(prev, dict):
+                    grp = self._node_group
+                    if grp:
+                        self._ts_id_to_group[ts_id] = grp
+                if grp and not entry.get("group"):
+                    entry["group"] = grp
+                existing[ts_id] = entry
             tmp = self._order_map_path + f".{_os.getpid()}.tmp"
             with open(tmp, "w") as _f:
                 _json.dump(existing, _f)
@@ -292,13 +480,26 @@ class TradeStationExecutionClient(LiveExecutionClient):
             with open(self._order_map_path, "r") as _f:
                 raw = _json.load(_f)
         except FileNotFoundError:
+            self._alive_loaded = True   # no previous process -> no alive stamp; ours may start
             return
         except Exception as exc:
             self._log.warning(f"[ORDER-MAP] Failed to load order map: {exc}")
+            self._alive_loaded = True
             return
         cutoff = _time.time() - 7 * 86400
         loaded = pruned = 0
+        # §151: previous process's last-alive stamps (before this instance overwrites them)
+        meta = raw.get(_ORDER_MAP_META)
+        if isinstance(meta, dict) and isinstance(meta.get("alive"), dict):
+            for g, t in meta["alive"].items():
+                try:
+                    self._previous_alive[str(g)] = float(t)
+                except (TypeError, ValueError):
+                    pass
+        self._alive_loaded = True
         for ts_id, entry in raw.items():
+            if ts_id == _ORDER_MAP_META or not isinstance(entry, dict):
+                continue
             if entry.get("submitted_ts", 0) < cutoff:
                 pruned += 1
                 continue
@@ -306,6 +507,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 coid = ClientOrderId(entry["client_order_id"])
                 self._ts_order_id_to_client_order_id[ts_id] = coid
                 self._client_order_id_to_ts_order_id[coid] = ts_id
+                if entry.get("group"):
+                    self._ts_id_to_group[ts_id] = str(entry["group"])
                 loaded += 1
             except Exception:
                 pass
@@ -359,6 +562,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
     async def _disconnect(self) -> None:
         """Disconnect from TradeStation."""
         self._log.info("Disconnecting from TradeStation...")
+        self._stamp_alive(force=True)  # §151: graceful stop = exact last-alive time
 
         # Stop fill polling and token keepalive
         if self._fill_poll_task:
@@ -1095,6 +1299,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         while True:
             try:
                 await asyncio.sleep(self._fill_poll_interval)
+                self._stamp_alive()
                 await self._check_order_statuses()
             except asyncio.CancelledError:
                 self._log.info("Order fill polling loop stopped")
@@ -1122,6 +1327,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         while True:
             try:
                 await asyncio.sleep(self._status_safety_poll_secs)
+                self._stamp_alive()
                 await self._check_order_statuses()
             except asyncio.CancelledError:
                 self._log.info("Status safety poll loop stopped")
@@ -1330,13 +1536,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"Fill poll: order {client_order_id} not found in cache (status={status})"
                 )
                 if status in ("FLL", "FLP"):
-                    _log_uncached_fill(
-                        self._log,
-                        ts_order,
-                        ts_order_id,
-                        client_order_id,
-                        getattr(self, "_instance_started_s", None),
-                    )
+                    _handle_uncached_fill(self, ts_order, ts_order_id, client_order_id)
                 continue
 
             # Skip if NautilusTrader already considers the order closed (idempotency guard).
@@ -1589,13 +1789,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # _order_last_status is already updated above, so the safety poll will
             # not see this change again — this is the only chance to make it loud.
             if status in ("FLL", "FLP"):
-                _log_uncached_fill(
-                    self._log,
-                    ts_order,
-                    ts_order_id,
-                    client_order_id,
-                    getattr(self, "_instance_started_s", None),
-                )
+                _handle_uncached_fill(self, ts_order, ts_order_id, client_order_id)
             return
         if cached_order.is_closed:
             _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)

@@ -112,3 +112,4 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     streaming_status_poll_secs: float = 60.0
     extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)
     order_map_path: str | None = None  # Path to persist order-ID map across restarts (T-2)
+    node_group: str | None = None  # §151: node group (stable/rolling) stamped on order-map entries + alive stamps

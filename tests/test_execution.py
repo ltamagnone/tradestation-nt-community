@@ -1289,6 +1289,11 @@ class TestUncachedFillWarning:
     def _client():
         m = MagicMock()
         m._ts_order_id_to_client_order_id = {"972721176": ClientOrderId("O-OLD-5")}
+        # §151: group attribution + previous last-alive (13:00Z start, alive until 12:59:30Z)
+        m._node_group = "stable"
+        m._ts_id_to_group = {"972721176": "stable"}
+        m._previous_alive = {"stable": 1790686770.0}
+        m._uncached_fill_callback = None
         m._order_last_status = {}
         m._pending_modify_trigger_price = {}
         m._cancel_verify_pending = {}
@@ -1302,7 +1307,7 @@ class TestUncachedFillWarning:
 
     @staticmethod
     def _uncached_warnings(m):
-        return [c for c in m._log.warning.call_args_list if "[UNCACHED-FILL]" in str(c)]
+        return [c for c in m._log.warning.call_args_list if "[UNCACHED-FILL-LIVE]" in str(c)]
 
     @pytest.mark.asyncio
     async def test_sse_fill_on_uncached_order_warns(self):
