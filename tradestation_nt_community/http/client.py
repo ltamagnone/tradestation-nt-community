@@ -796,21 +796,27 @@ class TradeStationHttpClient:
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Get orders for account(s).
+        Get today's and open orders for account(s) (``GET /orders``).
+
+        Window semantics (Q3 probe, sim account, 2026-10-12): ``/orders`` returns
+        the current/last trading-day window plus every open order and is
+        **disjoint from** ``/historicalorders``. It **ignores ``since``** (same
+        orders for any date, with or without it) and was never seen to page
+        (no ``NextToken``). Older closed orders are NOT reachable here: use
+        ``GET /historicalorders`` (``since`` is REQUIRED, HTTP 400 without it;
+        it excludes the current day; pages at 600 orders via ``NextToken``).
 
         Parameters
         ----------
         account_keys : str
             Account key(s) — single or comma-separated.
         since : str, optional
-            Return orders since this date (format: 'MM-DD-YYYY').
-            Note: empirically, TS ignores `since` for open/working orders —
-            all OPN/ACK orders appear regardless of placement date. Use
-            ``status='Open'`` instead when only working orders are needed.
+            Accepted for compatibility but **ignored by TradeStation on
+            ``/orders``** — do not rely on it to reach older orders.
         status : str, optional
             Filter by order status. Use ``'Open'`` to retrieve only working
-            orders (ACK/OPN/DON) without historical fills cluttering the
-            response. Case-sensitive — 'Open' not 'OPN'.
+            orders (ACK/OPN/DON) without the day's closed orders cluttering
+            the response. Case-sensitive — 'Open' not 'OPN'.
 
         Return
         -------

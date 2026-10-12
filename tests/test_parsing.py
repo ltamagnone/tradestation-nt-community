@@ -480,9 +480,9 @@ class TestParseFillReport:
         assert report.order_side == OrderSide.SELL
 
     def test_fill_price_fallback_to_legs(self):
-        """When AveragePrice is absent, fall back to Legs[0].ExecutionPrice."""
+        """When FilledPrice is absent, fall back to Legs[0].ExecutionPrice."""
         ts_order = {**TSTestOrderStubs.market_order_filled()}
-        del ts_order["AveragePrice"]
+        del ts_order["FilledPrice"]
         # Legs already have ExecutionPrice=3350.0 in the fixture
         report = self._parse(ts_order)
         assert report is not None

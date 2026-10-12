@@ -11,7 +11,7 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.reports import FillReport, OrderStatusReport
 from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce
+from nautilus_trader.model.enums import ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType
 from nautilus_trader.model.identifiers import AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId
 from nautilus_trader.model.objects import Currency, Money, Price, Quantity
 from nautilus_trader.model.orders import LimitOrder, MarketOrder, Order, StopLimitOrder, StopMarketOrder
@@ -141,6 +141,80 @@ def parse_ts_order_type(ts_order_type: str) -> OrderType:
     return _TS_ORDER_TYPE_TO_NT.get(ts_order_type, OrderType.MARKET)
 
 
+# TradeStation v3 order shape (OpenAPI Order/OrderBase/OrderLeg): quantity, side and
+# fill quantity live on ``Legs[0]`` (QuantityOrdered / BuyOrSell / ExecQuantity);
+# there is NO top-level Quantity/TradeAction/FilledQuantity/AveragePrice. The
+# average fill price is the top-level ``FilledPrice`` and the TIF is the
+# top-level ``Duration`` string. The old top-level names are read only as a
+# fallback when ``Legs`` is absent (legacy shape / synthetic callers).
+_BUY_ACTIONS = frozenset({"buy", "buytocover", "buytoopen", "buytoclose"})
+_SELL_ACTIONS = frozenset({"sell", "sellshort", "selltoopen", "selltoclose"})
+
+_TS_DURATION_TO_NT: dict[str, TimeInForce] = {
+    "DAY": TimeInForce.DAY,
+    "DYP": TimeInForce.DAY,
+    "DAY+": TimeInForce.DAY,
+    "GTC": TimeInForce.GTC,
+    "GTC+": TimeInForce.GTC,
+    "GCP": TimeInForce.GTC,
+    "IOC": TimeInForce.IOC,
+}
+
+
+def _first_leg(ts_order: dict) -> dict | None:
+    legs = ts_order.get("Legs")
+    if isinstance(legs, list) and legs and isinstance(legs[0], dict):
+        return legs[0]
+    return None
+
+
+def parse_order_side(ts_order: dict) -> OrderSide | None:
+    """Order side from ``Legs[0].BuyOrSell`` (fallback: top-level ``TradeAction``).
+
+    Returns ``None`` when the side is absent or unrecognised. Callers must skip
+    the report: the side is never defaulted (a defaulted Buy turns every SELL
+    into a BUY and NT would net it into the wrong position).
+    """
+    leg = _first_leg(ts_order)
+    raw = leg.get("BuyOrSell") if leg is not None else None
+    if not raw:
+        raw = ts_order.get("TradeAction")
+    key = str(raw or "").strip().lower()
+    if key in _BUY_ACTIONS:
+        return OrderSide.BUY
+    if key in _SELL_ACTIONS:
+        return OrderSide.SELL
+    return None
+
+
+def _order_quantities(ts_order: dict) -> tuple[Decimal, Decimal, bool]:
+    """(ordered, filled, has_exec_qty) from Legs[0], else legacy top-level fields."""
+    leg = _first_leg(ts_order)
+    if leg is not None:
+        ordered = Decimal(leg.get("QuantityOrdered") or "0")
+        raw_filled = leg.get("ExecQuantity")
+        return ordered, Decimal(raw_filled or "0"), raw_filled not in (None, "")
+    ordered = Decimal(ts_order.get("Quantity") or "0")
+    raw_filled = ts_order.get("FilledQuantity")
+    return ordered, Decimal(raw_filled or "0"), raw_filled not in (None, "")
+
+
+def _avg_fill_price(ts_order: dict) -> str:
+    """Average fill price: ``FilledPrice`` (spec) -> ``AveragePrice`` (legacy)."""
+    return ts_order.get("FilledPrice") or ts_order.get("AveragePrice") or "0"
+
+
+def parse_time_in_force(ts_order: dict) -> TimeInForce:
+    """TIF from top-level ``Duration`` (spec) or ``TimeInForce.Duration`` (request shape).
+
+    Unknown durations map to DAY (never GTC: do not invent a longer life)."""
+    dur = ts_order.get("Duration")
+    if not dur:
+        tif = ts_order.get("TimeInForce")
+        dur = tif.get("Duration") if isinstance(tif, dict) else None
+    return _TS_DURATION_TO_NT.get(str(dur or "").strip().upper(), TimeInForce.DAY)
+
+
 def parse_order_status_report(
     ts_order: dict,
     instrument_id: InstrumentId,
@@ -148,46 +222,61 @@ def parse_order_status_report(
     account_id: AccountId,
     ts_now: int,
 ) -> OrderStatusReport | None:
-    """Parse a raw TradeStation order dict into an OrderStatusReport.
+    """Parse a raw TradeStation v3 order dict into an OrderStatusReport.
 
-    Parameters
-    ----------
-    ts_order : dict
-        Raw order dict from the TradeStation API.
-    instrument_id : InstrumentId
-        The instrument this order belongs to.
-    client_order_id : ClientOrderId
-        The NautilusTrader client order ID to assign.
-    account_id : AccountId
-        The NautilusTrader account ID.
-    ts_now : int
-        Current timestamp in nanoseconds (from clock).
+    Reads quantity / side / fill quantity from ``Legs[0]``, the limit and stop
+    prices from ``LimitPrice`` / ``StopPrice`` and the TIF from ``Duration``.
 
     Returns
     -------
     OrderStatusReport or None
-        Parsed report, or None if parsing fails.
+        ``None`` (with a WARN where the order is real) when the quantity is
+        zero, the side is unknown, a stop order has no ``StopPrice``, or the
+        dict cannot be parsed.
     """
     try:
         ts_order_id = ts_order.get("OrderID")
         status = parse_order_status(ts_order.get("Status", ""))
 
-        qty_ordered = Decimal(ts_order.get("Quantity") or "0")
-        qty_filled = Decimal(ts_order.get("FilledQuantity") or "0")
+        qty_ordered, qty_filled, _ = _order_quantities(ts_order)
 
-        # TS returns Quantity=0 for rejected/cancelled-before-placed orders.
+        # TS returns zero quantity for rejected/cancelled-before-placed orders.
         # NT's Quantity requires a positive value — skip rather than error.
         if qty_ordered == 0:
             return None
 
+        side = parse_order_side(ts_order)
+        if side is None:
+            _log.warning(
+                f"Skipping order {ts_order_id}: unknown side "
+                f"(BuyOrSell/TradeAction not recognised) - not defaulting to Buy"
+            )
+            return None
+
+        order_type = parse_ts_order_type(ts_order.get("OrderType", "Market"))
+
         price_str = ts_order.get("LimitPrice") or ts_order.get("Price") or "0"
         price = Price.from_str(price_str) if price_str != "0" else None
 
-        trade_action = ts_order.get("TradeAction", "Buy")
-        side = OrderSide.BUY if trade_action in ("Buy", "BuyToCover") else OrderSide.SELL
+        trigger_price = None
+        trigger_type = None
+        if order_type in (OrderType.STOP_MARKET, OrderType.STOP_LIMIT):
+            stop_str = ts_order.get("StopPrice") or "0"
+            if stop_str == "0":
+                _log.warning(f"Skipping stop order {ts_order_id}: no StopPrice")
+                return None
+            trigger_price = Price.from_str(stop_str)
+            trigger_type = TriggerType.DEFAULT
+        if order_type == OrderType.STOP_MARKET:
+            price = None  # a stop-market carries no limit price
 
-        avg_px_str = ts_order.get("AveragePrice") or "0"
-        avg_px = Price.from_str(avg_px_str) if avg_px_str != "0" else None
+        avg_str = _avg_fill_price(ts_order)
+        avg_px = Decimal(avg_str) if avg_str != "0" else None
+
+        kwargs: dict[str, Any] = {}
+        if trigger_price is not None:
+            kwargs["trigger_price"] = trigger_price
+            kwargs["trigger_type"] = trigger_type
 
         return OrderStatusReport(
             account_id=account_id,
@@ -195,8 +284,8 @@ def parse_order_status_report(
             client_order_id=client_order_id,
             venue_order_id=VenueOrderId(ts_order_id) if ts_order_id else None,
             order_side=side,
-            order_type=parse_ts_order_type(ts_order.get("OrderType", "Market")),
-            time_in_force=TimeInForce.DAY,
+            order_type=order_type,
+            time_in_force=parse_time_in_force(ts_order),
             order_status=status,
             price=price,
             quantity=Quantity.from_str(str(qty_ordered)),
@@ -206,6 +295,7 @@ def parse_order_status_report(
             ts_accepted=ts_now,
             ts_last=ts_now,
             ts_init=ts_now,
+            **kwargs,
         )
 
     except Exception as e:
@@ -220,49 +310,43 @@ def parse_fill_report(
     ts_now: int,
     client_order_id: ClientOrderId | None = None,
 ) -> FillReport | None:
-    """Parse a filled TradeStation order dict into a NautilusTrader FillReport.
+    """Parse a filled TradeStation v3 order dict into a NautilusTrader FillReport.
 
-    Only orders with status ``FLL`` (fully filled) should be passed here.
-
-    Parameters
-    ----------
-    ts_order : dict
-        Raw order dict from the TradeStation API (Status == 'FLL').
-    instrument_id : InstrumentId
-        The instrument this fill belongs to.
-    account_id : AccountId
-        The NautilusTrader account ID.
-    ts_now : int
-        Current timestamp in nanoseconds (used as ts_event/ts_init fallback).
-    client_order_id : ClientOrderId, optional
-        The NautilusTrader client order ID if known; otherwise derived from the
-        TradeStation order ID.
+    Quantity is ``Legs[0].ExecQuantity`` (never the ordered quantity: an FLP
+    without an ExecQuantity yields ``None``), price is ``FilledPrice`` (fallback
+    ``Legs[0].ExecutionPrice``), side is ``Legs[0].BuyOrSell``.
 
     Returns
     -------
     FillReport or None
-        Parsed report, or None if the fill price or quantity cannot be read.
+        ``None`` if the fill price, executed quantity or side cannot be read.
     """
     try:
         ts_order_id = ts_order.get("OrderID", "")
 
-        # Fill price: prefer AveragePrice, fall back to ExecutionPrice in Legs
-        avg_px_str = ts_order.get("AveragePrice") or "0"
+        # Fill price: FilledPrice (spec) / AveragePrice (legacy), then Legs ExecutionPrice
+        avg_px_str = _avg_fill_price(ts_order)
         if avg_px_str == "0":
-            legs = ts_order.get("Legs", [])
-            avg_px_str = legs[0].get("ExecutionPrice", "0") if legs else "0"
+            leg = _first_leg(ts_order)
+            avg_px_str = (leg.get("ExecutionPrice") if leg else None) or "0"
         if avg_px_str == "0":
             return None
 
-        # Fill quantity
-        qty_str = ts_order.get("FilledQuantity") or ts_order.get("Quantity") or "0"
-        qty = Decimal(qty_str)
+        # Fill quantity: executed only. Legacy shape keeps its old Quantity fallback.
+        leg = _first_leg(ts_order)
+        if leg is not None:
+            qty = Decimal(leg.get("ExecQuantity") or "0")
+        else:
+            qty = Decimal(ts_order.get("FilledQuantity") or ts_order.get("Quantity") or "0")
         if qty == 0:
             return None
 
-        # Order side
-        trade_action = ts_order.get("TradeAction", "Buy")
-        order_side = OrderSide.BUY if trade_action in ("Buy", "BuyToCover") else OrderSide.SELL
+        order_side = parse_order_side(ts_order)
+        if order_side is None:
+            _log.warning(
+                f"Skipping fill for order {ts_order_id}: unknown side - not defaulting to Buy"
+            )
+            return None
 
         # Timestamp
         closed_str = ts_order.get("ClosedDateTime", "") or ts_order.get("OpenedDateTime", "")
@@ -292,7 +376,6 @@ def parse_fill_report(
     except Exception as e:
         _log.error(f"Failed to parse fill report: {e}")
         return None
-
 
 
 def _group_type_for_order_list(orders: list[Order]) -> str | None:

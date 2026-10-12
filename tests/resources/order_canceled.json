@@ -3,16 +3,21 @@
   "Status": "CAN",
   "StatusDescription": "Canceled",
   "AccountID": "SIM0000001F",
-  "Symbol": "",
-  "Legs": [{"Symbol": "GCJ26", "AssetType": "FUTURE", "BuyOrSell": "Buy", "QuantityOrdered": "1", "ExecQuantity": "0", "ExecutionPrice": "0"}],
+  "Legs": [
+    {
+      "Symbol": "GCJ26",
+      "AssetType": "FUTURE",
+      "BuyOrSell": "Buy",
+      "QuantityOrdered": "1",
+      "ExecQuantity": "0",
+      "QuantityRemaining": "1",
+      "OpenOrClose": "Open"
+    }
+  ],
   "OrderType": "Limit",
   "LimitPrice": "3300.0",
-  "TradeAction": "Buy",
-  "TimeInForce": {"Duration": "DAY"},
-  "Quantity": "1",
-  "FilledQuantity": "0",
-  "AveragePrice": "0",
-  "UnfilledQuantity": "1",
   "OpenedDateTime": "2026-04-08T10:00:00Z",
-  "ClosedDateTime": "2026-04-08T10:30:00Z"
+  "ClosedDateTime": "2026-04-08T10:30:00Z",
+  "Duration": "DAY",
+  "Routing": "Intelligent"
 }
