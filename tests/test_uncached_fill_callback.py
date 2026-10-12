@@ -86,8 +86,16 @@ class TestCallback:
         p = m._uncached_fill_callback.call_args[0][0]
         assert p["kind"] == kind and p["ts_order_id"] == "972944192"
         assert p["status"] == "FLL" and p["exec_qty"] == "2" and p["client_order_id"] == "O-OLD-1"
-        tag = "[UNCACHED-FILL-LIVE]" if kind == "live" else "[DOWNTIME-FILL]"
-        assert any(tag in str(c) for c in m._log.warning.call_args_list)
+        # callback registered -> the runner is the sole alerter: no WARN tag
+        assert not m._log.warning.call_args_list
+        assert any("handed to the runner" in str(c) for c in m._log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_no_callback_downtime_warns_with_tag(self):
+        m = _client()
+        m._uncached_fill_callback = None
+        await C._process_order_event(m, _order(ALIVE + 10))
+        assert any("[DOWNTIME-FILL]" in str(c) for c in m._log.warning.call_args_list)
 
     @pytest.mark.asyncio
     async def test_poll_path_fires(self):

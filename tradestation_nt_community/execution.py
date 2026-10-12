@@ -145,7 +145,7 @@ def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_ord
 
 def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
                        instance_started_s, entry_group=None, node_group=None,
-                       alive_prev_s=None) -> str:
+                       alive_prev_s=None, handed_to_runner=False) -> str:
     """Log (and classify) an FLL/FLP fill for a mapped TS order absent from the NT cache.
 
     2026-09-29 13:23Z/13:28Z: after a restart the persisted order map is loaded but
@@ -174,6 +174,14 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) owned by the "
             f"other node (group {entry_group}) — its adapter classifies this fill"
+        )
+    elif handed_to_runner:
+        # A runner callback is registered: it resolves the owner, applies the locality
+        # filter and is the sole alerter. INFO + bare tag so the log forwarder (which
+        # matches only the WARN tags) stays silent and the non-hosting node never alerts.
+        log.info(
+            f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) {kind} fill, "
+            f"not in the NT cache — handed to the runner"
         )
     elif kind == "downtime":
         log.warning(_uncached_fill_message(
@@ -207,15 +215,18 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
     alive_map = getattr(client, "_previous_alive", None)
     alive_prev = (_float_or_none(alive_map.get(node_group))
                   if isinstance(alive_map, dict) and node_group else None)
+    cb = getattr(client, "_uncached_fill_callback", None)
+    if not callable(cb):
+        cb = None
     kind = _log_uncached_fill(
         client._log, ts_order, ts_order_id, client_order_id,
         getattr(client, "_instance_started_s", None),
         entry_group=entry_group, node_group=node_group, alive_prev_s=alive_prev,
+        handed_to_runner=cb is not None,
     )
     if kind in ("delivered", "delivered_other"):
         return kind
-    cb = getattr(client, "_uncached_fill_callback", None)
-    if cb is None or not callable(cb):
+    if cb is None:
         return kind
     leg = (ts_order.get("Legs") or [{}])[0] if isinstance(ts_order, dict) else {}
     payload = {
