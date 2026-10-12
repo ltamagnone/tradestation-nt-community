@@ -32,7 +32,7 @@ async def test_don_logs_session_pause_and_emits_nothing(deliver):
 @pytest.mark.parametrize("code,event", [("REJ", "generate_order_rejected"),
                                         ("CAN", "generate_order_canceled"),
                                         ("EXP", "generate_order_canceled")])
-async def test_rjc_can_exp_rej_handled_directly(deliver, code, event):
+async def test_rej_can_exp_handled_directly_not_watched(deliver, code, event):
     m = _client()
     await deliver(m, code)
     getattr(m, event).assert_called_once()
@@ -66,6 +66,10 @@ async def test_watch_warning_logged_exactly_once(deliver, code):
     await deliver(m, code)
     watch = [c for c in m._log.warning.call_args_list if "[TS-STATUS-WATCH]" in c.args[0]]
     assert len(watch) == 1
+    # content, not just the count: the line must name the order, the client id and the code
+    msg = watch[0].args[0]
+    assert "TS order TS-1" in msg and f"got {code} we did not request" in msg
+    assert "O-EXIT" in msg and "broker recheck in 300s" in msg
 
 
 def _own_stub(cached_coid=None, order_in_cache=None):

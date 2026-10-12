@@ -146,6 +146,7 @@ class TestRequestedCancelStuck:
         errs = self._stuck_errors(stub)
         assert len(errs) == 1
         assert "Order 1 " in errs[0] and "UCN" in errs[0] and "§150" in errs[0]
+        assert "cancel requested 10 min ago" in errs[0]    # 601 s -> "10" (D6: minutes figure)
         stub._client.cancel_order.assert_not_awaited()
         assert stub._cancel_verify_pending["1"][3] is True
         await TradeStationExecutionClient._verify_pending_cancels(stub, orders)

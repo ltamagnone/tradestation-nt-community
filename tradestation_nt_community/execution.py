@@ -1614,7 +1614,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 await self._client.cancel_order(order_id=ts_order_id)
             except Exception as e:
                 self._log.warning(f"[CANCEL-ZOMBIE] re-cancel failed for {ts_order_id}: {e}")
-            self._cancel_verify_pending[ts_order_id] = (first_seen, attempts + 1, requested, alerted)
+            self._cancel_verify_pending[ts_order_id] = (
+                first_seen, attempts + 1, requested, alerted)
 
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.
