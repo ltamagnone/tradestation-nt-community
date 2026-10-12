@@ -239,22 +239,30 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
         "group": entry_group,
     }
 
+    tag = "[DOWNTIME-FILL]" if kind == "downtime" else "[UNCACHED-FILL-LIVE]"
+
+    def _fail(why: str, exc) -> None:
+        # The INFO downgrade made the runner the sole alerter, so a failure of that path
+        # must surface with a FORWARDED tag (WARN), not an ERROR-only line.
+        try:
+            client._log.warning(
+                f"{tag} TS order {ts_order_id} ({client_order_id}) {why}: "
+                f"{type(exc).__name__}: {exc} — the fill was NOT processed by the runner; "
+                f"check /positions and /orders"
+            )
+        except Exception:
+            pass
+
     def _run():
         try:
             cb(payload)
         except Exception as exc:  # never raise into the loop
-            try:
-                client._log.error(f"[UNCACHED-FILL] callback failed for {ts_order_id}: {exc}")
-            except Exception:
-                pass
+            _fail("callback failed", exc)
 
     try:
         client._loop.call_soon(_run)
     except Exception as exc:
-        try:
-            client._log.error(f"[UNCACHED-FILL] could not schedule callback: {exc}")
-        except Exception:
-            pass
+        _fail("could not schedule callback", exc)
     return kind
 
 

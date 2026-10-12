@@ -134,7 +134,9 @@ class TestCallback:
         m._client = MagicMock()
         m._client.get_orders = AsyncMock(return_value=[_order(START + 10)])
         await C._check_order_statuses(m)       # must not raise
-        m._log.error.assert_called()
+        warns = [str(c) for c in m._log.warning.call_args_list]
+        assert any("[UNCACHED-FILL-LIVE] TS order 972944192 (O-OLD-1) callback failed" in w
+                   and "RuntimeError: boom" in w for w in warns)
 
     @pytest.mark.asyncio
     async def test_no_callback_registered_is_todays_behaviour(self):
@@ -148,6 +150,16 @@ class TestCallback:
         m._loop.call_soon.side_effect = RuntimeError("closed")
         from tradestation_nt_community.execution import _handle_uncached_fill
         assert _handle_uncached_fill(m, _order(START + 10), "972944192", "O-OLD-1") == "live"
+        assert any("[UNCACHED-FILL-LIVE] TS order 972944192 (O-OLD-1) could not schedule" in str(c)
+                   for c in m._log.warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_downtime_callback_failure_uses_downtime_tag(self):
+        m = _client()
+        m._uncached_fill_callback.side_effect = RuntimeError("boom")
+        await C._process_order_event(m, _order(ALIVE + 10))
+        assert any("[DOWNTIME-FILL] TS order 972944192 (O-OLD-1) callback failed" in str(c)
+                   for c in m._log.warning.call_args_list)
 
     def test_setter(self):
         m = MagicMock()
