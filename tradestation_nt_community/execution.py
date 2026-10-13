@@ -134,9 +134,10 @@ def _uncached_fill_message(ts_order_id: str, client_order_id, tag: str = "[UNCAC
 
 def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_order) -> None:
     """§149 observe-only: the broker filled an order NT already closed as
-    CANCELED/EXPIRED — the position may be untracked.  No fill is emitted."""
+    CANCELED/EXPIRED/REJECTED (REJECTED: a late-accepted submit, [LATE-ACCEPT-CANCELLED])
+    — the position may be untracked.  No fill is emitted."""
     if status in _st.FILLED and cached_order.status in (
-            OrderStatus.CANCELED, OrderStatus.EXPIRED):
+            OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REJECTED):
         log.error(
             f"[FILL-AFTER-CANCEL] TS order {ts_order_id} ({client_order_id}, "
             f"{cached_order.instrument_id.symbol.value}) filled at the broker but "
@@ -1623,6 +1624,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     "ID mapping may be incomplete"
                 )
 
+            legs = []
             for i, (order, ts_order_resp) in enumerate(zip(orders, ts_orders)):
                 ts_order_id = ts_order_resp.get("OrderID")
                 if not ts_order_id:
@@ -1633,11 +1635,38 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
                 self._persist_order_map()
+                legs.append((i, order, ts_order_id))
 
-                if await self._cancel_if_closed_before_accept(order.client_order_id,
-                                                              ts_order_id):
-                    continue
+            # Late accept of a group (NT already closed a leg, e.g. in-flight resolved it as
+            # REJECTED): a TS cancel of one OCO leg cancels its siblings too, so accepting the
+            # open siblings would leave NT believing in exits that no longer exist. The whole
+            # group failed: cancel every leg at the broker, reject the open legs in NT, alert.
+            late = [(i, o, t) for (i, o, t) in legs
+                    if (c := self._cache.order(o.client_order_id)) is not None and c.is_closed]
+            if late:
+                self._log.error(
+                    f"[LATE-ACCEPT-CANCELLED] {late[0][1].client_order_id} accepted by "
+                    f"TradeStation as #{late[0][2]} after NT closed it (group of {len(legs)} "
+                    f"legs) - cancelling every leg at the broker; open legs rejected in NT")
+                for (i, o, t) in legs:
+                    try:
+                        await self._client.cancel_order(str(t))
+                    except Exception as e:  # noqa: BLE001
+                        self._log.error(
+                            f"[LATE-ACCEPT-CANCELLED] {o.client_order_id} cancel of #{t} "
+                            f"failed: {e} - cancel it manually (/orders cancel)")
+                    c = self._cache.order(o.client_order_id)
+                    if c is not None and not c.is_closed:
+                        self.generate_order_rejected(
+                            strategy_id=command.strategy_id,
+                            instrument_id=o.instrument_id,
+                            client_order_id=o.client_order_id,
+                            reason="late accept: group cancelled at the broker",
+                            ts_event=self._clock.timestamp_ns(),
+                        )
+                return
 
+            for i, order, ts_order_id in legs:
                 # Generate accepted event for each leg
                 self.generate_order_accepted(
                     strategy_id=command.strategy_id,
