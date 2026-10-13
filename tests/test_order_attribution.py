@@ -84,6 +84,9 @@ def _make_submit_order_stub() -> MagicMock:
     # Logger — real MagicMock so we can inspect .info calls
     stub._log = MagicMock()
 
+    # Late-accept safety net: the order is not closed in these tests (normal accept path)
+    stub._cancel_if_closed_before_accept = AsyncMock(return_value=False)
+
     # generate_order_accepted / generate_order_rejected are auto-mocked
     return stub
 

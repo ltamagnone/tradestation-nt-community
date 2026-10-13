@@ -1475,6 +1475,29 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     # -- COMMAND HANDLERS -----------------------------------------------------------------
 
+    async def _cancel_if_closed_before_accept(self, client_order_id, ts_order_id) -> bool:
+        """A POST that succeeds AFTER NT already closed the order (e.g. the in-flight check
+        resolved a slow SUBMITTED order as REJECTED) leaves a live broker order that NT
+        believes rejected -> the strategy may enter again (duplicate position). Cancel it
+        at the broker at once and alert; never emit OrderAccepted on a closed order.
+        Returns True when the order was closed (caller must skip the accept)."""
+        cached = self._cache.order(client_order_id) if self._cache is not None else None
+        if cached is None or not cached.is_closed:
+            return False
+        self._log.error(
+            f"[LATE-ACCEPT-CANCELLED] {client_order_id} accepted by TradeStation as "
+            f"#{ts_order_id} after NT closed it ({cached.status_string()}) - cancelling at "
+            f"the broker so no unknown live order remains"
+        )
+        try:
+            await self._client.cancel_order(str(ts_order_id))
+        except Exception as e:  # noqa: BLE001
+            self._log.error(
+                f"[LATE-ACCEPT-CANCELLED] {client_order_id} cancel of #{ts_order_id} "
+                f"failed: {e} - cancel it manually (/orders cancel)"
+            )
+        return True
+
     async def _submit_order(self, command: SubmitOrder) -> None:
         """Submit an order to TradeStation."""
         order = command.order
@@ -1508,6 +1531,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     sort_keys=True,
                 )
             )
+
+            if await self._cancel_if_closed_before_accept(order.client_order_id, ts_order_id):
+                return
 
             # Generate order accepted event
             self.generate_order_accepted(
@@ -1607,6 +1633,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
                 self._persist_order_map()
+
+                if await self._cancel_if_closed_before_accept(order.client_order_id,
+                                                              ts_order_id):
+                    continue
 
                 # Generate accepted event for each leg
                 self.generate_order_accepted(
