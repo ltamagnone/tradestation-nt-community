@@ -193,7 +193,12 @@ def _order_quantities(ts_order: dict) -> tuple[Decimal, Decimal, bool]:
     if leg is not None:
         ordered = Decimal(leg.get("QuantityOrdered") or "0")
         raw_filled = leg.get("ExecQuantity")
-        return ordered, Decimal(raw_filled or "0"), raw_filled not in (None, "")
+        # Executed qty is summed over every leg (same rule as the adapter's fill delta).
+        filled = Decimal(raw_filled or "0")
+        for extra in ts_order["Legs"][1:]:
+            if isinstance(extra, dict):
+                filled += Decimal(extra.get("ExecQuantity") or "0")
+        return ordered, filled, raw_filled not in (None, "")
     ordered = Decimal(ts_order.get("Quantity") or "0")
     raw_filled = ts_order.get("FilledQuantity")
     return ordered, Decimal(raw_filled or "0"), raw_filled not in (None, "")
@@ -202,6 +207,34 @@ def _order_quantities(ts_order: dict) -> tuple[Decimal, Decimal, bool]:
 def _avg_fill_price(ts_order: dict) -> str:
     """Average fill price: ``FilledPrice`` (spec) -> ``AveragePrice`` (legacy)."""
     return ts_order.get("FilledPrice") or ts_order.get("AveragePrice") or "0"
+
+
+def ts_fill_price(ts_order: dict) -> float | None:
+    """First strictly positive price of AveragePrice, FilledPrice, ``Legs[0].ExecutionPrice``
+    (TS fields only). ``None`` when none is usable: never a price of 0."""
+    leg = _first_leg(ts_order) or {}
+    for raw in (ts_order.get("AveragePrice"), ts_order.get("FilledPrice"),
+                leg.get("ExecutionPrice")):
+        try:
+            d = Decimal(str(raw)) if raw not in (None, "") else None
+        except Exception:
+            d = None
+        if d is not None and d.is_finite() and d > 0:
+            return float(d)
+    return None
+
+
+def event_ts(ts_order: dict, ts_now: int) -> int:
+    """F3: the broker's ``ClosedDateTime`` (UTC ns, never later than now), else ts_now."""
+    closed = ts_order.get("ClosedDateTime") if isinstance(ts_order, dict) else None
+    if not closed:
+        return ts_now
+    try:
+        ts = pd.Timestamp(closed)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        return min(dt_to_unix_nanos(ts), ts_now)
+    except Exception:
+        return ts_now
 
 
 def parse_time_in_force(ts_order: dict) -> TimeInForce:
@@ -298,7 +331,7 @@ def parse_order_status_report(
             avg_px=avg_px,
             report_id=UUID4(),
             ts_accepted=ts_now,
-            ts_last=ts_now,
+            ts_last=event_ts(ts_order, ts_now),  # F3
             ts_init=ts_now,
             **kwargs,
         )
@@ -340,7 +373,7 @@ def parse_fill_report(
         # Fill quantity: executed only. Legacy shape keeps its old Quantity fallback.
         leg = _first_leg(ts_order)
         if leg is not None:
-            qty = Decimal(leg.get("ExecQuantity") or "0")
+            qty = _order_quantities(ts_order)[1]
         else:
             qty = Decimal(ts_order.get("FilledQuantity") or ts_order.get("Quantity") or "0")
         if qty == 0:

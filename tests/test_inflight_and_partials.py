@@ -20,6 +20,7 @@ from nautilus_trader.test_kit.stubs.events import TestEventStubs
 
 from tests.test_kit import TSTestInstrumentStubs
 from tradestation_nt_community.execution import TradeStationExecutionClient as C
+from tradestation_nt_community.execution import _emit_fill_delta
 
 ACCT = AccountId("TRADESTATION-SIM0000001F")
 IID = InstrumentId.from_str("GCJ26.TRADESTATION")
@@ -75,13 +76,16 @@ def _stub(cache, orders=None, fail=False, requested=False):
     s._ts_order_id_to_client_order_id = {TS_ID: coid}
     s._client_order_id_to_ts_order_id = {coid: TS_ID}
     s._cancel_verify_pending = {}
+    s._pending_modify_trigger_price = {}
+    s._check_order_statuses = AsyncMock()
     s._cancel_requested_coids = {coid: None} if requested else {}
     if fail:
         s._client.get_orders = AsyncMock(side_effect=RuntimeError("HTTP 500"))
     else:
         s._client.get_orders = AsyncMock(return_value=orders or [])
     from tradestation_nt_community.parsing.execution import parse_order_status_report
-    s._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, 5)
+    now = CLOSED_NS + 10**9
+    s._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, now)
     s._is_own_cached_order = lambda c, t=None: True
     s._cancel_was_requested = lambda c: C._cancel_was_requested(s, c)
     s._inflight_status_report = lambda i, c, t: C._inflight_status_report(s, i, c, t)
@@ -89,7 +93,8 @@ def _stub(cache, orders=None, fail=False, requested=False):
 
 
 def _query(loop, s):
-    cmd = NS(instrument_id=IID, client_order_id=next(iter(s._client_order_id_to_ts_order_id)), venue_order_id=VenueOrderId(TS_ID))
+    coid = next(iter(s._client_order_id_to_ts_order_id))
+    cmd = NS(instrument_id=IID, client_order_id=coid, venue_order_id=VenueOrderId(TS_ID))
     return loop.run_until_complete(C.generate_order_status_report(s, cmd))
 
 
@@ -127,8 +132,8 @@ def test_rej_is_rejected():
     assert rep.order_status == OrderStatus.REJECTED
 
 
-@pytest.mark.parametrize("code,expect", [("CAN", OrderStatus.CANCELED), ("OUT", OrderStatus.CANCELED),
-                                         ("EXP", OrderStatus.EXPIRED)])
+@pytest.mark.parametrize("code,expect", [
+    ("CAN", OrderStatus.CANCELED), ("OUT", OrderStatus.CANCELED), ("EXP", OrderStatus.EXPIRED)])
 def test_terminal_cancel_codes_only_when_we_requested(code, expect):
     loop, _, cache, _ = _engine("pending_cancel")
     rep = _query(loop, _stub(cache, [ts_order(code)], requested=True))
@@ -144,7 +149,8 @@ def test_fll_report_carries_executed_qty_and_flp_partial():
     rep = _query(loop, _stub(cache, [ts_order("FLL", exec_qty=3)]))
     assert rep.order_status == OrderStatus.FILLED and rep.filled_qty == Quantity.from_int(3)
     rep = _query(loop, _stub(cache, [ts_order("FLP", exec_qty=2)]))
-    assert rep.order_status == OrderStatus.PARTIALLY_FILLED and rep.filled_qty == Quantity.from_int(2)
+    assert rep.order_status == OrderStatus.PARTIALLY_FILLED
+    assert rep.filled_qty == Quantity.from_int(2)
     assert _query(loop, _stub(cache, [ts_order("FLP", exec_qty=0)])) is None
 
 
@@ -172,6 +178,8 @@ def _m(qty=3, filled=0):
     cached.instrument_id = IID
     cached.quantity = Quantity.from_int(qty)
     cached.filled_qty = Quantity.from_int(filled)
+    cached.trigger_price = None
+    cached.price = None
     m = MagicMock()
     m._ts_order_id_to_client_order_id = {TS_ID: COID}
     m._order_last_status = {}
@@ -338,3 +346,118 @@ def test_partial_orders_accessor_is_a_copy():
     assert out == {COID: (1, 7)}
     out.clear()
     assert s._partial_orders == {COID: (1, 7)}
+
+
+# ---------------------------------------------------------------- fix round 1
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+class TestPriceResolver:
+    async def test_falls_back_to_the_orders_own_price_with_warning(self, deliver):
+        m = _m()
+        m._cache.order.return_value.price = Price.from_str("99.5")
+        await deliver(m, ts_order("FLL", exec_qty=3, price="0"))
+        assert float(_fills(m)[0]["last_px"]) == 99.5
+        assert any("[FILL-PRICE-FALLBACK]" in str(c) for c in m._log.warning.call_args_list)
+
+    async def test_stop_trigger_price_is_preferred_own_price(self, deliver):
+        m = _m()
+        m._cache.order.return_value.trigger_price = Price.from_str("98.0")
+        m._cache.order.return_value.price = None
+        await deliver(m, ts_order("FLL", exec_qty=3, price="0"))
+        assert float(_fills(m)[0]["last_px"]) == 98.0
+
+    async def test_no_price_anywhere_retries_next_status_read(self, deliver):
+        m = _m()
+        await deliver(m, ts_order("FLL", exec_qty=3, price="0"))
+        assert _fills(m) == [] and TS_ID not in m._order_last_status
+        assert any("[FILL-NO-PRICE]" in str(c) for c in m._log.error.call_args_list)
+        await deliver(m, ts_order("FLL", exec_qty=3, price="101.0"))  # price shows up
+        assert len(_fills(m)) == 1
+
+    async def test_flp_without_price_keeps_order_open_and_retries(self, deliver):
+        m = _m()
+        await deliver(m, ts_order("FLP", exec_qty=2, price="0"))
+        assert _fills(m) == []
+        m.generate_order_canceled.assert_not_called()
+        assert TS_ID not in m._order_last_status
+        await deliver(m, ts_order("FLP", exec_qty=2, price="101.0"))
+        assert _fills(m)[0]["last_qty"] == Quantity.from_int(2)
+        m.generate_order_canceled.assert_called_once()
+
+
+def test_inflight_fill_report_never_carries_px_zero():
+    loop, _, cache, order = _engine("accepted")
+    o = ts_order("FLL", exec_qty=3, price="0")
+    o["Legs"][0]["ExecutionPrice"] = "101.5"
+    rep = _query(loop, _stub(cache, [o]))
+    assert float(rep.avg_px) == 101.5
+    o = ts_order("FLP", exec_qty=2, price="0")  # nothing at TS: the limit price is the fallback
+    rep = _query(loop, _stub(cache, [o]))
+    assert float(rep.avg_px) == 100.0
+    s = _stub(cache, [o])
+    s._cache = MagicMock()
+    s._cache.order.return_value = None  # no own price either
+    assert _query(loop, s) is None
+
+
+def test_inflight_pending_update_runs_modify_recovery_instead_of_answering():
+    loop, _, cache, order = _engine("accepted")
+    order.apply(TestEventStubs.order_pending_update(order))
+    assert order.status == OrderStatus.PENDING_UPDATE
+    s = _stub(cache, [ts_order("OPN")])
+    s._pending_modify_trigger_price = {order.client_order_id: Price.from_str("99.0")}
+    assert _query(loop, s) is None
+    s._check_order_statuses.assert_awaited_once()
+    # no pending amend -> a normal ACCEPTED answer
+    s = _stub(cache, [ts_order("OPN")])
+    assert _query(loop, s).order_status == OrderStatus.ACCEPTED
+    # broker already terminal -> answer even with a pending amend
+    s = _stub(cache, [ts_order("FLL", exec_qty=3)])
+    s._pending_modify_trigger_price = {order.client_order_id: Price.from_str("99.0")}
+    assert _query(loop, s).order_status == OrderStatus.FILLED
+    s._check_order_statuses.assert_not_awaited()
+
+
+def test_status_report_ts_last_uses_closed_datetime():
+    loop, _, cache, _ = _engine("pending_cancel")
+    rep = _query(loop, _stub(cache, [ts_order("CAN", ClosedDateTime=CLOSED)], requested=True))
+    assert rep.ts_last == CLOSED_NS and rep.ts_init == CLOSED_NS + 10**9
+    rep = _query(loop, _stub(cache, [ts_order("OPN")]))
+    assert rep.ts_last == CLOSED_NS + 10**9
+
+
+def test_inflight_filled_qty_sums_legs():
+    loop, _, cache, _ = _engine("accepted")
+    o = ts_order("FLP", exec_qty=1)
+    o["Legs"].append({"QuantityOrdered": "0", "ExecQuantity": "1", "BuyOrSell": "Buy"})
+    rep = _query(loop, _stub(cache, [o]))
+    assert rep.filled_qty == Quantity.from_int(2)
+
+
+@pytest.mark.parametrize("code,qty", [("FLP", 2), ("FLL", 3)])
+def test_inflight_report_then_adapter_fill_does_not_double_deliver(code, qty):
+    """Real engine: NT infers the fill from the in-flight report; the adapter's later
+    SSE/poll FLL/FLP then finds nothing left to deliver (dedup by quantity)."""
+    loop, eng, cache, order = _engine("pending_cancel")
+    rep = _query(loop, _stub(cache, [ts_order(code, exec_qty=qty)]))
+    eng._reconcile_order_report(rep, [])
+    assert order.filled_qty == Quantity.from_int(qty)
+    client = _m()
+    client._cache = cache
+    emitted, exec_total, reason = _emit_fill_delta(
+        client, ts_order(code, exec_qty=qty), TS_ID, order.client_order_id, order,
+        VenueOrderId(TS_ID), 7, "sse", partial=(code == "FLP"))
+    assert emitted is False and reason == "already_applied"
+    client.generate_order_filled.assert_not_called()
+
+
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+class TestFprOwnOpenOnly:
+    async def test_not_tracked_for_closed_or_uncached(self, deliver):
+        m = _m()
+        m._cache.order.return_value.is_closed = True
+        await deliver(m, ts_order("FPR", exec_qty=1))
+        assert m._partial_orders == {}
+        m = _m()
+        m._cache.order.return_value = None
+        await deliver(m, ts_order("FPR", exec_qty=1))
+        assert m._partial_orders == {}
