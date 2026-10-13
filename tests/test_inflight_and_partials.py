@@ -462,3 +462,34 @@ class TestFprOwnOpenOnly:
         m._cache.order.return_value = None
         await deliver(m, ts_order("FPR", exec_qty=1))
         assert m._partial_orders == {}
+
+
+# ---------------------------------------------------------------- M-7 same-drain double fill
+class TestEmittedHwm:
+    async def test_two_emits_before_the_engine_applies_the_first(self):
+        """SSE FLP then a poll CAN-with-exec in one drain: filled_qty still lags."""
+        m = _m(qty=3)
+        m._emitted_exec_hwm = {}
+        cached = m._cache.order.return_value          # filled_qty stays 0: engine hasn't run
+        for st_code, partial in (("FLP", True), ("CAN", True)):
+            _emit_fill_delta(m, ts_order(st_code, exec_qty=2), TS_ID, COID, cached,
+                             VenueOrderId(TS_ID), 7, "t", partial=partial)
+        f = _fills(m)
+        assert len(f) == 1 and f[0]["last_qty"] == Quantity.from_int(2)
+
+    async def test_later_growth_is_only_the_increment(self):
+        m = _m(qty=3)
+        m._emitted_exec_hwm = {}
+        cached = m._cache.order.return_value
+        _emit_fill_delta(m, ts_order("FLP", exec_qty=1), TS_ID, COID, cached,
+                         VenueOrderId(TS_ID), 7, "t", partial=True)
+        _emit_fill_delta(m, ts_order("FLL", exec_qty=3), TS_ID, COID, cached,
+                         VenueOrderId(TS_ID), 8, "t", partial=False)
+        assert [c["last_qty"] for c in _fills(m)] == [Quantity.from_int(1), Quantity.from_int(2)]
+
+    async def test_cleared_once_nt_shows_the_order_closed(self):
+        m = _m(qty=3)
+        m._emitted_exec_hwm = {COID: 2}
+        m._cache.order.return_value.is_closed = True
+        await _sse(m, ts_order("CAN", exec_qty=2))
+        assert m._emitted_exec_hwm == {}

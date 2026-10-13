@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 import pytest
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Quantity
 
 from tests.test_inflight_and_partials import (
     COID, IID, TS_ID, _engine, _fills, _m, _poll, _query, _sse, _stub, ts_order)
@@ -252,9 +253,21 @@ async def test_cancel_with_executed_qty_but_no_price_retries_without_cancelling(
     assert TS_ID not in m._order_last_status
 
 
-def test_inflight_requested_cancel_with_executed_qty_returns_none():
+def test_inflight_requested_cancel_with_executed_qty_reports_partial_fill():
+    """M-8: not None (NT would fabricate a bare OrderCanceled after its retries) but an
+    FPR-shaped PARTIALLY_FILLED report; the real engine applies the executed qty."""
+    loop, eng, cache, order = _engine("pending_cancel")
+    rep = _query(loop, _stub(cache, [ts_order("CAN", exec_qty=2)], requested=True))
+    assert rep is not None and rep.order_status == OrderStatus.PARTIALLY_FILLED
+    assert rep.filled_qty == Quantity.from_int(2)
+    assert float(rep.avg_px) > 0
+    eng._reconcile_order_report(rep, [])
+    assert order.filled_qty == Quantity.from_int(2)
+    assert order.status != OrderStatus.CANCELED      # never a bare cancel with filled 0
+    # no price in the TS order: the order's own limit price is the resolver fallback
     loop, _, cache, _ = _engine("pending_cancel")
-    assert _query(loop, _stub(cache, [ts_order("CAN", exec_qty=2)], requested=True)) is None
+    rep = _query(loop, _stub(cache, [ts_order("CAN", exec_qty=2, price=None)], requested=True))
+    assert rep.order_status == OrderStatus.PARTIALLY_FILLED and float(rep.avg_px) == 100.0
     # nothing executed: the requested cancel still reports CANCELED
     rep = _query(loop, _stub(cache, [ts_order("CAN", exec_qty=0)], requested=True))
     assert rep.order_status == OrderStatus.CANCELED

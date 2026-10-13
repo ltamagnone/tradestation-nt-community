@@ -290,6 +290,15 @@ def _clear_partial(client, client_order_id) -> None:
         partial.pop(client_order_id, None)
 
 
+def _clear_emitted_hwm(client, client_order_id) -> None:
+    """Drop the emitted-exec high-water mark (M-7). Called only once NT's cache shows the
+    order CLOSED (the events have been applied): clearing at emit time would reopen the
+    same-drain window the mark exists to close."""
+    hwm = getattr(client, "_emitted_exec_hwm", None)
+    if isinstance(hwm, dict):
+        hwm.pop(client_order_id, None)
+
+
 def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, cached_order,
                      venue_order_id, ts_now: int, source: str, *, partial: bool):
     """F1 + price fallback + F3: emit ONE OrderFilled for the executed quantity not yet
@@ -312,7 +321,13 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
         already = cached_order.filled_qty.as_decimal()
     except Exception:
         already = Decimal(0)
-    delta = exec_total - already
+    # M-7: NT's live exec engine enqueues events, so ``cached_order.filled_qty`` lags a fill
+    # we just emitted. A second path (SSE FLP then a poll CAN-with-exec in the same drain)
+    # would re-emit the same delta: remember the highest executed qty WE emitted per order.
+    hwm_map = getattr(client, "_emitted_exec_hwm", None)
+    hwm_map = hwm_map if isinstance(hwm_map, dict) else None
+    hwm = hwm_map.get(client_order_id, Decimal(0)) if hwm_map is not None else Decimal(0)
+    delta = exec_total - max(already, hwm)
     if delta <= 0:
         log.info(
             f"[FILL-DELTA] {client_order_id}: executed {exec_total} already applied "
@@ -352,6 +367,10 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
         liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
         ts_event=_event_ts(ts_order, ts_now),
     )
+    if hwm_map is not None:
+        hwm_map[client_order_id] = exec_total
+        while len(hwm_map) > 2000:  # bounded backstop; normally cleared on terminal
+            hwm_map.pop(next(iter(hwm_map)))
     log.info(
         f"Order filled: {client_order_id} @ {fill_px} qty={qty} [fill-source={source}]",
         LogColor.GREEN,
@@ -660,6 +679,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._cancel_requested_coids: dict = {}
         # coid -> (executed qty, since_ns): own orders sitting in FPR (partial, working).
         self._partial_orders: dict = {}
+        # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
+        self._emitted_exec_hwm: dict = {}
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -1072,12 +1093,24 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 except Exception:
                     filled_c = Decimal(0)
                 if exec_c is not None and exec_c > filled_c:
-                    # NT's CANCELED branch ignores filled qty: let the status path deliver
-                    # the fill and then the cancel.
+                    # NT's CANCELED branch ignores filled qty (it would close the order with
+                    # filled_qty 0 and never fabricate-then-fix). Answer FPR-shaped instead:
+                    # PARTIALLY_FILLED with the executed qty and the resolver price. NT
+                    # applies the fill; the status path delivers the cancel afterwards.
+                    px = _resolve_fill_price(self, ts_order, cached, client_order_id)
+                    if px is None:
+                        self._log.error(
+                            f"[FILL-NO-PRICE] {client_order_id} (TS {ts_order_id}) {status} "
+                            f"with {exec_c} executed in the in-flight query has no usable "
+                            f"price - no report, NT will retry")
+                        return None
                     self._log.warning(
                         f"[INFLIGHT-QUERY] {client_order_id} {status} with {exec_c} executed "
-                        f"> filled {filled_c} - no report, the status path delivers the fill")
-                    return None
+                        f"> filled {filled_c} - reporting PARTIALLY_FILLED {exec_c}; the "
+                        f"status path delivers the cancel")
+                    rep = dict(rep)
+                    rep["Status"] = "FLP"
+                    rep["FilledPrice"] = str(px)
         else:
             rep["Status"] = "ACK"  # open / held / unknown -> live (never invent a terminal)
         if rep.get("Status") in ("FLL", "FLP"):
@@ -2125,6 +2158,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if cached_order.is_closed:
                 self._pending_modify_trigger_price.pop(client_order_id, None)
                 _clear_partial(self, client_order_id)
+                _clear_emitted_hwm(self, client_order_id)
                 _log_fill_after_cancel(
                     self._log, status, ts_order_id, client_order_id, cached_order)
                 continue
@@ -2297,6 +2331,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         _stamp_group_if_missing(self, ts_order_id)
         if cached_order.is_closed:
             _clear_partial(self, client_order_id)
+            _clear_emitted_hwm(self, client_order_id)
             _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
             return
 
