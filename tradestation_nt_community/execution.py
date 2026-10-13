@@ -709,8 +709,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._report_own_orders: bool = bool(report_own_orders)
         self._shadow_own_sig: dict = {}   # coid -> last logged shadow signature (dedup)
         self._ts_id_to_group: dict[str, str] = {}      # ts_order_id -> submitting group
-        self._previous_alive: dict[str, float] = {}    # group -> last-alive epoch of the PREVIOUS process
-        self._alive_loaded = False                      # stamp only after the previous value is read
+        # group -> last-alive epoch of the PREVIOUS process
+        self._previous_alive: dict[str, float] = {}
+        # stamp only after the previous value is read
+        self._alive_loaded = False
         self._last_alive_stamp_s = 0.0
         self._uncached_fill_callback = None
 
@@ -1264,7 +1266,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Filter by open only
                 if open_only:
                     status = self._parse_order_status(ts_order.get("Status", ""))
-                    if status not in (OrderStatus.ACCEPTED, OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED):
+                    if status not in (
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                    ):
                         continue
 
                 report = self._parse_order_status_report(
@@ -1985,7 +1991,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                             self._register_cancel_verify(ts_id, requested=False)
                             verdict += " - NT order closed"
                         except Exception as e:
-                            self._log.error(f"[TS-STATUS-RECHECK] cancel emit failed for {coid}: {e}")
+                            self._log.error(
+                                f"[TS-STATUS-RECHECK] cancel emit failed for {coid}: {e}"
+                            )
             self._log.warning(
                 f"[TS-STATUS-RECHECK] TS order {ts_id} ({coid}, {inst}) got {status} "
                 f"unsolicited; {now - first_seen:.0f}s later broker status={now_status} "
@@ -2027,8 +2035,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     async def _verify_pending_cancels(self, orders: list) -> None:
         """§111: re-check every order reported cancelled against the broker's own
-        order list; if still live (common/order_status.LIVE) >=_CANCEL_VERIFY_MIN_AGE_S later, re-issue
-        the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Only cancels this
+        order list; if still live (common/order_status.LIVE) >=_CANCEL_VERIFY_MIN_AGE_S later,
+        re-issue the cancel (max _CANCEL_VERIFY_MAX_ATTEMPTS), loudly.  Only cancels this
         session SENT are re-issued (§149: an observed-but-unrequested cancel that is
         still live is logged as [CANCEL-MISMATCH], never cancelled).  In-memory only: zombies from a
         prior process (before restart) are out of scope here — the agent's own
@@ -2209,15 +2217,20 @@ class TradeStationExecutionClient(LiveExecutionClient):
                                 instrument_id=cached_order.instrument_id,
                                 client_order_id=client_order_id,
                                 venue_order_id=VenueOrderId(ts_order_id),
-                                reason="5xx recovery: TS stop price unchanged — treating as rejected",
+                                reason=(
+                                    "5xx recovery: TS stop price unchanged "
+                                    "— treating as rejected"
+                                ),
                                 ts_event=self._clock.timestamp_ns(),
                             )
                             self._log.warning(
-                                f"[PENDING_UPDATE recovery] modify failed for {client_order_id} — rejecting"
+                                f"[PENDING_UPDATE recovery] modify failed for "
+                                f"{client_order_id} — rejecting"
                             )
                     except Exception as rec_e:
                         self._log.error(
-                            f"[PENDING_UPDATE recovery] comparison failed for {client_order_id}: {rec_e}"
+                            f"[PENDING_UPDATE recovery] comparison failed for "
+                            f"{client_order_id}: {rec_e}"
                         )
                     continue  # recovery handled this order — skip normal status processing
 
