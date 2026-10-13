@@ -707,6 +707,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # kept past the §111 registry's lifetime so report paths can tell "we asked" from
         # "the broker cancelled on its own" (F4).
         self._cancel_requested_coids: dict = {}
+        # coid -> None, insertion-ordered, bounded: a cancel arrived BEFORE TradeStation
+        # acknowledged the order (no TS id yet). The cancel is rejected to NT as before, and
+        # sent for real as soon as the submit maps the TS id (_cancel_after_ack). Without
+        # this the order lived on at the broker (fc_5_699 #974504866, 2026-10-12: 8 min).
+        self._cancel_after_ack_coids: dict = {}
         # coid -> (executed qty, since_ns): own orders sitting in FPR (partial, working).
         self._partial_orders: dict = {}
         # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
@@ -1499,6 +1504,48 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
         return True
 
+    def _remember_cancel_after_ack(self, client_order_id) -> None:
+        """A cancel came before the TS ack: queue it for _cancel_after_ack (bounded)."""
+        pend = getattr(self, "_cancel_after_ack_coids", None)
+        if pend is None:
+            pend = self._cancel_after_ack_coids = {}
+        pend[client_order_id] = None
+        while len(pend) > 500:
+            pend.pop(next(iter(pend)))
+        self._log.warning(
+            f"[CANCEL-AFTER-ACK] {client_order_id} cancel requested before TradeStation "
+            f"acknowledged it - will cancel as soon as the order is accepted")
+
+    def _forget_cancel_after_ack(self, client_order_id) -> None:
+        pend = getattr(self, "_cancel_after_ack_coids", None)
+        if pend:
+            pend.pop(client_order_id, None)
+
+    async def _cancel_after_ack(self, client_order_id, ts_order_id) -> bool:
+        """Send a cancel that was requested before the ack. Returns True if one was sent.
+
+        Registered via _note_cancel_requested so the broker's CAN is ours (F4) and §111
+        treats it as a requested cancel, never an unrequested one. NT already holds the
+        order ACCEPTED (the pre-ack cancel was reported rejected), so the CAN that follows
+        is a normal OrderCanceled. A fill that lands between the ack and this cancel is a
+        known residual (exit-side twin of §159); the fill path still reports it.
+        """
+        pend = getattr(self, "_cancel_after_ack_coids", None)
+        if not pend or client_order_id not in pend:
+            return False
+        pend.pop(client_order_id, None)
+        self._note_cancel_requested(client_order_id)
+        self._log.warning(
+            f"[CANCEL-AFTER-ACK] {client_order_id} accepted as #{ts_order_id} - sending the "
+            f"cancel that was requested before the ack")
+        try:
+            await self._client.cancel_order(str(ts_order_id))
+        except Exception as e:  # noqa: BLE001
+            self._log.error(
+                f"[CANCEL-AFTER-ACK] {client_order_id} cancel of #{ts_order_id} failed: {e} "
+                f"- cancel it manually (/orders cancel)")
+        return True
+
     async def _submit_order(self, command: SubmitOrder) -> None:
         """Submit an order to TradeStation."""
         order = command.order
@@ -1549,8 +1596,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"Order {order.client_order_id} accepted (TradeStation ID: {ts_order_id})",
                 LogColor.GREEN,
             )
+            await TradeStationExecutionClient._cancel_after_ack(
+                self, order.client_order_id, ts_order_id)
 
         except Exception as e:
+            TradeStationExecutionClient._forget_cancel_after_ack(self, order.client_order_id)
             self._log.error(f"Failed to submit order {order.client_order_id}: {e}")
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
@@ -1679,6 +1729,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"Order group leg {i} accepted: {order.client_order_id} "
                     f"(TS: {ts_order_id})"
                 )
+            # A leg cancelled before the ack (e.g. an exit sweep on the fill bar): cancel it
+            # now. On an OCO group TradeStation cancels the sibling with it, which is what a
+            # sweep wants anyway.
+            for _i, order, ts_order_id in legs:
+                await TradeStationExecutionClient._cancel_after_ack(
+                    self, order.client_order_id, ts_order_id)
 
         except Exception as e:
             self._log.error(
@@ -1687,6 +1743,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             # Reject all legs
             for order in orders:
+                TradeStationExecutionClient._forget_cancel_after_ack(self, order.client_order_id)
                 self.generate_order_rejected(
                     strategy_id=command.strategy_id,
                     instrument_id=order.instrument_id,
@@ -1837,6 +1894,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 reason="no TradeStation order id yet (not acknowledged)",
                 ts_event=self._clock.timestamp_ns(),
             )
+            # ...but the strategy still wants it gone: send the cancel once the submit has
+            # mapped the TS id. Rejecting alone left the order working at the broker.
+            self._remember_cancel_after_ack(command.client_order_id)
             return
 
         self._note_cancel_requested(command.client_order_id)
