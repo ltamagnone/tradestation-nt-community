@@ -160,6 +160,8 @@ def _adapter_stub(cache, ts_orders):
         "tradestation_nt_community.parsing.execution", fromlist=["x"]).parse_order_status(s)
     stub._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, 1)
     stub._is_own_cached_order = lambda c, t=None: TradeStationExecutionClient._is_own_cached_order(stub, c, t)
+    stub._cancel_was_requested = lambda c: False
+    stub._inflight_status_report = lambda i, c, t: TradeStationExecutionClient._inflight_status_report(stub, i, c, t)
     return stub
 
 
@@ -188,7 +190,9 @@ def test_own_cached_order_gets_no_reports_and_no_events(status):
     reports = run(TradeStationExecutionClient.generate_order_status_reports(stub, c_orders))
     fills = run(TradeStationExecutionClient.generate_fill_reports(stub, c_fills))
     single = run(TradeStationExecutionClient.generate_order_status_report(stub, c_single))
-    assert reports == [] and fills == [] and single is None
+    assert reports == [] and fills == []
+    # F4: the single-order (in-flight) query now reads the broker; the mass-status paths stay empty.
+    assert single is not None and single.client_order_id == order.client_order_id
 
     n_events, st = order.event_count, order.status
     ms = _EMS(client_id=ClientId("TRADESTATION"), account_id=ACCT, venue=Venue("TRADESTATION"),

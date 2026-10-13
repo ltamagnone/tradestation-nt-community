@@ -850,6 +850,7 @@ def _make_check_statuses_mock(
     cached_order.strategy_id = StrategyId("S-001")
     cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
     cached_order.quantity = Quantity.from_int(1)
+    cached_order.filled_qty = Quantity.from_int(0)
     m._cache = MagicMock()
     m._cache.order.return_value = cached_order
 
@@ -948,6 +949,7 @@ class TestPendingUpdateRecovery:
         cached_order.strategy_id = StrategyId("S-001")
         cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
         cached_order.quantity = Quantity.from_int(1)
+        cached_order.filled_qty = Quantity.from_int(0)
 
         m = MagicMock()
         m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
@@ -1002,6 +1004,7 @@ class TestPendingUpdateRecovery:
         cached_order.strategy_id = StrategyId("S-001")
         cached_order.instrument_id = InstrumentId(Symbol("NQM26"), Venue("TRADESTATION"))
         cached_order.quantity = Quantity.from_int(1)
+        cached_order.filled_qty = Quantity.from_int(0)
         cached_order.side = MagicMock()
         cached_order.order_type = MagicMock()
 
@@ -1271,6 +1274,7 @@ class TestDonIsASessionPauseForGtc:
         inst = MagicMock(); inst.price_precision = 2; inst.quote_currency = MagicMock()
         m._cache.instrument.return_value = inst
         m._cache.order.return_value.quantity = Quantity.from_int(1)
+        m._cache.order.return_value.filled_qty = Quantity.from_int(0)
         await TradeStationExecutionClient._process_order_event(m, {"OrderID": "TS-1", "Status": "DON"})
         await TradeStationExecutionClient._process_order_event(
             m, {"OrderID": "TS-1", "Status": "FLL", "AveragePrice": "30664.00", "FilledQuantity": "1"})

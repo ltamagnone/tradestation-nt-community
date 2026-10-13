@@ -98,7 +98,8 @@ Two structured, greppable log lines aid post-incident reconstruction (both addit
 - `60-MINUTE` bar spec is invalid in NautilusTrader -- use `1-HOUR`
 - TradeStation rejects FOK orders -- use `TimeInForce.DAY`
 - `reduce_only` is silently ignored (no broker-side effect)
-- Only full fills (FLL) trigger fill reports; no partial fill (FLP) handling
+- Fills carry the EXECUTED qty (`Legs[*].ExecQuantity` summed, as a delta vs `order.filled_qty`) and a price from AveragePrice/FilledPrice/`Legs[0].ExecutionPrice` (never 0; none usable -> ERROR `[FILL-NO-PRICE]`, skipped). Event stamps use `ClosedDateTime`, else now (F3). FLP is terminal: fill for the delta, then OrderCanceled for the remainder (`[FLP-TERMINAL]`); FLP without a qty stays `[FLP-NO-QTY]` (runner pending path). FPR is only tracked: `[PARTIAL-FILL]` WARNING once, `partial_orders()` -> {coid: (exec_qty, since_ns)}, no NT event; cleared on any terminal status.
+- F4: `generate_order_status_report` for an own cached order reads the broker (`_inflight_status_report`): open/held codes -> ACCEPTED, FLL -> FILLED, FLP -> PARTIALLY_FILLED, REJ -> REJECTED, CAN/OUT/EXP -> CANCELED/EXPIRED only if `_cancel_was_requested(coid)` (cancel attempts + §111 registry), else ACCEPTED + `[CANCEL-MISMATCH]`; broker read failure or order absent -> None (NT retries; runner sets `inflight_check_retries=20`).
 - `DON` ('Queued', Open category) is a session pause for every time-in-force, never a cancel (§149)
 - `[UNCACHED-FILL]` WARNING = a mapped TS order filled but NT's cache has no order (placed before a node restart — startup reconciliation rebuilds 0 orders), so the strategy never sees that fill; HEAL CASE-A / PERIODIC-RECON must reconcile it. Fills whose `ClosedDateTime` predates this adapter instance (already delivered by the previous process) log at INFO only (40b9a55).
 - Options: instrument loading works, but order submission is not implemented

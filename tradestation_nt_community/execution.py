@@ -202,6 +202,152 @@ def _float_or_none(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _dec_or_none(v) -> "Decimal | None":
+    """Decimal of a TS numeric string, or None when blank/unparseable."""
+    if v is None or isinstance(v, bool) or v == "":
+        return None
+    try:
+        d = Decimal(str(v))
+    except Exception:
+        return None
+    return d if d.is_finite() else None
+
+
+def _executed_total(ts_order: dict) -> "Decimal | None":
+    """Total executed qty of a TS order: ``Legs[*].ExecQuantity`` summed over legs
+    (v3 shape), else the legacy top-level ``FilledQuantity``. ``None`` when the order
+    carries no parseable executed quantity (never falls back to the ordered qty)."""
+    total = None
+    legs = ts_order.get("Legs")
+    if isinstance(legs, list):
+        for leg in legs:
+            if isinstance(leg, dict):
+                q = _dec_or_none(leg.get("ExecQuantity"))
+                if q is not None:
+                    total = (total or Decimal(0)) + q
+    if total is None:
+        total = _dec_or_none(ts_order.get("FilledQuantity"))
+    return total
+
+
+def _fill_price(ts_order: dict) -> "float | None":
+    """First strictly positive price of AveragePrice (legacy), FilledPrice, then
+    ``Legs[0].ExecutionPrice``. ``None`` if none is usable: never a px of 0."""
+    legs = ts_order.get("Legs")
+    leg = legs[0] if isinstance(legs, list) and legs and isinstance(legs[0], dict) else {}
+    for raw in (ts_order.get("AveragePrice"), ts_order.get("FilledPrice"),
+                leg.get("ExecutionPrice")):
+        d = _dec_or_none(raw)
+        if d is not None and d > 0:
+            return float(d)
+    return None
+
+
+def _event_ts(ts_order: dict, ts_now: int) -> int:
+    """F3: the broker's ``ClosedDateTime`` (UTC ns, never later than now), else ts_now."""
+    closed = ts_order.get("ClosedDateTime") if isinstance(ts_order, dict) else None
+    if not closed:
+        return ts_now
+    try:
+        ts = pd.Timestamp(closed)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        return min(dt_to_unix_nanos(ts), ts_now)
+    except Exception:
+        return ts_now
+
+
+def _track_partial(client, ts_order: dict, client_order_id, ts_now: int) -> None:
+    """FPR (partial, still working): remember it per own order, WARN once, emit no NT
+    event. The runner reads ``partial_orders()`` to decide when to stop waiting."""
+    partial = getattr(client, "_partial_orders", None)
+    if not isinstance(partial, dict):
+        return
+    exec_int = int(_executed_total(ts_order) or 0)
+    prev = partial.get(client_order_id)
+    if prev is None:
+        partial[client_order_id] = (exec_int, ts_now)
+        legs = ts_order.get("Legs")
+        leg = legs[0] if isinstance(legs, list) and legs and isinstance(legs[0], dict) else {}
+        client._log.warning(
+            f"[PARTIAL-FILL] {client_order_id} {exec_int}/{leg.get('QuantityOrdered', '?')}"
+        )
+    elif prev[0] != exec_int:
+        partial[client_order_id] = (exec_int, prev[1])  # keep since_ns, update qty
+
+
+def _clear_partial(client, client_order_id) -> None:
+    partial = getattr(client, "_partial_orders", None)
+    if isinstance(partial, dict):
+        partial.pop(client_order_id, None)
+
+
+def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, cached_order,
+                     venue_order_id, ts_now: int, source: str, *, partial: bool):
+    """F1 + price fallback + F3: emit ONE OrderFilled for the executed quantity not yet
+    applied to the NT order (delta vs ``cached_order.filled_qty``). Shared by the SSE
+    and poll paths, FLL and FLP.
+
+    Returns ``(emitted, exec_total)``. ``exec_total`` is ``None`` when an FLP carries no
+    executed qty (caller keeps the ``[FLP-NO-QTY]`` pending path). Never emits qty <= 0
+    or px 0; a missing price logs ERROR and skips (HEAL / RECON recover the fill)."""
+    log = client._log
+    exec_total = _executed_total(ts_order)
+    if partial and (exec_total is None or exec_total <= 0):
+        return False, None
+    if exec_total is None or exec_total <= 0:
+        # FLL without a parseable executed qty: the order is fully filled.
+        exec_total = cached_order.quantity.as_decimal()
+    try:
+        already = cached_order.filled_qty.as_decimal()
+    except Exception:
+        already = Decimal(0)
+    delta = exec_total - already
+    if delta <= 0:
+        log.warning(
+            f"[FILL-DELTA] {client_order_id}: executed {exec_total} already applied "
+            f"({already}) - no fill emitted"
+        )
+        return False, exec_total
+    px = _fill_price(ts_order)
+    if px is None:
+        log.error(
+            f"[FILL-NO-PRICE] {client_order_id} (TS {ts_order_id}): executed {delta} but no "
+            f"usable price (AveragePrice/FilledPrice/Legs[0].ExecutionPrice) - fill skipped, "
+            f"HEAL/RECON must recover it (raw={ts_order})"
+        )
+        return False, exec_total
+    instrument = client._cache.instrument(cached_order.instrument_id)
+    prec = getattr(instrument, "price_precision", None)
+    if isinstance(prec, int) and not isinstance(prec, bool):
+        fill_px = Price(round(px, prec), prec)
+        quote = instrument.quote_currency
+    else:
+        fill_px = Price.from_str(str(px))
+        quote = Currency.from_str("USD")
+    qty = Quantity.from_str(format(delta, "f"))
+    client.generate_order_filled(
+        strategy_id=cached_order.strategy_id,
+        instrument_id=cached_order.instrument_id,
+        client_order_id=client_order_id,
+        venue_order_id=venue_order_id,
+        venue_position_id=None,
+        trade_id=TradeId(f"{ts_order_id}-{ts_now}"),
+        order_side=cached_order.side,
+        order_type=cached_order.order_type,
+        last_qty=qty,
+        last_px=fill_px,
+        quote_currency=quote,
+        commission=Money(Decimal("0"), Currency.from_str("USD")),
+        liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+        ts_event=_event_ts(ts_order, ts_now),
+    )
+    log.info(
+        f"Order filled: {client_order_id} @ {fill_px} qty={qty} [fill-source={source}]",
+        LogColor.GREEN,
+    )
+    return True, exec_total
+
+
 def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                        client_order_id, cached_order, venue_order_id, ts_now: int,
                        *, stream: bool) -> None:
@@ -218,8 +364,9 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             instrument_id=cached_order.instrument_id,
             client_order_id=client_order_id,
             reason=reason,
-            ts_event=ts_now,
+            ts_event=_event_ts(ts_order, ts_now),
         )
+        _clear_partial(client, client_order_id)
         log.error(f"{lead} rejected: {client_order_id} ({reason})")
 
     elif status in _st.CANCELED and status not in _st.WATCH:
@@ -232,14 +379,19 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             instrument_id=cached_order.instrument_id,
             client_order_id=client_order_id,
             venue_order_id=venue_order_id,
-            ts_event=ts_now,
+            ts_event=_event_ts(ts_order, ts_now),
         )
+        _clear_partial(client, client_order_id)
         client._register_cancel_verify(ts_order_id, requested=False)  # §111
         client._pending_modify_trigger_price.pop(client_order_id, None)  # no stale entry
         log.info(f"{lead} canceled: {client_order_id} (status={status})")
 
     elif status == "DON":
         log.info(f"{lead} {client_order_id} status=DON (Queued) — session pause, kept open")
+
+    elif status == "FPR":
+        # Partial fill, still working: monitored, no NT event (the runner decides).
+        _track_partial(client, ts_order, client_order_id, ts_now)
 
     elif status in _st.OPEN or status in _st.CANCELED:
         # R24: CANCELED∩WATCH codes land here too (held, no NT event).
@@ -248,10 +400,37 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             client._watch_status(ts_order_id, client_order_id, status)
 
     elif status in _st.FILLED:
-        # Reached only for non-FLL filled codes (FLP).
-        client._watch_status(
-            ts_order_id, client_order_id, status,
-            note="(Partial Fill UROut) not handled by the adapter")
+        # Reached only for non-FLL filled codes (FLP = partial fill, UROut: terminal).
+        # Fill the executed delta, then cancel the remainder. Never a new order.
+        try:
+            emitted, exec_total = _emit_fill_delta(
+                client, ts_order, ts_order_id, client_order_id, cached_order,
+                venue_order_id, ts_now, "flp", partial=True)
+        except Exception as e:  # never break the poll loop; HEAL/RECON recover the fill
+            log.error(f"[FLP-FILL-ERROR] {client_order_id}: fill emit failed: {e} - "
+                      f"order left open, HEAL/RECON must recover")
+            return
+        if exec_total is None:
+            client._watch_status(
+                ts_order_id, client_order_id, status,
+                note="[FLP-NO-QTY] (Partial Fill UROut) without an executed qty - "
+                     "left to the runner pending path")
+            return
+        _clear_partial(client, client_order_id)
+        remainder = cached_order.quantity.as_decimal() - exec_total
+        if remainder > 0:
+            client.generate_order_canceled(
+                strategy_id=cached_order.strategy_id,
+                instrument_id=cached_order.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=_event_ts(ts_order, ts_now),
+            )
+            client._pending_modify_trigger_price.pop(client_order_id, None)
+            log.warning(
+                f"[FLP-TERMINAL] {client_order_id}: {exec_total} filled, remainder "
+                f"{remainder} canceled (fill {'emitted' if emitted else 'NOT emitted'})"
+            )
 
     else:
         client._watch_status(
@@ -434,6 +613,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # reported cancelled, checked against the safety poll's own order fetch.
         # In-memory only: cross-restart zombies remain the agent orphan scan's job.
         self._cancel_verify_pending: dict[str, tuple[float, int, bool, bool]] = {}
+        # coid -> None, insertion-ordered, bounded: cancels this process SENT (attempted),
+        # kept past the §111 registry's lifetime so report paths can tell "we asked" from
+        # "the broker cancelled on its own" (F4).
+        self._cancel_requested_coids: dict = {}
+        # coid -> (executed qty, since_ns): own orders sitting in FPR (partial, working).
+        self._partial_orders: dict = {}
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -733,7 +918,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
             ts_order_id = str(venue_order_id)
 
         if self._is_own_cached_order(client_order_id, ts_order_id):
-            return None
+            # F4: NT's in-flight check queries here. Answering None made it fabricate
+            # OrderRejected (SUBMITTED) / OrderCanceled (PENDING_CANCEL) with no broker read.
+            return await self._inflight_status_report(
+                instrument_id, client_order_id, ts_order_id)
 
         if not ts_order_id:
             self._log.warning(f"Cannot find TradeStation order ID for {client_order_id}")
@@ -761,6 +949,64 @@ class TradeStationExecutionClient(LiveExecutionClient):
         except Exception as e:
             self._log.error(f"Failed to generate order status report: {e}")
             return None
+
+    async def _inflight_status_report(
+        self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId | None,
+        ts_order_id: str | None,
+    ) -> OrderStatusReport | None:
+        """F4: broker-read report for an own cached order that NT is chasing in-flight.
+
+        Returns None (NT retries, ``inflight_check_retries``) when the id is unknown,
+        the broker read fails or the order is not in the broker's list. Open-category
+        codes (incl. FPR and the held WATCH codes) report ACCEPTED, FLL FILLED, FLP
+        PARTIALLY_FILLED with the executed qty, REJ REJECTED. A broker CAN/OUT/EXP is
+        reported CANCELED/EXPIRED only if we requested the cancel; otherwise ACCEPTED
+        with a ``[CANCEL-MISMATCH]`` log, as the live status paths treat it.
+        """
+        if not ts_order_id:
+            return None
+        try:
+            orders = await self._client.get_orders(account_keys=self._account_id)
+        except Exception as e:
+            self._log.error(
+                f"[INFLIGHT-QUERY] broker read failed for {client_order_id} "
+                f"(TS {ts_order_id}): {e} - no report, NT will retry"
+            )
+            return None
+        ts_order = next((o for o in orders if o.get("OrderID") == ts_order_id), None)
+        if ts_order is None:
+            self._log.warning(
+                f"[INFLIGHT-QUERY] {client_order_id} (TS {ts_order_id}) not in the broker "
+                f"order list - no report, NT will retry"
+            )
+            return None
+        if client_order_id is None:
+            client_order_id = self._ts_order_id_to_client_order_id.get(ts_order_id)
+        status = ts_order.get("Status", "")
+        rep = dict(ts_order)
+        if status in _st.REJECTED or status in _st.FILLED:
+            pass  # REJECTED / FILLED / PARTIALLY_FILLED straight from the parser
+        elif status in _st.CANCELED and status not in _st.WATCH:
+            if not self._cancel_was_requested(client_order_id):
+                self._log.error(
+                    f"[CANCEL-MISMATCH] {client_order_id} (TS {ts_order_id}) is {status} at "
+                    f"the broker but we never asked to cancel it - in-flight report says "
+                    f"ACCEPTED, the status path decides"
+                )
+                rep["Status"] = "ACK"
+        else:
+            rep["Status"] = "ACK"  # open / held / unknown -> live (never invent a terminal)
+        if rep.get("Status") in ("FLL", "FLP"):
+            exec_total = _executed_total(rep)
+            if exec_total is None or exec_total <= 0:
+                self._log.warning(
+                    f"[INFLIGHT-QUERY] {client_order_id} {rep.get('Status')} without an "
+                    f"executed qty - no report, NT will retry"
+                )
+                return None
+        return self._parse_order_status_report(rep, instrument_id, client_order_id)
 
     async def generate_order_status_reports(
         self,
@@ -1291,6 +1537,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             return
 
+        self._note_cancel_requested(command.client_order_id)
         try:
             await self._client.cancel_order(
                 order_id=ts_order_id,
@@ -1303,6 +1550,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 venue_order_id=VenueOrderId(ts_order_id),
                 ts_event=self._clock.timestamp_ns(),
             )
+            self._partial_orders.pop(command.client_order_id, None)
             self._register_cancel_verify(ts_order_id)  # §111
 
             self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
@@ -1386,6 +1634,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 continue
 
             ts_order_id = venue_order_id.value
+            self._note_cancel_requested(order.client_order_id)
             try:
                 await self._client.cancel_order(order_id=ts_order_id)
                 self.generate_order_canceled(
@@ -1540,6 +1789,28 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"-> {verdict}"
             )
 
+    def _note_cancel_requested(self, client_order_id) -> None:
+        """Remember that this process sent a cancel for ``client_order_id`` (bounded)."""
+        reqs = self._cancel_requested_coids
+        reqs[client_order_id] = None
+        while len(reqs) > 2000:
+            reqs.pop(next(iter(reqs)))
+
+    def _cancel_was_requested(self, client_order_id) -> bool:
+        """True if THIS process asked the broker to cancel ``client_order_id`` (a cancel
+        attempt, even one whose HTTP call failed, or a §111 registry row with
+        ``requested=True``). A broker CAN/OUT/EXP for an order we never asked to cancel
+        is not ours to report as canceled (F4)."""
+        if client_order_id in self._cancel_requested_coids:
+            return True
+        ts_id = self._client_order_id_to_ts_order_id.get(client_order_id)
+        row = self._cancel_verify_pending.get(ts_id) if ts_id else None
+        return bool(row and row[2])
+
+    def partial_orders(self) -> dict:
+        """Read-only copy of the own orders in FPR: ``{client_order_id: (exec_qty, since_ns)}``."""
+        return dict(self._partial_orders)
+
     def _register_cancel_verify(self, ts_order_id: str, requested: bool = True) -> None:
         """Queue a cancelled order for §111 verification. `requested`: this session
         sent the cancel (only those may be re-issued — §149)."""
@@ -1652,6 +1923,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
             status = ts_order.get("Status", "")
             last_status = self._order_last_status.get(ts_order_id, "")
             has_pending_amend = client_order_id in self._pending_modify_trigger_price
+            if status == "FPR":
+                _track_partial(self, ts_order, client_order_id, self._clock.timestamp_ns())
 
             # Normal skip: no status change and no pending amend to resolve.
             # If a 5xx left an amend in-flight (has_pending_amend=True) we must
@@ -1676,6 +1949,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Also clean up any stale pending-amend record (e.g. SSE filled it first).
             if cached_order.is_closed:
                 self._pending_modify_trigger_price.pop(client_order_id, None)
+                _clear_partial(self, client_order_id)
                 _log_fill_after_cancel(
                     self._log, status, ts_order_id, client_order_id, cached_order)
                 continue
@@ -1742,63 +2016,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
             ts_now = self._clock.timestamp_ns()
 
             if status == "FLL":
-                # Fully filled
-                avg_px_str = ts_order.get("AveragePrice", "0")
-                filled_qty_str = ts_order.get("FilledQuantity", str(cached_order.quantity))
-
                 try:
-                    fill_px_raw = float(avg_px_str) if avg_px_str else 0.0
-                    if fill_px_raw == 0.0:
-                        # AveragePrice is missing/zero — common in sim mode.
-                        # Resolution order:
-                        #   1. FilledPrice field (present for Market orders in TS sim)
-                        #   2. Legs[0].ExecutionPrice (always present when filled)
-                        #   3. Order's own trigger_price (StopMarket) or price (Limit)
-                        filled_price = ts_order.get("FilledPrice", "") or ""
-                        if not filled_price and ts_order.get("Legs"):
-                            filled_price = ts_order["Legs"][0].get("ExecutionPrice", "") or ""
-                        if filled_price and float(filled_price) > 0:
-                            avg_px_str = filled_price
-                        else:
-                            # Last resort: use the order's own price (stop trigger or limit)
-                            fallback = (
-                                getattr(cached_order, "trigger_price", None)  # StopMarket
-                                or getattr(cached_order, "price", None)        # Limit
-                            )
-                            avg_px_str = str(fallback) if fallback else "0"
-                        self._log.warning(
-                            f"AveragePrice=0 for filled order {client_order_id}; "
-                            f"resolved to {avg_px_str} (raw ts_order={ts_order})."
-                        )
-
-                    fill_px = Price.from_str(avg_px_str)
-                    filled_qty = Quantity.from_str(filled_qty_str)
-
-                    self.generate_order_filled(
-                        strategy_id=cached_order.strategy_id,
-                        instrument_id=cached_order.instrument_id,
-                        client_order_id=client_order_id,
-                        venue_order_id=venue_order_id,
-                        venue_position_id=None,
-                        trade_id=TradeId(f"{ts_order_id}-{ts_now}"),
-                        order_side=cached_order.side,
-                        order_type=cached_order.order_type,
-                        last_qty=filled_qty,
-                        last_px=fill_px,
-                        quote_currency=Currency.from_str("USD"),
-                        commission=Money(Decimal("0"), Currency.from_str("USD")),
-                        liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
-                        ts_event=ts_now,
-                    )
-                    self._log.info(
-                        f"Order filled: {client_order_id} @ {fill_px} qty={filled_qty} "
-                        f"[fill-source=status-poll]",
-                        LogColor.GREEN,
-                    )
+                    _emit_fill_delta(
+                        self, ts_order, ts_order_id, client_order_id, cached_order,
+                        venue_order_id, ts_now, "status-poll", partial=False)
                 except Exception as e:
                     self._log.error(
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
+                _clear_partial(self, client_order_id)
+                self._pending_modify_trigger_price.pop(client_order_id, None)
 
             else:
                 _apply_status_tail(
@@ -1868,6 +2095,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         status = ts_order.get("Status", "")
         last_status = self._order_last_status.get(ts_order_id, "")
 
+        if status == "FPR":
+            _track_partial(self, ts_order, client_order_id, self._clock.timestamp_ns())
+
         if status == last_status:
             return  # No change
 
@@ -1882,6 +2112,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return
         _stamp_group_if_missing(self, ts_order_id)
         if cached_order.is_closed:
+            _clear_partial(self, client_order_id)
             _log_fill_after_cancel(self._log, status, ts_order_id, client_order_id, cached_order)
             return
 
@@ -1889,54 +2120,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         ts_now = self._clock.timestamp_ns()
 
         if status == "FLL":
-            avg_px_str = ts_order.get("AveragePrice", "0")
-            filled_qty_str = ts_order.get("FilledQuantity", str(cached_order.quantity))
-
-            # Three-step price fallback (mirrors _check_order_statuses):
-            #   1. AveragePrice  — standard TS fill field
-            #   2. FilledPrice   — present for Market orders in TS sim
-            #   3. Legs[0].ExecutionPrice — always present when filled
-            fill_px_raw = float(avg_px_str) if avg_px_str else 0.0
-            if fill_px_raw == 0.0:
-                filled_price = ts_order.get("FilledPrice", "") or ""
-                if not filled_price:
-                    legs = ts_order.get("Legs", [])
-                    if legs:
-                        filled_price = legs[0].get("ExecutionPrice", "") or ""
-                if filled_price:
-                    fill_px_raw = float(filled_price)
-
-            if fill_px_raw == 0.0:
-                self._log.warning(
-                    f"Stream: AveragePrice=0 for filled order {client_order_id}; "
-                    "fill event skipped — order status report will reconcile"
-                )
-                return
-
-            instrument = self._cache.instrument(cached_order.instrument_id)
-            if not instrument:
-                return
-            prec = instrument.price_precision
-            fill_px = Price(round(fill_px_raw, prec), prec)
-            filled_qty = Quantity.from_str(filled_qty_str or str(cached_order.quantity))
-            self.generate_order_filled(
-                strategy_id=cached_order.strategy_id,
-                instrument_id=cached_order.instrument_id,
-                client_order_id=client_order_id,
-                venue_order_id=venue_order_id,
-                venue_position_id=None,
-                trade_id=TradeId(f"{ts_order_id}-{ts_now}"),
-                order_side=cached_order.side,
-                order_type=cached_order.order_type,
-                last_qty=filled_qty,
-                last_px=fill_px,
-                quote_currency=instrument.quote_currency,
-                commission=Money(Decimal("0"), Currency.from_str("USD")),
-                liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
-                ts_event=ts_now,
-            )
+            _emit_fill_delta(
+                self, ts_order, ts_order_id, client_order_id, cached_order,
+                venue_order_id, ts_now, "sse", partial=False)
+            _clear_partial(self, client_order_id)
             self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
-            self._log.info(f"Stream: order filled: {client_order_id} @ {fill_px} [fill-source=sse]")
 
         else:
             _apply_status_tail(
