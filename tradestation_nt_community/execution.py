@@ -385,6 +385,29 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
         # no generate_order_expired path anywhere, and the §111 cancel verifier plus
         # strategies only know the canceled event.  Reports for EXP map to
         # OrderStatus.EXPIRED (parsing/execution.py) on reconciliation.
+        # A cancel with executed qty not yet applied (partial-then-cancelled reported as
+        # CAN/OUT/EXP instead of FLP): the fill delta goes FIRST, or NT closes the order
+        # with filled_qty 0 and the contracts exist only at the broker.
+        exec_c = _executed_total(ts_order)
+        try:
+            filled_c = cached_order.filled_qty.as_decimal()
+        except Exception:
+            filled_c = Decimal(0)
+        if exec_c is not None and exec_c > filled_c:
+            try:
+                _em, _tot, _why = _emit_fill_delta(
+                    client, ts_order, ts_order_id, client_order_id, cached_order,
+                    venue_order_id, ts_now, "cancel-with-exec", partial=True)
+            except Exception as e:
+                log.error(f"[CANCEL-FILL-ERROR] {client_order_id}: fill emit failed: {e} - "
+                          f"order left open, the next poll retries")
+                client._order_last_status.pop(ts_order_id, None)
+                return
+            if _why == "no_price":
+                client._order_last_status.pop(ts_order_id, None)  # retry; cancel not sent
+                return
+            log.warning(f"[CANCEL-WITH-EXEC] {client_order_id}: {status} with {exec_c} "
+                        f"executed - fill delivered before the cancel")
         client.generate_order_canceled(
             strategy_id=cached_order.strategy_id,
             instrument_id=cached_order.instrument_id,
@@ -1042,6 +1065,19 @@ class TradeStationExecutionClient(LiveExecutionClient):
             rep["FilledPrice"] = str(px)
         elif status in _st.CANCELED and status not in _st.WATCH:
             rep = self._requested_cancel_filter(rep, client_order_id, ts_order_id)
+            if rep.get("Status") == status:  # still a cancel (requested)
+                exec_c = _executed_total(rep)
+                try:
+                    filled_c = cached.filled_qty.as_decimal() if cached is not None else 0
+                except Exception:
+                    filled_c = Decimal(0)
+                if exec_c is not None and exec_c > filled_c:
+                    # NT's CANCELED branch ignores filled qty: let the status path deliver
+                    # the fill and then the cancel.
+                    self._log.warning(
+                        f"[INFLIGHT-QUERY] {client_order_id} {status} with {exec_c} executed "
+                        f"> filled {filled_c} - no report, the status path delivers the fill")
+                    return None
         else:
             rep["Status"] = "ACK"  # open / held / unknown -> live (never invent a terminal)
         if rep.get("Status") in ("FLL", "FLP"):
@@ -1071,6 +1107,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 rep = dict(rep)
                 rep["Status"] = "ACK"
         return rep
+
+    def _remember_shadow_sig(self, client_order_id, sig) -> None:
+        sigs = self._shadow_own_sig
+        sigs[client_order_id] = sig
+        while len(sigs) > 2000:       # bounded: terminal orders age out FIFO
+            sigs.pop(next(iter(sigs)))
 
     def _shadow_own_order(self, ts_order: dict, client_order_id, ts_order_id) -> None:
         """Shadow mode ``[RECON-SHADOW-OWN]`` (E2): called where the own-order guard
@@ -1115,7 +1157,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             sig = json.dumps(rec, sort_keys=True)
             if self._shadow_own_sig.get(client_order_id) == sig:
                 return
-            self._shadow_own_sig[client_order_id] = sig
+            self._remember_shadow_sig(client_order_id, sig)
             self._log.info("[RECON-SHADOW-OWN] " + sig)
         except Exception as e:  # shadow mode must never affect reconciliation
             self._log.debug(f"[RECON-SHADOW-OWN] skipped: {e}")

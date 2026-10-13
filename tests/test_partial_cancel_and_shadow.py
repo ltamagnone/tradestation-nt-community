@@ -158,6 +158,7 @@ def _shadow_client(order, requested=False):
     s._log = MagicMock()
     s._shadow_own_sig = {}
     s._cancel_was_requested = lambda c: requested
+    s._remember_shadow_sig = lambda c, g: C._remember_shadow_sig(s, c, g)
     return s
 
 
@@ -209,6 +210,7 @@ async def test_mass_status_reports_stay_withheld_and_log_shadow():
     s._log = MagicMock()
     s._shadow_own_sig = {}
     s._cancel_was_requested = lambda c: False
+    s._remember_shadow_sig = lambda c, g: C._remember_shadow_sig(s, c, g)
     cmd = NS(instrument_id=None, open_only=False)
     assert await C.generate_order_status_reports(s, cmd) == []
     assert len(_lines(s)) == 1
@@ -218,3 +220,49 @@ async def test_mass_status_reports_stay_withheld_and_log_shadow():
 def test_report_own_orders_flag_defaults_false_and_is_unused():
     from tradestation_nt_community.config import TradeStationExecClientConfig
     assert TradeStationExecClientConfig(account_id="x").report_own_orders is False
+
+
+# ------------------------------------------------------- I-2: CAN/OUT/EXP with executed qty
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+@pytest.mark.parametrize("code", ["CAN", "OUT", "EXP"])
+async def test_cancel_with_executed_qty_delivers_fill_before_cancel(deliver, code):
+    m = _m(qty=3)
+    order_of_events = []
+    m.generate_order_filled.side_effect = lambda **k: order_of_events.append("fill")
+    m.generate_order_canceled.side_effect = lambda **k: order_of_events.append("cancel")
+    await deliver(m, ts_order(code, exec_qty=2))
+    assert order_of_events == ["fill", "cancel"]
+    assert float(_fills(m)[0]["last_qty"]) == 2
+
+
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+async def test_cancel_without_executed_qty_has_no_fill(deliver):
+    m = _m(qty=3)
+    await deliver(m, ts_order("CAN", exec_qty=0))
+    assert _fills(m) == []
+    m.generate_order_canceled.assert_called_once()
+
+
+@pytest.mark.parametrize("deliver", [_sse, _poll])
+async def test_cancel_with_executed_qty_but_no_price_retries_without_cancelling(deliver):
+    m = _m(qty=3)
+    m._cache.order.return_value.price = None
+    await deliver(m, ts_order("CAN", exec_qty=2, price=None, LimitPrice="0"))
+    m.generate_order_canceled.assert_not_called()
+    assert TS_ID not in m._order_last_status
+
+
+def test_inflight_requested_cancel_with_executed_qty_returns_none():
+    loop, _, cache, _ = _engine("pending_cancel")
+    assert _query(loop, _stub(cache, [ts_order("CAN", exec_qty=2)], requested=True)) is None
+    # nothing executed: the requested cancel still reports CANCELED
+    rep = _query(loop, _stub(cache, [ts_order("CAN", exec_qty=0)], requested=True))
+    assert rep.order_status == OrderStatus.CANCELED
+
+
+def test_shadow_signature_dict_is_bounded():
+    s = MagicMock()
+    s._shadow_own_sig = {}
+    for i in range(2105):
+        C._remember_shadow_sig(s, i, "x")
+    assert len(s._shadow_own_sig) == 2000 and 0 not in s._shadow_own_sig
