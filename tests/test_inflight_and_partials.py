@@ -523,6 +523,22 @@ def test_inflight_report_waits_for_a_queued_adapter_fill():
     assert order.filled_qty == Quantity.from_int(1)
 
 
+
+def test_inflight_report_waits_when_exec_grew_past_a_queued_fill():
+    """Re-review m-A: 1 lot emitted and still queued, then the broker shows exec 2. The old
+    gate (emitted >= exec) let a report through and NT inferred 2 on top of the queued 1."""
+    loop, eng, cache, order = _engine("pending_cancel")
+    client = _m()
+    client._cache = cache
+    client._emitted_exec_hwm = {}
+    _emit_fill_delta(
+        client, ts_order("FLP", exec_qty=1), TS_ID, order.client_order_id, order,
+        VenueOrderId(TS_ID), 7, "sse", partial=True)
+    assert order.filled_qty == Quantity.from_int(0)               # queued, not applied
+    s = _stub(cache, [ts_order("FLP", exec_qty=2)])
+    s._emitted_exec_hwm = client._emitted_exec_hwm
+    assert _query(loop, s) is None
+
 class TestDuplicateCancelAndCleanup:
     async def test_flp_then_can_same_drain_emits_one_cancel(self):
         """M-3: the FLP path queued the remainder cancel; the CAN-with-exec that follows

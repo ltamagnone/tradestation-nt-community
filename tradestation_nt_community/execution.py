@@ -1159,12 +1159,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # it yet, a report now makes NT infer the same fill a second time.
             hwm_map = getattr(self, "_emitted_exec_hwm", None)
             emitted = hwm_map.get(client_order_id) if isinstance(hwm_map, dict) else None
-            if emitted is not None and emitted >= exec_total and cached is not None:
+            # Gate on ANY emitted-but-unapplied qty (not only emitted >= exec): a second
+            # partial can raise exec while the first emitted fill is still queued.
+            if emitted is not None and cached is not None:
                 try:
                     applied = cached.filled_qty.as_decimal()
                 except Exception:
                     applied = Decimal(0)
-                if applied < exec_total:
+                if applied < emitted:
                     self._log.info(
                         f"[INFLIGHT-QUERY] {client_order_id} fill for {exec_total} already "
                         f"emitted (queued, applied {applied}) - no report, NT will retry")
