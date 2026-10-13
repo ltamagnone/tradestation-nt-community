@@ -88,6 +88,7 @@ def _stub(cache, orders=None, fail=False, requested=False):
     s._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, now)
     s._is_own_cached_order = lambda c, t=None: True
     s._cancel_was_requested = lambda c: C._cancel_was_requested(s, c)
+    s._requested_cancel_filter = lambda r, c, t: C._requested_cancel_filter(s, r, c, t)
     s._inflight_status_report = lambda i, c, t: C._inflight_status_report(s, i, c, t)
     return s
 

@@ -161,6 +161,7 @@ def _adapter_stub(cache, ts_orders):
     stub._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, 1)
     stub._is_own_cached_order = lambda c, t=None: TradeStationExecutionClient._is_own_cached_order(stub, c, t)
     stub._cancel_was_requested = lambda c: False
+    stub._requested_cancel_filter = lambda r, c, t: TradeStationExecutionClient._requested_cancel_filter(stub, r, c, t)
     stub._inflight_status_report = lambda i, c, t: TradeStationExecutionClient._inflight_status_report(stub, i, c, t)
     return stub
 

@@ -271,9 +271,14 @@ def _track_partial(client, ts_order: dict, client_order_id, ts_now: int) -> None
     if prev is None:
         partial[client_order_id] = (exec_int, ts_now)
         legs = ts_order.get("Legs")
-        leg = legs[0] if isinstance(legs, list) and legs and isinstance(legs[0], dict) else {}
+        ordered = 0
+        for leg in (legs if isinstance(legs, list) else []):
+            try:
+                ordered += int(float((leg or {}).get("QuantityOrdered") or 0))
+            except (TypeError, ValueError, AttributeError):
+                pass
         client._log.warning(
-            f"[PARTIAL-FILL] {client_order_id} {exec_int}/{leg.get('QuantityOrdered', '?')}"
+            f"[PARTIAL-FILL] {client_order_id} {exec_int}/{ordered if ordered else '?'}"
         )
     elif prev[0] != exec_int:
         partial[client_order_id] = (exec_int, prev[1])  # keep since_ns, update qty
@@ -414,7 +419,8 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 venue_order_id, ts_now, "flp", partial=True)
         except Exception as e:  # never break the poll loop; HEAL/RECON recover the fill
             log.error(f"[FLP-FILL-ERROR] {client_order_id}: fill emit failed: {e} - "
-                      f"order left open, HEAL/RECON must recover")
+                      f"order left open, the next poll retries")
+            client._order_last_status.pop(ts_order_id, None)  # un-advance: retry
             return
         if exec_total is None:
             client._watch_status(
@@ -574,6 +580,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         extended_hours: bool = False,
         order_map_path: str | None = None,
         node_group: str | None = None,
+        report_own_orders: bool = False,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -654,6 +661,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # §151: which node group (stable/rolling) this adapter serves. Stamped on every
         # order-map entry it submits and used to key the last-alive stamp.
         self._node_group: str | None = node_group or None
+        # Act-mode flag (later plan): defined, unused. Shadow mode logs only.
+        self._report_own_orders: bool = bool(report_own_orders)
+        self._shadow_own_sig: dict = {}   # coid -> last logged shadow signature (dedup)
         self._ts_id_to_group: dict[str, str] = {}      # ts_order_id -> submitting group
         self._previous_alive: dict[str, float] = {}    # group -> last-alive epoch of the PREVIOUS process
         self._alive_loaded = False                      # stamp only after the previous value is read
@@ -1011,7 +1021,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"[INFLIGHT-QUERY] {client_order_id} PENDING_UPDATE with a pending amend - "
                 f"running the 5xx-modify recovery instead of answering"
             )
-            await self._check_order_statuses()
+            try:
+                await self._check_order_statuses()
+            except Exception as e:  # e.g. _verify_pending_cancels HTTP: NT just retries
+                self._log.error(f"[INFLIGHT-QUERY] modify recovery failed for "
+                                f"{client_order_id}: {e} - no report, NT will retry")
             return None
         if status in _st.REJECTED:
             pass
@@ -1027,13 +1041,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 return None
             rep["FilledPrice"] = str(px)
         elif status in _st.CANCELED and status not in _st.WATCH:
-            if not self._cancel_was_requested(client_order_id):
-                self._log.error(
-                    f"[CANCEL-MISMATCH] {client_order_id} (TS {ts_order_id}) is {status} at "
-                    f"the broker but we never asked to cancel it - in-flight report says "
-                    f"ACCEPTED, the status path decides"
-                )
-                rep["Status"] = "ACK"
+            rep = self._requested_cancel_filter(rep, client_order_id, ts_order_id)
         else:
             rep["Status"] = "ACK"  # open / held / unknown -> live (never invent a terminal)
         if rep.get("Status") in ("FLL", "FLP"):
@@ -1045,6 +1053,72 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
                 return None
         return self._parse_order_status_report(rep, instrument_id, client_order_id)
+
+    def _requested_cancel_filter(self, rep: dict, client_order_id, ts_order_id) -> dict:
+        """THE requested-cancel filter for every report path that may describe an OWN
+        order (F4 in-flight query, shadow mode, any future act mode): a broker
+        CAN/OUT/EXP maps to canceled only if THIS process asked for the cancel; otherwise
+        the report says ACK (live) with a ``[CANCEL-MISMATCH]`` ERROR. Returns ``rep``
+        (possibly a copy with Status ACK)."""
+        status = rep.get("Status", "")
+        if status in _st.CANCELED and status not in _st.WATCH:
+            if not self._cancel_was_requested(client_order_id):
+                self._log.error(
+                    f"[CANCEL-MISMATCH] {client_order_id} (TS {ts_order_id}) is {status} at "
+                    f"the broker but we never asked to cancel it - in-flight report says "
+                    f"ACCEPTED, the status path decides"
+                )
+                rep = dict(rep)
+                rep["Status"] = "ACK"
+        return rep
+
+    def _shadow_own_order(self, ts_order: dict, client_order_id, ts_order_id) -> None:
+        """Shadow mode ``[RECON-SHADOW-OWN]`` (E2): called where the own-order guard
+        WITHHOLDS a report. When the broker's state differs from NT's cache, log ONE JSON
+        line (deduplicated per order until the signature changes). LOGS ONLY: never returns
+        a report, never emits an NT event, never raises. ``report_own_orders`` (act mode)
+        is intentionally not consulted."""
+        try:
+            cached = self._cache.order(client_order_id)
+            if cached is None and ts_order_id:
+                alt = self._cache.client_order_id(VenueOrderId(str(ts_order_id)))
+                cached = self._cache.order(alt) if alt is not None else None
+                client_order_id = alt or client_order_id
+            if cached is None:
+                return
+            status = ts_order.get("Status", "")
+            exec_qty = _executed_total(ts_order)
+            try:
+                filled = cached.filled_qty.as_decimal()
+            except Exception:
+                filled = Decimal(0)
+            terminal = (status in _st.REJECTED or status in _st.FILLED
+                        or (status in _st.CANCELED and status not in _st.WATCH))
+            differs = ((exec_qty or Decimal(0)) != filled
+                       or (terminal and not cached.is_closed)
+                       or (not terminal and cached.is_closed))
+            if not differs:
+                self._shadow_own_sig.pop(client_order_id, None)
+                return
+            requested = self._cancel_was_requested(client_order_id)
+            rec = {
+                "event": "own_order_differs",
+                "client_order_id": str(client_order_id),
+                "ts_order_id": str(ts_order_id),
+                "status": status,
+                "cache_status": cached.status.name,
+                "exec_qty": None if exec_qty is None else str(exec_qty),
+                "filled_qty": str(filled),
+                "avg_px_present": ts_fill_price(ts_order) is not None,
+                "requested_cancel": bool(requested),
+            }
+            sig = json.dumps(rec, sort_keys=True)
+            if self._shadow_own_sig.get(client_order_id) == sig:
+                return
+            self._shadow_own_sig[client_order_id] = sig
+            self._log.info("[RECON-SHADOW-OWN] " + sig)
+        except Exception as e:  # shadow mode must never affect reconciliation
+            self._log.debug(f"[RECON-SHADOW-OWN] skipped: {e}")
 
     async def generate_order_status_reports(
         self,
@@ -1071,6 +1145,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     client_order_id = ClientOrderId(f"TS-{ts_order_id}")
 
                 if self._is_own_cached_order(client_order_id, ts_order_id):
+                    self._shadow_own_order(ts_order, client_order_id, ts_order_id)
                     continue
 
                 # Get instrument ID — TS futures orders don't have a top-level Symbol;
@@ -1194,6 +1269,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 ts_order_id = ts_order.get("OrderID")
                 coid = self._ts_order_id_to_client_order_id.get(ts_order_id)
                 if self._is_own_cached_order(coid, ts_order_id):
+                    self._shadow_own_order(ts_order, coid, ts_order_id)
                     continue
 
                 report = parse_fill_report(
@@ -1581,14 +1657,24 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 order_id=ts_order_id,
             )
 
-            self.generate_order_canceled(
-                strategy_id=command.strategy_id,
-                instrument_id=command.instrument_id,
-                client_order_id=command.client_order_id,
-                venue_order_id=VenueOrderId(ts_order_id),
-                ts_event=self._clock.timestamp_ns(),
-            )
-            self._partial_orders.pop(command.client_order_id, None)
+            if command.client_order_id in self._partial_orders:
+                # Cancel of an FPR remainder: the broker answers FLP (executed qty + cancel,
+                # emitted by the FLP terminal path as fill delta then OrderCanceled) or FLL
+                # (the cancel lost the race). Emitting OrderCanceled now would close the NT
+                # order before the executed qty is applied -> that fill would be dropped.
+                self._log.info(
+                    f"[PARTIAL-CANCEL] {command.client_order_id}: cancel accepted for a "
+                    f"partially filled order - OrderCanceled withheld until the broker's "
+                    f"terminal FLP/FLL"
+                )
+            else:
+                self.generate_order_canceled(
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    client_order_id=command.client_order_id,
+                    venue_order_id=VenueOrderId(ts_order_id),
+                    ts_event=self._clock.timestamp_ns(),
+                )
             self._register_cancel_verify(ts_order_id)  # §111
 
             self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
@@ -1675,13 +1761,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._note_cancel_requested(order.client_order_id)
             try:
                 await self._client.cancel_order(order_id=ts_order_id)
-                self.generate_order_canceled(
-                    strategy_id=command.strategy_id,
-                    instrument_id=command.instrument_id,
-                    client_order_id=order.client_order_id,
-                    venue_order_id=venue_order_id,
-                    ts_event=self._clock.timestamp_ns(),
-                )
+                if order.client_order_id not in self._partial_orders:
+                    self.generate_order_canceled(
+                        strategy_id=command.strategy_id,
+                        instrument_id=command.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=venue_order_id,
+                        ts_event=self._clock.timestamp_ns(),
+                    )
+                else:  # FPR remainder: the terminal FLP/FLL applies the fill, then cancels
+                    self._log.info(f"[PARTIAL-CANCEL] {order.client_order_id}: "
+                                   f"OrderCanceled withheld until the broker's FLP/FLL")
                 self._register_cancel_verify(ts_order_id)  # §111
                 self._log.info(
                     f"Cancelled order {order.client_order_id} ({ts_order_id})"
@@ -1966,6 +2056,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if _own is not None and not _own.is_closed:  # own, open orders only
                     _track_partial(
                         self, ts_order, client_order_id, self._clock.timestamp_ns())
+                else:
+                    _clear_partial(self, client_order_id)  # closed/uncached: no stale entry
 
             # Normal skip: no status change and no pending amend to resolve.
             # If a 5xx left an amend in-flight (has_pending_amend=True) we must
@@ -2068,6 +2160,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     self._log.error(
                         f"Fill poll: error generating fill event for {client_order_id}: {e}"
                     )
+                    self._order_last_status.pop(ts_order_id, None)  # un-advance: retry
+                    continue
                 _clear_partial(self, client_order_id)
                 self._pending_modify_trigger_price.pop(client_order_id, None)
 
@@ -2143,6 +2237,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
             _own = self._cache.order(client_order_id)
             if _own is not None and not _own.is_closed:  # own, open orders only
                 _track_partial(self, ts_order, client_order_id, self._clock.timestamp_ns())
+            else:
+                _clear_partial(self, client_order_id)  # closed/uncached: no stale entry
 
         if status == last_status:
             return  # No change
@@ -2166,9 +2262,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
         ts_now = self._clock.timestamp_ns()
 
         if status == "FLL":
-            _, _, reason = _emit_fill_delta(
-                self, ts_order, ts_order_id, client_order_id, cached_order,
-                venue_order_id, ts_now, "sse", partial=False)
+            try:
+                _, _, reason = _emit_fill_delta(
+                    self, ts_order, ts_order_id, client_order_id, cached_order,
+                    venue_order_id, ts_now, "sse", partial=False)
+            except Exception:
+                self._order_last_status.pop(ts_order_id, None)  # un-advance: poll retries
+                raise
             if reason == "no_price":
                 self._order_last_status.pop(ts_order_id, None)  # the safety poll retries
                 return

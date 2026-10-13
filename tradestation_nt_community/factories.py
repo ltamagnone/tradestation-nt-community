@@ -251,4 +251,5 @@ class TradeStationLiveExecClientFactory(LiveExecClientFactory):
             extended_hours=config.extended_hours,
             order_map_path=config.order_map_path,
             node_group=config.node_group,
+            report_own_orders=config.report_own_orders,
         )

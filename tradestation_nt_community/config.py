@@ -112,4 +112,8 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     streaming_status_poll_secs: float = 60.0
     extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)
     order_map_path: str | None = None  # Path to persist order-ID map across restarts (T-2)
+    # E2 act mode (a LATER plan): hand reports for own cached orders to NT reconciliation.
+    # Defined but UNUSED today: the own-order guard always withholds them and only logs
+    # [RECON-SHADOW-OWN] (shadow mode). Must stay False.
+    report_own_orders: bool = False
     node_group: str | None = None  # §151: node group (stable/rolling) stamped on order-map entries + alive stamps
