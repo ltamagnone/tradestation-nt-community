@@ -297,6 +297,23 @@ def _clear_emitted_hwm(client, client_order_id) -> None:
     hwm = getattr(client, "_emitted_exec_hwm", None)
     if isinstance(hwm, dict):
         hwm.pop(client_order_id, None)
+    canceled = getattr(client, "_emitted_cancel_coids", None)
+    if isinstance(canceled, set):
+        canceled.discard(client_order_id)
+
+
+def _release_if_terminal_closed(client, status: str, client_order_id) -> None:
+    """M-5: the unchanged-status early exit precedes the is_closed branch that clears the
+    emitted-exec bookkeeping, so after FLL/CAN it stayed until the FIFO backstop. Clear it
+    as soon as NT shows the order closed."""
+    if status not in _st.FILLED and status not in _st.CANCELED and status not in _st.REJECTED:
+        return
+    try:
+        cached = client._cache.order(client_order_id)
+    except Exception:
+        return
+    if cached is not None and cached.is_closed:
+        _clear_emitted_hwm(client, client_order_id)
 
 
 def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, cached_order,
@@ -427,13 +444,20 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 return
             log.warning(f"[CANCEL-WITH-EXEC] {client_order_id}: {status} with {exec_c} "
                         f"executed - fill delivered before the cancel")
-        client.generate_order_canceled(
-            strategy_id=cached_order.strategy_id,
-            instrument_id=cached_order.instrument_id,
-            client_order_id=client_order_id,
-            venue_order_id=venue_order_id,
-            ts_event=_event_ts(ts_order, ts_now),
-        )
+        _sent = getattr(client, "_emitted_cancel_coids", None)
+        if isinstance(_sent, set) and client_order_id in _sent:
+            # FLP-then-CAN in one drain: the FLP path already queued the remainder cancel
+            # (NT has not applied it yet) - a second would be an InvalidStateTrigger warning.
+            log.info(f"[CANCEL-DUP] {client_order_id}: remainder cancel already emitted - "
+                     f"not repeated")
+        else:
+            client.generate_order_canceled(
+                strategy_id=cached_order.strategy_id,
+                instrument_id=cached_order.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=venue_order_id,
+                ts_event=_event_ts(ts_order, ts_now),
+            )
         _clear_partial(client, client_order_id)
         client._register_cancel_verify(ts_order_id, requested=False)  # §111
         client._pending_modify_trigger_price.pop(client_order_id, None)  # no stale entry
@@ -485,6 +509,11 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 venue_order_id=venue_order_id,
                 ts_event=_event_ts(ts_order, ts_now),
             )
+            _sent = getattr(client, "_emitted_cancel_coids", None)
+            if isinstance(_sent, set):
+                _sent.add(client_order_id)
+                while len(_sent) > 2000:   # bounded backstop; normally cleared on closed
+                    _sent.discard(next(iter(_sent)))
             client._pending_modify_trigger_price.pop(client_order_id, None)
             log.warning(
                 f"[FLP-TERMINAL] {client_order_id}: {exec_total} filled, remainder "
@@ -681,6 +710,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._partial_orders: dict = {}
         # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
         self._emitted_exec_hwm: dict = {}
+        # coids whose remainder OrderCanceled the FLP path already emitted (M-3 dedup)
+        self._emitted_cancel_coids: set = set()
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -1123,6 +1154,21 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"executed qty - no report, NT will retry"
                 )
                 return None
+            # I-1: NT reconciles this report SYNCHRONOUSLY while our own generate_order_filled
+            # is only ENQUEUED. If we already emitted this executed qty and NT has not applied
+            # it yet, a report now makes NT infer the same fill a second time.
+            hwm_map = getattr(self, "_emitted_exec_hwm", None)
+            emitted = hwm_map.get(client_order_id) if isinstance(hwm_map, dict) else None
+            if emitted is not None and emitted >= exec_total and cached is not None:
+                try:
+                    applied = cached.filled_qty.as_decimal()
+                except Exception:
+                    applied = Decimal(0)
+                if applied < exec_total:
+                    self._log.info(
+                        f"[INFLIGHT-QUERY] {client_order_id} fill for {exec_total} already "
+                        f"emitted (queued, applied {applied}) - no report, NT will retry")
+                    return None
         return self._parse_order_status_report(rep, instrument_id, client_order_id)
 
     def _requested_cancel_filter(self, rep: dict, client_order_id, ts_order_id) -> dict:
@@ -2099,6 +2145,19 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._cancel_verify_pending[ts_order_id] = (
                 first_seen, attempts + 1, requested, alerted)
 
+    def _prune_closed_last_status(self, orders: list) -> None:
+        """M-5: drop ``_order_last_status`` entries of orders that left the broker's list
+        and that NT shows closed (terminal orders otherwise stay until process end)."""
+        try:
+            listed = {o.get("OrderID") for o in orders}
+            for ts_id in [t for t in self._order_last_status if t not in listed]:
+                coid = self._ts_order_id_to_client_order_id.get(ts_id)
+                cached = self._cache.order(coid) if coid is not None else None
+                if cached is not None and cached.is_closed:
+                    self._order_last_status.pop(ts_id, None)
+        except Exception:
+            pass  # housekeeping only
+
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.
 
@@ -2121,6 +2180,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         await self._verify_pending_cancels(orders)  # §111
         self._recheck_watched_statuses(orders)      # §149
+        self._prune_closed_last_status(orders)      # M-5
 
         for ts_order in orders:
             ts_order_id = ts_order.get("OrderID")
@@ -2146,6 +2206,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # If a 5xx left an amend in-flight (has_pending_amend=True) we must
             # process the order even when TS status is unchanged (still OPN/ACK).
             if status == last_status and not has_pending_amend:
+                _release_if_terminal_closed(self, status, client_order_id)
                 continue
 
             self._order_last_status[ts_order_id] = status
@@ -2330,6 +2391,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 _clear_partial(self, client_order_id)  # closed/uncached: no stale entry
 
         if status == last_status:
+            _release_if_terminal_closed(self, status, client_order_id)
             return  # No change
 
         self._order_last_status[ts_order_id] = status

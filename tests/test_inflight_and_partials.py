@@ -493,3 +493,62 @@ class TestEmittedHwm:
         m._cache.order.return_value.is_closed = True
         await _sse(m, ts_order("CAN", exec_qty=2))
         assert m._emitted_exec_hwm == {}
+
+
+# ---------------------------------------------------------------- final-fix I-1 / M-3 / M-5
+def test_inflight_report_waits_for_a_queued_adapter_fill():
+    """I-1 (real engine): an adapter fill is ENQUEUED (hwm set, order.filled_qty still 0)
+    when NT's in-flight query lands. A report now would make NT infer the same 1 lot and the
+    queued fill would apply on top (1+1 <= 3: no overfill) = broker 1, NT 2."""
+    loop, eng, cache, order = _engine("pending_cancel")
+    client = _m()
+    client._cache = cache
+    client._emitted_exec_hwm = {}
+    emitted, _, _ = _emit_fill_delta(
+        client, ts_order("FLP", exec_qty=1), TS_ID, order.client_order_id, order,
+        VenueOrderId(TS_ID), 7, "sse", partial=True)
+    assert emitted and order.filled_qty == Quantity.from_int(0)   # queued, not applied
+    s = _stub(cache, [ts_order("FLP", exec_qty=1)])
+    s._emitted_exec_hwm = client._emitted_exec_hwm
+    assert _query(loop, s) is None
+    assert any("already emitted" in str(c) for c in s._log.info.call_args_list
+               + s._log.warning.call_args_list)
+    # the queue drains: the fill is applied -> the next query reports it, NT infers nothing
+    order.apply(TestEventStubs.order_filled(
+        order, cache.instrument(IID), last_qty=Quantity.from_int(1),
+        last_px=Price.from_str("100.0"), venue_order_id=VenueOrderId(TS_ID)))
+    rep = _query(loop, s)
+    assert rep is not None and rep.filled_qty == Quantity.from_int(1)
+    eng._reconcile_order_report(rep, [])
+    assert order.filled_qty == Quantity.from_int(1)
+
+
+class TestDuplicateCancelAndCleanup:
+    async def test_flp_then_can_same_drain_emits_one_cancel(self):
+        """M-3: the FLP path queued the remainder cancel; the CAN-with-exec that follows
+        in the same drain must not queue a second OrderCanceled."""
+        m = _m(qty=3)
+        m._emitted_exec_hwm = {}
+        m._emitted_cancel_coids = set()
+        await _sse(m, ts_order("FLP", exec_qty=2))
+        assert m.generate_order_canceled.call_count == 1
+        await _poll(m, ts_order("CAN", exec_qty=2))
+        assert m.generate_order_canceled.call_count == 1
+        assert len(_fills(m)) == 1
+
+    async def test_poll_clears_hwm_for_terminal_closed_order_even_if_status_unchanged(self):
+        m = _m(qty=3)
+        m._emitted_exec_hwm = {COID: 2}
+        m._order_last_status = {TS_ID: "CAN"}
+        m._cache.order.return_value.is_closed = True
+        await _poll(m, ts_order("CAN", exec_qty=2))
+        assert m._emitted_exec_hwm == {}
+
+    async def test_poll_prunes_last_status_of_vanished_closed_orders(self):
+        m = _m(qty=3)
+        m._order_last_status = {TS_ID: "FLL", "gone": "FLL"}
+        m._ts_order_id_to_client_order_id["gone"] = ClientOrderId("O-2")
+        m._prune_closed_last_status = lambda o: C._prune_closed_last_status(m, o)
+        m._cache.order.return_value.is_closed = True
+        await _poll(m, ts_order("FLL", exec_qty=3))
+        assert "gone" not in m._order_last_status and TS_ID in m._order_last_status
