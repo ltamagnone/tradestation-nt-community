@@ -369,6 +369,16 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
         fill_px = Price.from_str(str(px))
         quote = Currency.from_str("USD")
     qty = Quantity.from_str(format(delta, "f"))
+    sent = getattr(client, "_cancel_after_ack_sent", None)
+    if isinstance(sent, dict) and client_order_id in sent:
+        # §166 residual A, observe-only: the strategy cancelled this order before the ack
+        # and has untracked it, but it filled in the ack -> cancel window. The fill is
+        # still emitted; the position may now differ from what the strategy believes.
+        log.error(
+            f"[FILL-AFTER-ACK-CANCEL] {client_order_id} (TS {ts_order_id}) filled {delta} @ "
+            f"{px} after its pre-ack cancel was sent - the strategy had dropped it; "
+            f"check the position (LESSONS §166 residual A)"
+        )
     client.generate_order_filled(
         strategy_id=cached_order.strategy_id,
         instrument_id=cached_order.instrument_id,
@@ -712,6 +722,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # sent for real as soon as the submit maps the TS id (_cancel_after_ack). Without
         # this the order lived on at the broker (fc_5_699 #974504866, 2026-10-12: 8 min).
         self._cancel_after_ack_coids: dict = {}
+        # coid -> None, bounded: orders _cancel_after_ack actually cancelled (measurement).
+        self._cancel_after_ack_sent: dict = {}
         # coid -> (executed qty, since_ns): own orders sitting in FPR (partial, working).
         self._partial_orders: dict = {}
         # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
@@ -1516,6 +1528,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
             f"[CANCEL-AFTER-ACK] {client_order_id} cancel requested before TradeStation "
             f"acknowledged it - will cancel as soon as the order is accepted")
 
+    def _remember_cancel_after_ack_sent(self, client_order_id) -> None:
+        """Orders _cancel_after_ack cancelled (bounded): a fill on one of them is the §166
+        residual A race, logged by _emit_fill_delta as [FILL-AFTER-ACK-CANCEL]."""
+        sent = getattr(self, "_cancel_after_ack_sent", None)
+        if not isinstance(sent, dict):
+            sent = self._cancel_after_ack_sent = {}
+        sent[client_order_id] = None
+        while len(sent) > 500:
+            sent.pop(next(iter(sent)))
+
     def _forget_cancel_after_ack(self, client_order_id) -> None:
         pend = getattr(self, "_cancel_after_ack_coids", None)
         if pend:
@@ -1535,6 +1557,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return False
         pend.pop(client_order_id, None)
         self._note_cancel_requested(client_order_id)
+        TradeStationExecutionClient._remember_cancel_after_ack_sent(self, client_order_id)
         self._log.info(
             f"[CANCEL-AFTER-ACK] {client_order_id} accepted as #{ts_order_id} - sending the "
             f"cancel that was requested before the ack")
