@@ -1541,6 +1541,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
         try:
             await self._client.cancel_order(str(ts_order_id))
         except Exception as e:  # noqa: BLE001
+            if "Not an open order" in str(e):
+                # Already gone: an OCO sibling cancelled with the first leg, or it filled
+                # (the fill path reports that). Nothing left to cancel.
+                self._log.info(
+                    f"[CANCEL-AFTER-ACK] {client_order_id} #{ts_order_id} already closed")
+                return True
             self._log.error(
                 f"[CANCEL-AFTER-ACK] {client_order_id} cancel of #{ts_order_id} failed: {e} "
                 f"- cancel it manually (/orders cancel)")

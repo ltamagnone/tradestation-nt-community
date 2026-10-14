@@ -83,6 +83,20 @@ async def test_cancel_after_ack_failure_is_logged_not_raised():
                for c in stub._log.error.call_args_list)
 
 
+async def test_oco_sibling_already_gone_is_not_an_error():
+    """Both OCO legs cancelled pre-ack: the first cancel kills the sibling at TS, so the
+    second returns 'Not an open order' - expected, never an operator alarm."""
+    order = make_market_order(tags=None)
+    stub = _submit_stub()
+    stub._client.cancel_order = AsyncMock(side_effect=RuntimeError("Not an open order"))
+    stub._remember_cancel_after_ack(order.client_order_id)
+
+    await TradeStationExecutionClient._submit_order(stub, _build_submit_command(order))
+
+    assert not any("[CANCEL-AFTER-ACK]" in str(c.args[0])
+                   for c in stub._log.error.call_args_list)
+
+
 async def test_missing_ts_id_rejects_and_queues():
     m, cmd = _te.TestCancelOrderRejectedEmission._make_cancel_order_mock(None, "950568948")
     m._client_order_id_to_ts_order_id = {}
