@@ -1512,7 +1512,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         pend[client_order_id] = None
         while len(pend) > 500:
             pend.pop(next(iter(pend)))
-        self._log.warning(
+        self._log.info(
             f"[CANCEL-AFTER-ACK] {client_order_id} cancel requested before TradeStation "
             f"acknowledged it - will cancel as soon as the order is accepted")
 
@@ -1535,7 +1535,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return False
         pend.pop(client_order_id, None)
         self._note_cancel_requested(client_order_id)
-        self._log.warning(
+        self._log.info(
             f"[CANCEL-AFTER-ACK] {client_order_id} accepted as #{ts_order_id} - sending the "
             f"cancel that was requested before the ack")
         try:
@@ -1888,7 +1888,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         ts_order_id = self._client_order_id_to_ts_order_id.get(command.client_order_id)
 
         if not ts_order_id:
-            self._log.error(f"Cannot find TradeStation order ID for {command.client_order_id}")
+            # Not an error any more: the cancel is queued and sent right after the ack
+            # (_cancel_after_ack, strategies LESSONS §166). Exit sweeps hit this routinely.
+            self._log.info(f"Cannot find TradeStation order ID for {command.client_order_id} yet")
             # Reject rather than stay silent: NT otherwise holds the order PENDING_CANCEL
             # until its in-flight check resolves it — possibly by synthesizing OrderCanceled
             # for an order that is live at the broker (2026-09-26).
