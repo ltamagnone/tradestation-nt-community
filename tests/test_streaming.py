@@ -13,6 +13,7 @@ import pytest
 from tradestation_nt_community.streaming.client import (
     TradeStationStreamClient,
     _HEARTBEAT_KEYS,
+    _control_event,
 )
 
 
@@ -124,7 +125,7 @@ class TestStreamUrlConstruction:
 
     @pytest.mark.asyncio
     async def test_stream_market_depth_url(self):
-        """stream_market_depth uses /marketdata/stream/marketdepth/{symbol}."""
+        """stream_market_depth uses the spec's /marketdepth/quotes or /aggregates path (§207)."""
         client = _make_client()
         urls = []
 
@@ -136,8 +137,10 @@ class TestStreamUrlConstruction:
         client._stream = fake_stream  # type: ignore
         async for _ in client.stream_market_depth("GCJ26"):
             pass
-        assert len(urls) == 1
-        assert "stream/marketdepth/GCJ26" in urls[0]
+        async for _ in client.stream_market_depth("GCJ26", aggregates=True):
+            pass
+        assert urls[0].endswith("/marketdata/stream/marketdepth/quotes/GCJ26")
+        assert urls[1].endswith("/marketdata/stream/marketdepth/aggregates/GCJ26")
 
 
 class TestStreamEventParsing:
@@ -621,3 +624,123 @@ class TestAuthErrorRefresh:
                 break
 
         assert len(sleep_calls) == 1, "Failed refresh must fall through to backoff"
+
+
+class TestControlEvents:
+    """In-band control messages are logged, never yielded; GoAway reconnects at once (§207)."""
+
+    def test_classification(self):
+        assert _control_event({"StreamStatus": "EndSnapshot"}) == ("EndSnapshot", "EndSnapshot")
+        assert _control_event({"StreamStatus": "GoAway"})[0] == "GoAway"
+        assert _control_event({"Error": "GoAway", "Message": "shutdown"})[0] == "GoAway"
+        assert _control_event({"Error": "DualLogon", "Message": "x"}) == ("Error", "DualLogon: x")
+        assert _control_event({"Error": "Forbidden", "AccountID": "SIM1"})[0] == "Error"
+        # data events, including a quote's own per-symbol Error, are never control
+        assert _control_event({"Symbol": "GCZ26", "Error": "invalid symbol"}) is None
+        assert _control_event({"OrderID": "1", "Status": "OPN"}) is None
+        assert _control_event({"TimeStamp": "2026-10-16T16:00:00Z", "BarStatus": "Open"}) is None
+        assert _control_event({"_reconnected": True}) is None
+
+    @pytest.mark.asyncio
+    async def test_goaway_reconnects_without_backoff(self, monkeypatch):
+        """A GoAway on a connection that lived >= _GOAWAY_MIN_LIFETIME_S reconnects at once."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+        sc = _make_client()
+        sleeps = []
+        clock = iter([0.0, 100.0, 200.0, 300.0])  # connect at 0, GoAway at 100, ...
+
+        async def mock_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(streaming_mod, "_monotonic", lambda: next(clock))
+        monkeypatch.setattr(streaming_mod.httpx, "AsyncClient",
+                            TestHeartbeatTimeout()._make_mock_client([
+                                ['{"OrderID": "A", "Status": "OPN"}', '{"StreamStatus": "GoAway"}',
+                                 '{"OrderID": "B", "Status": "OPN"}'],
+                                ['{"OrderID": "C", "Status": "OPN"}'],
+                            ]))
+        events = []
+        async for e in sc._stream("https://mock.ts.com/brokerage/stream/accounts/X/orders"):
+            events.append(e)
+            if len(events) >= 3:
+                break
+        assert events == [{"OrderID": "A", "Status": "OPN"}, {"_reconnected": True},
+                          {"OrderID": "C", "Status": "OPN"}]
+        assert sleeps == []
+
+    @pytest.mark.asyncio
+    async def test_goaway_right_after_connect_backs_off(self, monkeypatch):
+        """A shutting-down server that GoAways every fresh connect must not be hammered."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+        sc = _make_client()
+        sleeps = []
+
+        async def mock_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(streaming_mod, "_monotonic", lambda: 0.0)  # every connection 0 s old
+        monkeypatch.setattr(streaming_mod.httpx, "AsyncClient",
+                            TestHeartbeatTimeout()._make_mock_client([
+                                ['{"Error": "GoAway", "Message": "shutdown"}'],
+                                ['{"Error": "GoAway", "Message": "shutdown"}'],
+                                ['{"OrderID": "C", "Status": "OPN"}'],
+                            ]))
+        events = []
+        async for e in sc._stream("https://mock.ts.com/marketdata/stream/barcharts/X"):
+            events.append(e)
+            if e.get("OrderID"):
+                break
+        assert sleeps == [sc._max_delay, sc._max_delay]
+        assert events[-1] == {"OrderID": "C", "Status": "OPN"}
+
+    @pytest.mark.asyncio
+    async def test_end_snapshot_and_errors_are_logged_not_yielded(self, monkeypatch, caplog):
+        from tradestation_nt_community.streaming import client as streaming_mod
+        sc = _make_client()
+
+        async def mock_sleep(s):
+            return None
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(streaming_mod.httpx, "AsyncClient",
+                            TestHeartbeatTimeout()._make_mock_client([
+                                ['{"StreamStatus": "EndSnapshot"}',
+                                 '{"Error": "DualLogon", "Message": "dual"}',
+                                 '{"OrderID": "A", "Status": "OPN"}'],
+                            ]))
+        caplog.set_level("DEBUG")
+        async for e in sc._stream("https://mock.ts.com/marketdata/stream/barcharts/X"):
+            assert e == {"OrderID": "A", "Status": "OPN"}
+            break
+        assert "[STREAM-ERROR]" in caplog.text and "DualLogon: dual" in caplog.text
+        assert "[STREAM-STATUS] EndSnapshot" in caplog.text
+
+    def test_brokerage_streams_ask_for_the_v3_media_type(self):
+        sc = _make_client()
+        assert sc._headers("https://x/v3/brokerage/stream/accounts/A/orders")["Accept"] == (
+            "application/vnd.tradestation.streams.v3+json")
+        assert sc._headers("https://x/v3/marketdata/stream/quotes/GCZ26")["Accept"] == (
+            "application/vnd.tradestation.streams.v2+json")
+
+    @pytest.mark.asyncio
+    async def test_stream_error_then_clean_close_backs_off(self, monkeypatch):
+        """DualLogon then a clean close: reconnecting at once would let two logons loop."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+        sc = _make_client()
+        sleeps = []
+
+        async def mock_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(streaming_mod.httpx, "AsyncClient",
+                            TestHeartbeatTimeout()._make_mock_client([
+                                ['{"Error": "DualLogon", "Message": "dual"}'],  # then clean EOF
+                                ['{"OrderID": "C", "Status": "OPN"}'],
+                            ]))
+        async for e in sc._stream("https://mock.ts.com/marketdata/stream/barcharts/X"):
+            if e.get("OrderID"):
+                break
+        assert sleeps == [sc._max_delay]

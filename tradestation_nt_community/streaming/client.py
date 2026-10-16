@@ -10,7 +10,7 @@ Endpoints
 - GET /v3/marketdata/stream/quotes/{symbols}       → real-time quotes
 - GET /v3/marketdata/stream/barcharts/{symbol}     → real-time bars
 - GET /v3/brokerage/stream/accounts/{account}/orders → order status changes
-- GET /v3/marketdata/stream/marketdepth/{symbol}   → level-2 order book
+- GET /v3/marketdata/stream/marketdepth/quotes/{symbol} (or /aggregates/) → level-2 order book
 
 Usage
 -----
@@ -32,6 +32,7 @@ Usage
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Awaitable, Callable
 
@@ -42,6 +43,38 @@ _log = logging.getLogger(__name__)
 
 # Heartbeat lines that TradeStation sends to keep the connection alive.
 _HEARTBEAT_KEYS = {"Heartbeat", "heartbeat"}
+
+# Indirection so tests can drive connection age without patching the event loop's clock.
+_monotonic = time.monotonic
+
+# A GoAway on a connection younger than this is a server still shutting down: reconnecting
+# at once would loop connect -> GoAway, so back off by the max delay instead.
+_GOAWAY_MIN_LIFETIME_S = 30.0
+
+# Keys that identify a data event. A quote's own per-symbol "Error" comes with "Symbol",
+# so an event carrying any of these is data, never an in-band control message.
+_IDENTITY_KEYS = ("Symbol", "OrderID", "TimeStamp", "_reconnected")
+
+
+def _control_event(event: dict) -> tuple[str, str] | None:
+    """(kind, detail) for an in-band control message; None for data (strategies LESSONS §207).
+
+    Brokerage streams send ``{"StreamStatus": "EndSnapshot" | "GoAway"}``; every stream can send
+    ``{"Error": ..., "Message": ...}`` (market data: BadRequest, DualLogon, GoAway,
+    InternalServerError; brokerage: Forbidden, Failed, ...). Kind is "GoAway", "EndSnapshot",
+    "Status" (any other StreamStatus) or "Error".
+    """
+    if any(k in event for k in _IDENTITY_KEYS):
+        return None
+    status = event.get("StreamStatus")
+    if status:
+        status = str(status)
+        return (status if status in ("GoAway", "EndSnapshot") else "Status"), status
+    err = event.get("Error")
+    if err:
+        detail = f"{err}: {event.get('Message', '')}".rstrip(": ")
+        return ("GoAway" if err == "GoAway" else "Error"), detail
+    return None
 
 
 class TradeStationStreamClient:
@@ -78,11 +111,14 @@ class TradeStationStreamClient:
         self._max_delay = reconnect_delay_secs * 8
         self._on_auth_error = on_auth_error
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, url: str = "") -> dict[str, str]:
         token = self._token_provider()
+        # The spec types brokerage streams streams.v3+json and market data streams.v2+json
+        # (the server answers v3 on brokerage streams either way - probed 2026-10-16).
+        version = "v3" if "/brokerage/stream/" in url else "v2"
         return {
             "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.tradestation.streams.v2+json",
+            "Accept": f"application/vnd.tradestation.streams.{version}+json",
         }
 
     async def _stream(
@@ -101,13 +137,17 @@ class TradeStationStreamClient:
         """
         delay = self._reconnect_delay
         first_connect = True
+        pause_next = False  # wait _max_delay before the next connect (young GoAway, stream Error)
         while True:
+            if pause_next:
+                pause_next = False
+                await asyncio.sleep(self._max_delay)
             try:
                 async with httpx.AsyncClient(
                     timeout=httpx.Timeout(connect=30.0, read=90.0, write=None, pool=30.0),
                 ) as client:
                     async with client.stream(
-                        "GET", url, headers=self._headers(), params=params,
+                        "GET", url, headers=self._headers(url), params=params,
                     ) as resp:
                         if resp.status_code != 200:
                             body = await resp.aread()
@@ -129,6 +169,7 @@ class TradeStationStreamClient:
 
                         _log.info(f"SSE stream connected: {url}")
                         delay = self._reconnect_delay  # reset on successful connect
+                        connected_at = _monotonic()
 
                         if not first_connect:
                             # Signal the caller that a reconnect occurred so it can
@@ -148,6 +189,29 @@ class TradeStationStreamClient:
 
                             # Drop heartbeats silently
                             if any(k in event for k in _HEARTBEAT_KEYS):
+                                continue
+
+                            control = _control_event(event)
+                            if control is not None:
+                                kind, detail = control
+                                if kind == "GoAway":
+                                    lived = _monotonic() - connected_at
+                                    pause_next = lived < _GOAWAY_MIN_LIFETIME_S
+                                    _log.warning(
+                                        f"[STREAM-GOAWAY] {url}: {detail} after {lived:.0f}s - "
+                                        + (f"reconnecting in {self._max_delay:.0f}s"
+                                           if pause_next else "reconnecting now")
+                                    )
+                                    break  # leave this connection
+                                if kind == "Error":
+                                    # DualLogon included: if the server then closes cleanly, the
+                                    # loop would reconnect at once and two logons would loop.
+                                    pause_next = True
+                                    _log.error(f"[STREAM-ERROR] {url}: {detail}")
+                                elif kind == "EndSnapshot":
+                                    _log.debug(f"[STREAM-STATUS] EndSnapshot: {url}")
+                                else:
+                                    _log.info(f"[STREAM-STATUS] {detail}: {url}")
                                 continue
 
                             yield event
@@ -247,22 +311,27 @@ class TradeStationStreamClient:
         async for event in self._stream(url):
             yield event
 
-    async def stream_market_depth(self, symbol: str) -> AsyncIterator[dict]:
+    async def stream_market_depth(
+        self, symbol: str, aggregates: bool = False,
+    ) -> AsyncIterator[dict]:
         """
-        Stream level-2 market depth (order book) for a symbol.
+        Stream level-2 market depth for a symbol.
 
         Parameters
         ----------
         symbol : str
             The contract symbol (e.g. ``"GCJ26"``).
+        aggregates : bool, default False
+            False: individual quotes per level (``/marketdepth/quotes``); True: levels
+            aggregated per price (``/marketdepth/aggregates``).
 
         Yields
         ------
         dict
-            Market depth event with keys: Side (``"Bid"``/``"Ask"``),
-            Price, Size, OrderCount, etc.
+            Market depth event (``Bids`` / ``Asks`` arrays).
 
         """
-        url = f"{self._base_url}/marketdata/stream/marketdepth/{symbol}"
+        kind = "aggregates" if aggregates else "quotes"
+        url = f"{self._base_url}/marketdata/stream/marketdepth/{kind}/{symbol}"
         async for event in self._stream(url):
             yield event
