@@ -338,8 +338,13 @@ class TradeStationDataClient(LiveMarketDataClient):
         event: dict,
         bar_type: BarType,
         instrument: Instrument,
+        live_stream: bool = True,
     ) -> None:
-        """Feed one TradeStation bar event through ``gate`` and emit what it releases."""
+        """Feed one TradeStation bar event through ``gate`` and emit what it releases.
+
+        ``live_stream`` is False for polling, where every bar is history: only a stream's
+        reconnect seed can replay a bar that closed during a gap.
+        """
         ts_ns = bar_end_ns(event.get("TimeStamp", ""))
         if ts_ns is None:
             return
@@ -348,6 +353,11 @@ class TradeStationDataClient(LiveMarketDataClient):
                 self._log.info(
                     f"[BAR-CLOSE-FALLBACK] {bar_type} ts={raw.get('TimeStamp')}: no Closed "
                     f"event - emitted on the next bar's first update"
+                )
+            elif live_stream and raw.get("IsRealtime") is False:
+                self._log.info(
+                    f"[BAR-GAP-REPLAY] {bar_type} ts={raw.get('TimeStamp')}: closed while the "
+                    f"stream was down - replayed from the reconnect seed"
                 )
             for bar in self._parse_bars([raw], bar_type, instrument):
                 self._handle_data(bar)
@@ -384,7 +394,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                     barsback=2,
                 )
                 for raw in raw_bars or []:
-                    self._emit_gated(gate, raw, bar_type, instrument)
+                    self._emit_gated(gate, raw, bar_type, instrument, live_stream=False)
                 if first_poll:
                     gate.reset_connection()  # watermark set: closed bars are live from now
                     first_poll = False

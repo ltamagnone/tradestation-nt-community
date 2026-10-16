@@ -86,7 +86,7 @@ Tests use a `MockTradeStationHttpClient` (in `tests/mock_http_client.py`) that r
 
 Core dependencies for the adapter: `nautilus_trader >= 1.200`, `httpx >= 0.27`, `pandas`.
 
-> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **707 passed, 2 skipped** (2026-10-16). Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
+> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **709 passed, 2 skipped** (2026-10-16). Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
 
 ## Observability (June 2026)
 
@@ -95,6 +95,7 @@ Structured, greppable log lines aid post-incident reconstruction:
 - **`[RECON-SHADOW]`** (observe-only) — emitted by `generate_order_status_reports` for any broker order absent from `_ts_order_id_to_client_order_id` **and** the NT cache: the "adopted/external order" gap where `_check_order_statuses` (the §95 safety poll) double-skips, so a dropped fill is invisible. This **measures** the gap (it does not fix it — no map registration, no behavior change); a later phase uses the soak data to close it.
 - **TradeStation API spec alignment (strategies LESSONS §207, 2026-10-16):**
   - `[BAR-CLOSE-FALLBACK]` (INFO) — a bar emitted on the next bar's first update because no `BarStatus` Closed came for it.
+  - `[BAR-GAP-REPLAY]` (INFO) — a closed bar replayed from a stream reconnect seed (it closed while the stream was down); counted as `gap_recovery` by the strategies' `bar_stream_latency_report.py`. Polling never tags.
   - `[STREAM-GOAWAY]` (WARNING) — the server announced shutdown (`{"Error":"GoAway"}` market data, `{"StreamStatus":"GoAway"}` brokerage); reconnect at once, or after the max delay if the connection was < 30 s old.
   - `[STREAM-ERROR]` (ERROR) — an in-band stream error (`BadRequest`, `DualLogon`, `Forbidden`, `Failed`...); the next reconnect waits the max delay so two logons cannot loop. `[STREAM-STATUS]` logs `EndSnapshot` (DEBUG) and other statuses. A quote's own per-symbol `Error` (it carries `Symbol`) is data, never control.
   - `[ORDERS-PAGE-CAP]` (ERROR) — `/orders` still paging after 20 pages of 600; the list is truncated. `get_orders` always pages (`pageSize`/`nextToken`); single-order reads use `get_orders_by_id` (`GET /orders/{ids}`, HTTP 404 = none found).

@@ -49,7 +49,7 @@ def _fake(events, gates=None):
     )
     fake._parse_bars = lambda raws, bt, inst: [r["TimeStamp"][11:16] for r in raws]
     fake._handle_data = fake.emitted.append
-    fake._emit_gated = lambda *a: C._emit_gated(fake, *a)
+    fake._emit_gated = lambda *a, **k: C._emit_gated(fake, *a, **k)
     return fake
 
 
@@ -187,3 +187,43 @@ async def test_poll_emits_only_closed_bars_after_the_seeding_poll(monkeypatch):
     fake._client = types.SimpleNamespace(get_bars=get_bars)
     await C._poll_bars(fake, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None, 300.0)
     assert fake.emitted == ["16:05", "16:10"]
+
+
+async def test_reconnect_replay_is_tagged_gap_replay():
+    """A bar replayed from a reconnect seed logs [BAR-GAP-REPLAY]; live bars do not (§207)."""
+    f = await _run(
+        [
+            ev("16:05"),
+            ev("16:05", "Closed"),
+            {"_reconnected": True},
+            ev("16:05", "Closed", False),
+            ev("16:10", "Closed", False),
+            ev("16:15", "Open", False),
+            ev("16:15", "Closed"),
+        ]
+    )
+    tagged = [
+        str(c.args[0]) for c in f._log.info.call_args_list if "[BAR-GAP-REPLAY]" in str(c.args[0])
+    ]
+    assert f.emitted == ["16:05", "16:10", "16:15"]
+    assert len(tagged) == 1 and "ts=2026-10-16T16:10:00Z" in tagged[0]
+
+
+async def test_polled_bars_are_not_tagged_gap_replay(monkeypatch):
+    polls = iter([[ev("16:00", "Closed", False)], [ev("16:05", "Closed", False)]])
+
+    async def get_bars(**kw):
+        try:
+            return next(polls)
+        except StopIteration:
+            raise asyncio.CancelledError
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    fake = _fake([])
+    fake._client = types.SimpleNamespace(get_bars=get_bars)
+    await C._poll_bars(fake, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None, 300.0)
+    assert fake.emitted == ["16:05"]
+    assert not any("[BAR-GAP-REPLAY]" in str(c.args[0]) for c in fake._log.info.call_args_list)
