@@ -7,6 +7,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from tradestation_nt_community.bar_gate import BarCloseGate
+from tradestation_nt_community.bar_gate import bar_end_ns
 from tradestation_nt_community.common.enums import TradeStationBarUnit
 from tradestation_nt_community.constants import TRADESTATION_CLIENT_ID
 from tradestation_nt_community.constants import TRADESTATION_VENUE
@@ -45,6 +47,11 @@ _BAR_AGG_SECS = {
     BarAggregation.HOUR: 3600,
     BarAggregation.DAY: 86400,
 }
+
+# Bars requested on every bar-stream (re)connect. The seed's closed bars newer than the
+# watermark are replayed, so a reconnect gap of up to 9 bars loses nothing (strategies
+# LESSONS §207). Older seed bars are dropped by the gate, so the extra history is harmless.
+_STREAM_BARSBACK = 10
 
 
 def _bar_interval_secs(bar_type) -> int | None:
@@ -126,6 +133,9 @@ class TradeStationDataClient(LiveMarketDataClient):
         # Bar subscription state
         self._bar_subscriptions: dict[BarType, asyncio.Task] = {}
         self._last_bar_ts: dict[BarType, str] = {}
+        # One BarCloseGate per bar type; never cleared, so its watermark survives reconnects
+        # and watchdog task restarts (strategies LESSONS §207).
+        self._bar_gates: dict[BarType, BarCloseGate] = {}
 
         # Quote/trade tick state (polling or streaming tasks)
         self._quote_subscriptions: dict[InstrumentId, asyncio.Task] = {}
@@ -217,8 +227,8 @@ class TradeStationDataClient(LiveMarketDataClient):
         """Subscribe to bar updates via SSE streaming (preferred) or polling fallback.
 
         When ``use_streaming=True``, opens an SSE connection to the barcharts
-        endpoint. The stream sends in-progress bar updates; we buffer the
-        current bar and only emit it when its timestamp changes (= bar closed).
+        endpoint. Bars are emitted when TradeStation marks them ``BarStatus`` Closed
+        (see ``_stream_bars``).
 
         When streaming is not enabled, falls back to HTTP polling every 60s
         (MINUTE) or 300s (HOUR/DAY).
@@ -287,32 +297,15 @@ class TradeStationDataClient(LiveMarketDataClient):
     ) -> None:
         """SSE streaming loop for bars.
 
-        The TradeStation barcharts SSE endpoint sends partial (in-progress) bar
-        updates during the bar period, then a final update when the bar closes
-        and the next bar's first tick arrives (the timestamp changes).
-
-        We buffer each event and only emit the bar when we see a *new* timestamp,
-        meaning the previous bar has closed. This matches the polling behaviour
-        where strategies receive completed bars.
-
-        Reconnection recovery
-        ---------------------
-        On reconnect, TradeStation sends a ``Status=Historical`` seed bar
-        containing the last *completed* bar with accurate OHLCV.  We use it to:
-
-        * **Correct the buffer** — if the seed timestamp matches the buffered
-          bar, it replaces the (possibly stale) OHLCV values.
-        * **Ignore stale seed** — if the seed timestamp is *older* than the
-          buffer, it means we reconnected within the same bar period.  The
-          seed is a bar already emitted; the buffer is still in-progress.
-        * **Fill a gap** — if the seed timestamp is *newer* than the buffer,
-          the buffered bar is emitted first, then the seed bar is emitted as
-          a completed bar that was missed during the outage.
+        TradeStation v3 bar events carry ``BarStatus`` ("Open" while forming, "Closed" once
+        final - sent ~0.1 s after the boundary, no trade needed), ``IsRealtime`` (False for
+        the history seed sent on every connect) and ``TimeStamp`` = the bar's END. The bar
+        type's ``BarCloseGate`` decides what is emitted: closed bars once, seeds and repeats
+        never, bars that closed during a reconnect gap from the seed (strategies LESSONS §207).
         """
         self._log.info(f"Bar SSE stream started for {bar_type}")
-        buffered_event: dict | None = None
-        buffered_ts: str = ""
-        initialized = False  # True after first RealTime event processed
+        gate = self._bar_gates.setdefault(bar_type, BarCloseGate())
+        gate.reset_connection()
 
         try:
             # When extended_hours is enabled and the instrument is an equity,
@@ -329,106 +322,37 @@ class TradeStationDataClient(LiveMarketDataClient):
                 interval=interval,
                 unit=unit.value,
                 session_template=session_tpl,
+                barsback=_STREAM_BARSBACK,
             ):
-                event_ts = event.get("TimeStamp", "")
-                if not event_ts:
+                if event.get("_reconnected"):
+                    gate.reset_connection()
                     continue
-
-                is_historical = event.get("Status") == "Historical"
-
-                if is_historical:
-                    if not initialized:
-                        # Initial connection seed bar — skip it; the buffer
-                        # is empty and we don't want to emit a potentially
-                        # stale bar before live data starts flowing.
-                        self._log.debug(
-                            f"Bar stream skipping initial seed for {bar_type}: "
-                            f"ts={event_ts}"
-                        )
-                        continue
-
-                    # Reconnection seed bar — use it for gap recovery.
-                    if event_ts == buffered_ts:
-                        # Same bar period as buffer → replace with accurate
-                        # close values from the completed bar.
-                        buffered_event = event
-                        self._log.debug(
-                            f"Bar stream corrected buffer for {bar_type}: "
-                            f"ts={event_ts}"
-                        )
-                    elif event_ts < buffered_ts:
-                        # Seed is OLDER than the buffered bar — we reconnected
-                        # within the same bar period.  The seed is a bar we
-                        # already emitted before.  Ignore it and keep buffering.
-                        self._log.debug(
-                            f"Bar stream ignoring stale seed for {bar_type}: "
-                            f"seed_ts={event_ts} < buffered_ts={buffered_ts}"
-                        )
-                    else:
-                        # Seed is NEWER → the buffered bar closed during the
-                        # outage and this seed bar is the completed version
-                        # of a bar we missed.  Emit both in chronological order.
-                        if buffered_event:
-                            bars = self._parse_bars(
-                                [buffered_event], bar_type, instrument,
-                            )
-                            for bar in bars:
-                                self._handle_data(bar)
-                                self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
-                            self._log.debug(
-                                f"Bar emitted (pre-gap) for {bar_type}: "
-                                f"ts={buffered_ts}"
-                            )
-                        # Emit the seed bar (accurately closed during gap)
-                        bars = self._parse_bars(
-                            [event], bar_type, instrument,
-                        )
-                        for bar in bars:
-                            self._handle_data(bar)
-                            self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
-                        self._log.info(
-                            f"Bar gap recovery for {bar_type}: emitted seed "
-                            f"ts={event_ts}"
-                        )
-                        # Reset buffer — the next RealTime event will start
-                        # a fresh buffer for the currently-forming bar.
-                        buffered_ts = ""
-                        buffered_event = None
-                    continue
-
-                # --- RealTime event ---
-
-                if not buffered_ts:
-                    # First RealTime event (or first after gap recovery reset).
-                    buffered_ts = event_ts
-                    buffered_event = event
-                    initialized = True
-                    self._log.debug(
-                        f"Bar stream initialised for {bar_type}: ts={event_ts}"
-                    )
-                    continue
-
-                if event_ts != buffered_ts:
-                    # Timestamp changed → the buffered bar is now closed.
-                    if buffered_event:
-                        bars = self._parse_bars(
-                            [buffered_event], bar_type, instrument,
-                        )
-                        for bar in bars:
-                            self._handle_data(bar)
-                            self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
-                        self._log.debug(
-                            f"Bar emitted for {bar_type}: ts={buffered_ts}"
-                        )
-                    # Start buffering the new bar
-                    buffered_ts = event_ts
-                    buffered_event = event
-                else:
-                    # Same timestamp — update the buffer with latest OHLCV
-                    buffered_event = event
+                self._emit_gated(gate, event, bar_type, instrument)
 
         except asyncio.CancelledError:
             self._log.info(f"Bar SSE stream stopped for {bar_type}")
+
+    def _emit_gated(
+        self,
+        gate: BarCloseGate,
+        event: dict,
+        bar_type: BarType,
+        instrument: Instrument,
+    ) -> None:
+        """Feed one TradeStation bar event through ``gate`` and emit what it releases."""
+        ts_ns = bar_end_ns(event.get("TimeStamp", ""))
+        if ts_ns is None:
+            return
+        for raw in gate.on_event(event, ts_ns):
+            if raw.get("BarStatus") != "Closed":
+                self._log.info(
+                    f"[BAR-CLOSE-FALLBACK] {bar_type} ts={raw.get('TimeStamp')}: no Closed "
+                    f"event - emitted on the next bar's first update"
+                )
+            for bar in self._parse_bars([raw], bar_type, instrument):
+                self._handle_data(bar)
+                self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
+            self._log.debug(f"Bar emitted for {bar_type}: ts={raw.get('TimeStamp')}")
 
     async def _poll_bars(
         self,
@@ -439,12 +363,14 @@ class TradeStationDataClient(LiveMarketDataClient):
         instrument: Instrument,
         poll_secs: float,
     ) -> None:
-        """Background polling loop — fetches last completed bar every poll_secs seconds.
-
-        On first poll, initialises _last_bar_ts so subsequent polls only push new bars.
-        Recovers from transient API errors without stopping.
+        """Background polling loop: every ``poll_secs`` read the last two bars and emit each
+        bar once it is closed, through the same ``BarCloseGate`` as the stream. The first
+        poll only sets the watermark, so no stale bar is replayed on startup. Recovers from
+        transient API errors without stopping.
         """
         self._log.info(f"Bar polling loop started for {bar_type}")
+        gate = self._bar_gates.setdefault(bar_type, BarCloseGate())
+        gate.reset_connection()
         first_poll = True
 
         while True:
@@ -455,32 +381,13 @@ class TradeStationDataClient(LiveMarketDataClient):
                     symbol=symbol,
                     interval=interval,
                     unit=unit,
-                    barsback=1,
+                    barsback=2,
                 )
-
-                if not raw_bars:
-                    continue
-
-                latest_ts = raw_bars[-1].get("TimeStamp", "")
-
+                for raw in raw_bars or []:
+                    self._emit_gated(gate, raw, bar_type, instrument)
                 if first_poll:
-                    # Record the current bar timestamp so we only push bars that arrive *after*
-                    # subscription. This avoids replaying a stale bar immediately on startup.
-                    self._last_bar_ts[bar_type] = latest_ts
+                    gate.reset_connection()  # watermark set: closed bars are live from now
                     first_poll = False
-                    self._log.debug(
-                        f"Bar polling initialised for {bar_type}: last_ts={latest_ts}"
-                    )
-                    continue
-
-                last_seen = self._last_bar_ts.get(bar_type, "")
-
-                if latest_ts != last_seen:
-                    self._last_bar_ts[bar_type] = latest_ts
-                    bars = self._parse_bars(raw_bars, bar_type, instrument)
-                    for bar in bars:
-                        self._handle_data(bar)
-                    self._log.debug(f"New bar pushed for {bar_type}: ts={latest_ts}")
 
             except asyncio.CancelledError:
                 self._log.info(f"Bar polling loop stopped for {bar_type}")
@@ -852,6 +759,12 @@ class TradeStationDataClient(LiveMarketDataClient):
 
         if not bars:
             return
+
+        # The history holds only closed bars (historical client): the stream must not
+        # re-emit them (strategies LESSONS §207).
+        self._bar_gates.setdefault(bar_type, BarCloseGate()).seed_from_history(
+            bars[-1].ts_event
+        )
 
         self._handle_bars(
             bar_type,

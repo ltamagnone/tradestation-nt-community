@@ -191,6 +191,7 @@ class TradeStationStreamClient:
         interval: str,
         unit: str,
         session_template: str | None = None,
+        barsback: int = 1,
     ) -> AsyncIterator[dict]:
         """
         Stream real-time bar updates for a symbol.
@@ -206,21 +207,24 @@ class TradeStationStreamClient:
         session_template : str, optional
             TS session template. Use ``"USEQPreAndPost"`` for extended hours
             equity bars. Default ``None`` uses TS default (RTH only for equities).
+        barsback : int, default 1
+            Bars sent as the seed on every (re)connect.
 
         Yields
         ------
         dict
-            Bar event with keys: Open, High, Low, Close, TotalVolume,
-            TimeStamp, Status (``"Historical"`` or ``"RealTime"``).
+            Bar event with Open, High, Low, Close, TotalVolume, TimeStamp (bar END),
+            BarStatus (``Open``/``Closed``), IsRealtime (False for the connect seed of
+            ``barsback`` bars) and IsEndOfHistory.
 
         """
         url = f"{self._base_url}/marketdata/stream/barcharts/{symbol}"
-        params: dict[str, str] = {"interval": interval, "unit": unit, "barsback": "1"}
+        params: dict[str, str] = {
+            "interval": interval, "unit": unit, "barsback": str(barsback),
+        }
         if session_template:
             params["sessiontemplate"] = session_template
         async for event in self._stream(url, params=params):
-            # Pass all events through — including Historical seed bars.
-            # The caller (_stream_bars) uses them for reconnection gap recovery.
             yield event
 
     async def stream_orders(self, account_id: str) -> AsyncIterator[dict]:

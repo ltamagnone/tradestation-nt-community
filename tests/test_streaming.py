@@ -194,27 +194,24 @@ class TestStreamEventParsing:
         assert all("Symbol" in e for e in collected)
 
     @pytest.mark.asyncio
-    async def test_stream_bars_passes_all_events(self):
-        """stream_bars yields both Historical and RealTime events for caller to handle."""
+    async def test_stream_bars_passes_all_events_and_barsback(self):
+        """stream_bars yields seed and live events unchanged and sends barsback (§207)."""
         client = _make_client()
-
+        seen = {}
         raw = [
-            {"Status": "Historical", "Open": 3340.0, "Close": 3345.0},
-            {"Status": "RealTime", "Open": 3350.0, "Close": 3355.0},
+            {"TimeStamp": "2026-10-16T16:10:00Z", "BarStatus": "Open", "IsRealtime": False},
+            {"TimeStamp": "2026-10-16T16:10:00Z", "BarStatus": "Closed", "IsRealtime": True},
         ]
 
         async def fake_stream(url: str, params: dict | None = None):
+            seen["params"] = params
             for evt in raw:
                 yield evt
 
         client._stream = fake_stream  # type: ignore
-        collected = []
-        async for event in client.stream_bars("GCJ26", "1", "Minute"):
-            collected.append(event)
-
-        assert len(collected) == 2
-        assert collected[0]["Status"] == "Historical"
-        assert collected[1]["Status"] == "RealTime"
+        collected = [e async for e in client.stream_bars("GCJ26", "1", "Minute", barsback=10)]
+        assert collected == raw
+        assert seen["params"]["barsback"] == "10"
 
     @pytest.mark.asyncio
     async def test_stream_can_be_cancelled(self):
