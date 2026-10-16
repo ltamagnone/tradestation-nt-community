@@ -26,6 +26,7 @@ from tradestation_nt_community.data import TradeStationDataClient
 from tradestation_nt_community.factories import TradeStationLiveDataClientFactory
 from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
 from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
+from tradestation_nt_community.http.client import OrderGroupPartialException
 from tradestation_nt_community.http.client import OrderRejectedException
 from tradestation_nt_community.http.client import SymbolNotFoundException
 from tradestation_nt_community.http.client import TradeStationHttpClient
@@ -37,6 +38,7 @@ __all__ = [
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",
     "DuplicateOrderConfirmIdException",
+    "OrderGroupPartialException",
     "OrderRejectedException",
     "SymbolNotFoundException",
     "TradeStationDataClient",

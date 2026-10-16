@@ -65,6 +65,20 @@ class OrderRejectedException(Exception):
         self.ts_message = ts_message
 
 
+class OrderGroupPartialException(OrderRejectedException):
+    """
+    Raised when a group POST answers HTTP 200 but only some legs landed.
+
+    TradeStation's response legs carry only OrderID / Message / Error, so the request leg
+    each landed OrderID belongs to cannot be known: every id in ``landed_order_ids`` must
+    be cancelled and the whole group treated as rejected (strategies LESSONS §207).
+    """
+
+    def __init__(self, ts_message: str, landed_order_ids: list[str]) -> None:
+        super().__init__(ts_message)
+        self.landed_order_ids = landed_order_ids
+
+
 class SymbolNotFoundException(Exception):
     """
     Raised when TradeStation answers HTTP 200 for a symbol lookup but the body
@@ -589,6 +603,15 @@ class TradeStationHttpClient:
         )
         return response
 
+    @staticmethod
+    def _body_failures(body: Any) -> list[str]:
+        """Failure messages in an HTTP-200 order body: top-level Error, Orders[i].Error, Errors[]."""
+        if not isinstance(body, dict):
+            return []
+        entries = [body] + list(body.get("Orders") or []) + list(body.get("Errors") or [])
+        return [str(e.get("Message") or e.get("Error")) for e in entries
+                if isinstance(e, dict) and e.get("Error")]
+
     def _check_order_body_error(
         self,
         response_json: dict[str, Any],
@@ -605,7 +628,10 @@ class TradeStationHttpClient:
             msg : str — lowercased ``Message`` value (empty string if absent).
         """
         orders_in_response = response_json.get("Orders") or []
+        errors_in_response = response_json.get("Errors") or []
         first = (orders_in_response[0] if orders_in_response else {}) or {}
+        if not first.get("Error") and not first.get("OrderID") and errors_in_response:
+            first = errors_in_response[0] or {}
         err = first.get("Error") or ""
         msg = (first.get("Message") or "").lower()
         has_error = bool(err)
@@ -707,9 +733,8 @@ class TradeStationHttpClient:
             return await self._resolve_duplicates(account_id, [confirm_id], msg)
 
         # (c) Real rejection — raise so the caller sees it
-        orders_in_response = response_json.get("Orders") or []
-        first = (orders_in_response[0] if orders_in_response else {}) or {}
-        raw_msg = first.get("Message") or err
+        failures = self._body_failures(response_json)
+        raw_msg = failures[0] if failures else err
         _log.debug(f"Place order rejected by TS (body-level): {raw_msg}")
         raise OrderRejectedException(raw_msg)
 
@@ -762,7 +787,13 @@ class TradeStationHttpClient:
         if response.status_code not in (200, 201):
             _log.debug(f"Replace order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Replace order failed (HTTP {response.status_code}): {response.text[:200]}")
-        return response.json()
+        body = response.json()
+        failures = self._body_failures(body)
+        if failures:
+            # Observe-only (strategies LESSONS §207): no real error body was ever captured;
+            # promote to a raise once the soak shows what TradeStation sends.
+            _log.warning(f"[ORDER-BODY-ERROR] replace {order_id}: HTTP 200 with {failures}")
+        return body
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """
@@ -785,9 +816,15 @@ class TradeStationHttpClient:
             _log.debug(f"Cancel order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Cancel order failed (HTTP {response.status_code}): {response.text[:200]}")
         try:
-            return response.json()
+            body = response.json()
         except Exception:
             return {"OrderID": order_id, "Status": "Cancelled"}
+        failures = self._body_failures(body)
+        if failures:
+            # Observe-only (§207): a wrong raise here would emit cancel_rejected for an order
+            # the broker did cancel.
+            _log.warning(f"[ORDER-BODY-ERROR] cancel {order_id}: HTTP 200 with {failures}")
+        return body
 
     _ORDERS_PAGE_SIZE = 600  # the spec maximum
     _ORDERS_MAX_PAGES = 20   # loop guard (12,000 orders), not a business limit
@@ -951,16 +988,18 @@ class TradeStationHttpClient:
 
         response_json = response.json()
 
-        has_error, is_duplicate, err, msg = self._check_order_body_error(response_json)
+        _has_error, is_duplicate, _err, msg = self._check_order_body_error(response_json)
 
-        if not has_error:
+        landed = [o.get("OrderID") for o in response_json.get("Orders") or []
+                  if isinstance(o, dict) and o.get("OrderID") and not o.get("Error")]
+        failures = self._body_failures(response_json)
+
+        if not failures and len(landed) == len(stamped_orders):
             # (a) Normal success — return as-is
             return response_json
 
         if is_duplicate:
-            # (b) Dedup acknowledgement — resolve ALL legs from /orders so the
-            # caller sees every real OrderID, not just the first leg. Uses the
-            # first leg's AccountID since all legs in a group share one account.
+            # (b) Dedup acknowledgement — resolve ALL legs from /orders (Task 8 replaces this)
             account_id = stamped_orders[0].get("AccountID", "") if stamped_orders else ""
             if not account_id:
                 raise OrderRejectedException(
@@ -969,10 +1008,13 @@ class TradeStationHttpClient:
                 )
             return await self._resolve_duplicates(account_id, confirm_ids, msg)
 
-        # (c) Real rejection — raise so the caller sees it
-        orders_in_response = response_json.get("Orders") or []
-        first = (orders_in_response[0] if orders_in_response else {}) or {}
-        raw_msg = first.get("Message") or err
+        raw_msg = "; ".join(failures) or (
+            f"{len(landed)} of {len(stamped_orders)} legs acknowledged, no error given")
+        if landed:
+            # (c) Some legs landed: they cannot be mapped to request legs - caller cancels them
+            _log.debug(f"Place order group partially placed: {raw_msg}")
+            raise OrderGroupPartialException(raw_msg, landed)
+        # (d) Nothing landed — a real rejection
         _log.debug(f"Place order group rejected by TS (body-level): {raw_msg}")
         raise OrderRejectedException(raw_msg)
 

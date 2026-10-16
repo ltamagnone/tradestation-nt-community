@@ -12,6 +12,7 @@ import pandas as pd
 
 from tradestation_nt_community._attribution import order_attribution
 from tradestation_nt_community.common import order_status as _st
+from tradestation_nt_community.http.client import OrderGroupPartialException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
 from tradestation_nt_community.parsing.execution import convert_order_type
@@ -1694,12 +1695,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
             # Extract individual order IDs from response
             # TS returns: {"OrderGroupId": "...", "Orders": [{"OrderID": "...", ...}, ...]}
+            # The HTTP client raises OrderGroupPartialException unless every leg landed
             ts_orders = response.get("Orders", [])
-            if len(ts_orders) != len(orders):
-                self._log.warning(
-                    f"Group response has {len(ts_orders)} orders but submitted {len(orders)} — "
-                    "ID mapping may be incomplete"
-                )
 
             legs = []
             for i, (order, ts_order_resp) in enumerate(zip(orders, ts_orders)):
@@ -1725,22 +1722,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"[LATE-ACCEPT-CANCELLED] {late[0][1].client_order_id} accepted by "
                     f"TradeStation as #{late[0][2]} after NT closed it (group of {len(legs)} "
                     f"legs) - cancelling every leg at the broker; open legs rejected in NT")
-                for (i, o, t) in legs:
-                    try:
-                        await self._client.cancel_order(str(t))
-                    except Exception as e:  # noqa: BLE001
-                        self._log.error(
-                            f"[LATE-ACCEPT-CANCELLED] {o.client_order_id} cancel of #{t} "
-                            f"failed: {e} - cancel it manually (/orders cancel)")
-                    c = self._cache.order(o.client_order_id)
-                    if c is not None and not c.is_closed:
-                        self.generate_order_rejected(
-                            strategy_id=command.strategy_id,
-                            instrument_id=o.instrument_id,
-                            client_order_id=o.client_order_id,
-                            reason="late accept: group cancelled at the broker",
-                            ts_event=self._clock.timestamp_ns(),
-                        )
+                await TradeStationExecutionClient._cancel_group_legs_and_reject(
+                    self, command, [(o, t) for (_i, o, t) in legs], "LATE-ACCEPT-CANCELLED",
+                    "late accept: group cancelled at the broker")
                 return
 
             for i, order, ts_order_id in legs:
@@ -1763,6 +1747,15 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 await TradeStationExecutionClient._cancel_after_ack(
                     self, order.client_order_id, ts_order_id)
 
+        except OrderGroupPartialException as e:
+            self._log.error(
+                f"[GROUP-PARTIAL] {group_type} group for OrderList {command.order_list.id}: "
+                f"{len(e.landed_order_ids)}/{len(orders)} legs landed ({e.ts_message}) - "
+                f"cancelling the landed legs at the broker; every leg rejected in NT")
+            await TradeStationExecutionClient._cancel_group_legs_and_reject(
+                self, command,
+                [(None, t) for t in e.landed_order_ids] + [(o, None) for o in orders],
+                "GROUP-PARTIAL", f"group partially placed and cancelled: {e.ts_message}"[:200])
         except Exception as e:
             self._log.error(
                 f"Failed to submit {group_type} order group for "
@@ -1778,6 +1771,34 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     reason=str(e),
                     ts_event=self._clock.timestamp_ns(),
                 )
+
+    async def _cancel_group_legs_and_reject(self, command, pairs, tag: str, reason: str) -> None:
+        """Cancel each TS id at the broker and reject each still-open NT leg.
+
+        ``pairs`` is ``[(nt_order | None, ts_order_id | None), ...]``: a TS id with no NT
+        order is cancelled only (a partial group cannot map ids to legs); an NT order with
+        no TS id is rejected only.
+        """
+        for o, t in pairs:
+            if t:
+                try:
+                    await self._client.cancel_order(str(t))
+                except Exception as e:  # noqa: BLE001
+                    who = f"{o.client_order_id} " if o is not None else ""
+                    self._log.error(
+                        f"[{tag}] {who}cancel of #{t} failed: {e} - cancel it manually "
+                        f"(/orders cancel)")
+            if o is not None:
+                TradeStationExecutionClient._forget_cancel_after_ack(self, o.client_order_id)
+                c = self._cache.order(o.client_order_id)
+                if c is not None and not c.is_closed:
+                    self.generate_order_rejected(
+                        strategy_id=command.strategy_id,
+                        instrument_id=o.instrument_id,
+                        client_order_id=o.client_order_id,
+                        reason=reason,
+                        ts_event=self._clock.timestamp_ns(),
+                    )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         """Modify (replace) an existing order price via TradeStation PUT endpoint.
