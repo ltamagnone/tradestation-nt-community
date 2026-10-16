@@ -150,6 +150,14 @@ class TradeStationHistoricalClient:
             _log.warning(f"No historical bars received for {bar_type}")
             return []
 
-        bars = parse_bars(raw_bars, bar_type)
+        # TS returns the still-forming bar last (BarStatus "Open", TimeStamp = its future END):
+        # warm-up must not replay a partial bar - the stream emits it complete when it closes
+        # (strategies LESSONS §207).
+        closed = [b for b in raw_bars if b.get("BarStatus") != "Open"]
+        if len(closed) != len(raw_bars):
+            _log.debug(
+                f"Historical: dropped {len(raw_bars) - len(closed)} forming bar(s) for {bar_type}"
+            )
+        bars = parse_bars(closed, bar_type)
         _log.info(f"Historical: received {len(bars)} bars for {bar_type}")
         return bars

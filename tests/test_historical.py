@@ -161,3 +161,25 @@ class TestTradeStationHistoricalClient:
         bar_type = _make_bar_type(instrument, 1)
         bars = await client.get_bars(bar_type=bar_type, instrument=instrument)
         assert bars == []
+
+    @pytest.mark.asyncio
+    async def test_drops_the_still_forming_bar(self, instrument):
+        """TS returns the forming bar last (BarStatus Open, future end): never replay it (§207)."""
+        from unittest.mock import AsyncMock
+
+        def raw(ts, status):
+            return {"TimeStamp": ts, "Open": 1, "High": 1, "Low": 1, "Close": 1,
+                    "TotalVolume": 1, "BarStatus": status}
+
+        mock_client = MockTradeStationHttpClient()
+        mock_client.get_bars = AsyncMock(return_value=[
+            raw("2026-10-16T16:06:00Z", "Closed"),
+            raw("2026-10-16T16:07:00Z", "Closed"),
+            raw("2026-10-16T16:08:00Z", "Open"),
+        ])
+        client = TradeStationHistoricalClient(http_client=mock_client)
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert [b.ts_event for b in bars] == [
+            pd.Timestamp("2026-10-16T16:06:00Z").value,
+            pd.Timestamp("2026-10-16T16:07:00Z").value,
+        ]
