@@ -645,44 +645,16 @@ class TestPlaceOrderConfirmId:
         assert result == expected
 
     @pytest.mark.asyncio
-    async def test_place_order_duplicate_ack_resolves_via_get_orders(self, http_client):
-        """Dedup-ack: GET /orders lookup by confirm_id resolves to real OrderID."""
-        custom_id = "dedup-confirm-id-abcde"
-
-        dedup_body = _dedup_ack_body()
-        get_orders_response = _mock_resp(200, {
-            "Orders": [{"OrderID": "real-222", "OrderConfirmId": custom_id}]
-        })
-
-        post_resp = _mock_resp(200, dedup_body)
-        http_client._httpx.post = AsyncMock(return_value=post_resp)
-        http_client._httpx.get = AsyncMock(return_value=get_orders_response)
-
-        result = await http_client.place_order(
-            account_id="SIM001", symbol="GCJ26", quantity="1",
-            order_type="Market", trade_action="Buy",
-            order_confirm_id=custom_id,
-        )
-
-        assert "Orders" in result
-        assert result["Orders"][0]["OrderID"] == "real-222"
-        assert result["Orders"][0]["Message"].startswith("Dedup acknowledged")
-
-    @pytest.mark.asyncio
-    async def test_place_order_duplicate_ack_original_not_found_raises(self, http_client):
-        """Dedup-ack but GET /orders returns empty list → DuplicateOrderConfirmIdException."""
-        dedup_body = _dedup_ack_body()
-        post_resp = _mock_resp(200, dedup_body)
-        get_orders_resp = _mock_resp(200, {"Orders": []})
-
-        http_client._httpx.post = AsyncMock(return_value=post_resp)
-        http_client._httpx.get = AsyncMock(return_value=get_orders_resp)
-
-        with pytest.raises(DuplicateOrderConfirmIdException):
-            await http_client.place_order(
-                account_id="SIM001", symbol="GCJ26", quantity="1",
-                order_type="Market", trade_action="Buy",
-            )
+    async def test_place_order_duplicate_ack_raises_without_a_lookup(self, http_client):
+        """Broker orders never echo the confirm id: a duplicate ack is reported, not resolved."""
+        http_client._httpx.post = AsyncMock(return_value=_mock_resp(200, {"Orders": [{
+            "Error": "FAILED", "Message": "OrderConfirmID must be unique"}]}))
+        http_client._httpx.get = AsyncMock()
+        with pytest.raises(DuplicateOrderConfirmIdException) as ei:
+            await http_client.place_order("SIM1", "GCZ26", "1", "Market", "Buy",
+                                          order_confirm_id="cid-1")
+        assert ei.value.confirm_id == "cid-1"
+        http_client._httpx.get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_place_order_non_dedup_body_error_raises_OrderRejectedException(self, http_client):

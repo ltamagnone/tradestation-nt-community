@@ -24,23 +24,24 @@ _log = logging.getLogger(__name__)
 
 class DuplicateOrderConfirmIdException(Exception):
     """
-    Raised when TS acknowledges a duplicate OrderConfirmId but the original
-    order can no longer be found in the /orders listing (e.g. already filled
-    and aged out of the query window).
+    Raised when TradeStation reports an OrderConfirmID it has already seen.
+
+    This adapter never re-sends a confirm id (no 5xx retry), and broker orders do not echo
+    it, so the original cannot be looked up: the original order MAY be live at the broker.
+    Treat it as ambiguous - check /orders (strategies LESSONS §207).
 
     Attributes
     ----------
     confirm_id : str
-        The OrderConfirmId that was re-submitted.
+        The OrderConfirmID(s) that were re-submitted.
     message : str
         The body-level error message returned by TradeStation.
     """
 
     def __init__(self, message: str, confirm_id: str) -> None:
         super().__init__(
-            f"Duplicate OrderConfirmId '{confirm_id}' acknowledged by TS but "
-            f"original order not found in /orders listing. "
-            f"TS message: {message}"
+            f"Duplicate OrderConfirmId '{confirm_id}' reported by TradeStation - the original "
+            f"order may be live (it cannot be looked up). TS message: {message}"
         )
         self.confirm_id = confirm_id
         self.message = message
@@ -49,7 +50,7 @@ class DuplicateOrderConfirmIdException(Exception):
 class OrderRejectedException(Exception):
     """
     Raised when TradeStation returns HTTP 200 but the response body contains
-    a FAILED error that is NOT a duplicate-confirm dedup acknowledgement.
+    a FAILED error that is NOT a duplicate-confirm report.
 
     This covers real rejections: invalid symbol, insufficient margin,
     quantity limits, session restrictions, etc.
@@ -514,95 +515,6 @@ class TradeStationHttpClient:
             and ("orderconfirmid" in msg or "orderconfirm" in msg)
         )
 
-    _CONFIRM_ID_KEYS = ("OrderConfirmId", "OrderConfirmID", "orderConfirmId")
-
-    async def _resolve_duplicates(
-        self,
-        account_id: str,
-        confirm_ids: list[str],
-        ts_message: str,
-    ) -> dict[str, Any]:
-        """
-        Resolve one or more duplicate-acknowledged OrderConfirmIds to their
-        real OrderIDs via GET /orders.
-
-        Used by both ``place_order`` (single confirm_id, N=1) and
-        ``place_order_group`` (multiple legs, N>1). For groups, all legs must
-        be found or the whole response is treated as unrecoverable.
-
-        Parameters
-        ----------
-        account_id : str
-            Account to search.
-        confirm_ids : list[str]
-            One entry per leg; order matters (matched legs are returned in
-            the same order).
-        ts_message : str
-            The rejection message from TS (logged on lookup failure).
-
-        Return
-        -------
-        dict[str, Any]
-            Success-shaped response. For single: ``{"Orders": [...]}``. For
-            groups: ``{"OrderGroupId": ..., "Orders": [...]}`` — OrderGroupId
-            is sourced from the first matched order's ``OrderGroupId`` field
-            if present, otherwise omitted.
-
-        Raises
-        ------
-        DuplicateOrderConfirmIdException
-            If ANY leg's confirm_id is not found in /orders (partial recovery
-            is not safe — caller can't tell which legs landed and which didn't).
-        """
-        _log.info(
-            f"[DEDUP] {len(confirm_ids)} duplicate OrderConfirmId(s) acknowledged "
-            f"by TS — resolving via /orders"
-        )
-        orders = await self.get_orders(account_id)
-        # Build confirm_id → order index for O(1) lookup
-        by_confirm_id: dict[str, dict[str, Any]] = {}
-        for order in orders:
-            for key in self._CONFIRM_ID_KEYS:
-                cid = order.get(key)
-                if cid:
-                    by_confirm_id[cid] = order
-                    break
-
-        resolved: list[dict[str, Any]] = []
-        unresolved: list[str] = []
-        group_id: str | None = None
-        for cid in confirm_ids:
-            order = by_confirm_id.get(cid)
-            if order is None:
-                unresolved.append(cid)
-                continue
-            real_id = order.get("OrderID", order.get("Id", ""))
-            if group_id is None:
-                group_id = order.get("OrderGroupId") or order.get("OrderGroupID")
-            resolved.append({
-                "OrderID": real_id,
-                "Message": f"Dedup acknowledged: existing order {real_id}",
-            })
-
-        if unresolved:
-            _log.warning(
-                f"[DEDUP] {len(unresolved)}/{len(confirm_ids)} confirm_id(s) not "
-                f"found in /orders: {unresolved}. TS message: {ts_message}"
-            )
-            raise DuplicateOrderConfirmIdException(
-                message=ts_message,
-                confirm_id=", ".join(unresolved),
-            )
-
-        response: dict[str, Any] = {"Orders": resolved}
-        if group_id is not None:
-            response["OrderGroupId"] = group_id
-        _log.info(
-            f"[DEDUP] Resolved {len(resolved)} order(s)"
-            + (f" in group {group_id}" if group_id else "")
-        )
-        return response
-
     @staticmethod
     def _body_failures(body: Any) -> list[str]:
         """Failure messages in an HTTP-200 order body: top-level Error, Orders[i].Error, Errors[]."""
@@ -653,11 +565,11 @@ class TradeStationHttpClient:
         """
         Place an order with TradeStation.
 
-        An ``OrderConfirmId`` is automatically injected into every submission
-        to guarantee idempotency: if a transient 5xx causes ``_request()`` to
-        retry, TS will reject the duplicate with a body-level error that this
-        method detects and resolves to the real OrderID, so the caller always
-        receives exactly one order.
+        An ``OrderConfirmId`` (≤ 22 chars) is sent with every order. TradeStation
+        rejects a re-used id; this adapter never re-sends one (``_request`` retries
+        only HTTP 429, which TradeStation did not process), so a duplicate report
+        means the original may be live - see ``DuplicateOrderConfirmIdException``
+        (strategies LESSONS §207).
 
         Parameters
         ----------
@@ -684,18 +596,16 @@ class TradeStationHttpClient:
         Return
         -------
         dict[str, Any]
-            Order confirmation response. On a dedup acknowledgement the
-            response is synthesised from a /orders lookup and shaped like a
-            normal success (``{"Orders": [{"OrderID": ..., "Message": ...}]}``).
+            Order confirmation response
+            (``{"Orders": [{"OrderID": ..., "Message": ...}]}``).
 
         Raises
         ------
         OrderRejectedException
-            If TS returns HTTP 200 with a FAILED error that is not a dedup
-            acknowledgement (e.g. invalid symbol, insufficient margin).
+            If TS returns HTTP 200 with a FAILED error in ``Orders[]`` or ``Errors[]``
+            that is not a duplicate report (e.g. invalid symbol, insufficient margin).
         DuplicateOrderConfirmIdException
-            If TS acknowledges a duplicate but the original order can no
-            longer be found in the /orders listing.
+            If TS reports the confirm id as already used: the original may be live.
         Exception
             If TS returns a non-200/201 HTTP status.
         """
@@ -729,8 +639,8 @@ class TradeStationHttpClient:
             return response_json
 
         if is_duplicate:
-            # (b) Dedup acknowledgement — resolve real OrderID from /orders
-            return await self._resolve_duplicates(account_id, [confirm_id], msg)
+            # (b) TS saw this confirm id before; the original cannot be looked up (§207)
+            raise DuplicateOrderConfirmIdException(message=msg, confirm_id=confirm_id)
 
         # (c) Real rejection — raise so the caller sees it
         failures = self._body_failures(response_json)
@@ -931,8 +841,8 @@ class TradeStationHttpClient:
         ``POST /v3/orderexecution/ordergroups`` and link orders so that
         fills or cancellations on one leg affect the others.
 
-        An ``OrderConfirmId`` is injected into each leg to guarantee
-        idempotency across retries (same protocol as ``place_order``).
+        An ``OrderConfirmId`` is sent with each leg (same rules as ``place_order``:
+        never re-sent, so a duplicate report means the originals may be live).
 
         Parameters
         ----------
@@ -942,8 +852,7 @@ class TradeStationHttpClient:
             List of individual order dicts, each in the same format as
             ``place_order`` — i.e. with ``AccountID``, ``Symbol``,
             ``Quantity``, ``OrderType``, ``TradeAction``, ``TimeInForce``
-            (and optional ``LimitPrice`` / ``StopPrice``). Each leg must
-            contain ``AccountID`` so that dedup resolution can query /orders.
+            (and optional ``LimitPrice`` / ``StopPrice``).
         order_confirm_ids : list[str], optional
             Caller-supplied idempotency keys, one per leg (each ≤ 22 chars).
             If omitted (or shorter than ``orders``), missing entries are
@@ -953,18 +862,18 @@ class TradeStationHttpClient:
         -------
         dict[str, Any]
             Group order confirmation response containing ``OrderGroupId``
-            and a ``Orders`` list with individual ``OrderID`` values.
-            On a dedup acknowledgement the response is synthesised from a
-            /orders lookup for the first leg's ``AccountID``.
+            and a ``Orders`` list with individual ``OrderID`` values, one per leg.
 
         Raises
         ------
+        OrderGroupPartialException
+            If only some legs landed (the landed ids cannot be mapped to legs; the
+            caller must cancel every one of ``landed_order_ids``).
         OrderRejectedException
-            If TS returns HTTP 200 with a FAILED error that is not a dedup
-            acknowledgement.
+            If no leg landed and TS returned a FAILED error that is not a duplicate
+            report.
         DuplicateOrderConfirmIdException
-            If TS acknowledges a duplicate but the original order can no
-            longer be found in the /orders listing.
+            If TS reports the confirm ids as already used: the originals may be live.
         Exception
             If TS returns a non-200/201 HTTP status.
         """
@@ -999,14 +908,8 @@ class TradeStationHttpClient:
             return response_json
 
         if is_duplicate:
-            # (b) Dedup acknowledgement — resolve ALL legs from /orders (Task 8 replaces this)
-            account_id = stamped_orders[0].get("AccountID", "") if stamped_orders else ""
-            if not account_id:
-                raise OrderRejectedException(
-                    "Group dedup response received but legs carry no AccountID — "
-                    "cannot resolve via /orders. TS message: " + msg
-                )
-            return await self._resolve_duplicates(account_id, confirm_ids, msg)
+            # (b) TS saw these confirm ids before; the originals cannot be looked up (§207)
+            raise DuplicateOrderConfirmIdException(message=msg, confirm_id=", ".join(confirm_ids))
 
         raw_msg = "; ".join(failures) or (
             f"{len(landed)} of {len(stamped_orders)} legs acknowledged, no error given")

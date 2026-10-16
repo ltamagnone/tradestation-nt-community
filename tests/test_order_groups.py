@@ -13,7 +13,6 @@ import pytest
 
 from tradestation_nt_community.http.client import (
     DuplicateOrderConfirmIdException,
-    OrderRejectedException,
     TradeStationHttpClient,
 )
 from tradestation_nt_community.parsing.execution import (
@@ -344,60 +343,17 @@ class TestPlaceOrderGroupConfirmId:
         assert result == expected
 
     @pytest.mark.asyncio
-    async def test_place_order_group_duplicate_ack_resolves_all_legs(self, http_client_for_groups):
-        """Dedup-ack: all legs are found in GET /orders; OrderGroupId preserved."""
+    async def test_place_order_group_duplicate_ack_raises_without_a_lookup(
+        self, http_client_for_groups,
+    ):
+        """Broker orders never echo confirm ids: a group dedup ack is reported, not resolved."""
         cid_a, cid_b = "dedup-leg-a-cid-abcde", "dedup-leg-b-cid-abcde"
-
-        dedup_body = _dedup_ack_body()
-        get_orders_data = {
-            "Orders": [
-                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
-                {"OrderID": "real-B", "OrderConfirmId": cid_b, "OrderGroupId": "G-9"},
-            ]
-        }
-
-        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
-        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
-
-        result = await http_client_for_groups.place_order_group(
-            "OCO", _two_leg_orders(),
-            order_confirm_ids=[cid_a, cid_b],
-        )
-
-        assert result["OrderGroupId"] == "G-9"
-        assert len(result["Orders"]) == 2
-        order_ids = {o["OrderID"] for o in result["Orders"]}
-        assert order_ids == {"real-A", "real-B"}
-
-    @pytest.mark.asyncio
-    async def test_place_order_group_duplicate_ack_partial_resolution_raises(self, http_client_for_groups):
-        """Dedup-ack with only 1 of 2 legs found → DuplicateOrderConfirmIdException."""
-        cid_a, cid_b = "found-cid-a-abcdefghij", "missing-cid-b-abcdefgh"
-
-        dedup_body = _dedup_ack_body()
-        # GET /orders returns only leg A
-        get_orders_data = {
-            "Orders": [
-                {"OrderID": "real-A", "OrderConfirmId": cid_a, "OrderGroupId": "G-9"},
-            ]
-        }
-
-        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
-        http_client_for_groups._httpx.get = AsyncMock(return_value=_mock_resp(200, get_orders_data))
-
-        with pytest.raises(DuplicateOrderConfirmIdException):
+        http_client_for_groups._httpx.post = AsyncMock(
+            return_value=_mock_resp(200, _dedup_ack_body()))
+        http_client_for_groups._httpx.get = AsyncMock()
+        with pytest.raises(DuplicateOrderConfirmIdException) as ei:
             await http_client_for_groups.place_order_group(
-                "OCO", _two_leg_orders(),
-                order_confirm_ids=[cid_a, cid_b],
-            )
+                "OCO", _two_leg_orders(), order_confirm_ids=[cid_a, cid_b])
+        assert ei.value.confirm_id == f"{cid_a}, {cid_b}"
+        http_client_for_groups._httpx.get.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_place_order_group_legs_missing_account_id_raises_OrderRejectedException(self, http_client_for_groups):
-        """Legs without AccountID on a dedup-ack → OrderRejectedException (not KeyError)."""
-        dedup_body = _dedup_ack_body()
-        http_client_for_groups._httpx.post = AsyncMock(return_value=_mock_resp(200, dedup_body))
-
-        with pytest.raises(OrderRejectedException):
-            await http_client_for_groups.place_order_group(
-                "OCO", _two_leg_orders(with_account_id=False),
-            )

@@ -8,10 +8,12 @@ import time
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pandas as pd
 
 from tradestation_nt_community._attribution import order_attribution
 from tradestation_nt_community.common import order_status as _st
+from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
 from tradestation_nt_community.http.client import OrderGroupPartialException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
@@ -82,6 +84,18 @@ from nautilus_trader.model.orders import StopMarketOrder
 _ALIVE_TOLERANCE_S = 60.0
 _ALIVE_STAMP_EVERY_S = 60.0
 _ORDER_MAP_META = "_meta"
+
+# Failures after which the POST may have reached TradeStation: the request was written and
+# the answer lost. Connect/pool failures mean it was never sent (strategies LESSONS §207).
+_AMBIGUOUS_SUBMIT_ERRORS = (
+    httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError, httpx.ReadError,
+    DuplicateOrderConfirmIdException,
+)
+
+
+def _is_ambiguous_submit(e: BaseException) -> bool:
+    """True when a failed submit may still have placed the order at TradeStation."""
+    return isinstance(e, _AMBIGUOUS_SUBMIT_ERRORS)
 
 
 def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
@@ -1629,6 +1643,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         except Exception as e:
             TradeStationExecutionClient._forget_cancel_after_ack(self, order.client_order_id)
+            if _is_ambiguous_submit(e):
+                self._log.error(
+                    f"[SUBMIT-AMBIGUOUS] {order.client_order_id} {order.instrument_id} "
+                    f"{order.side.name} {order.quantity}: {type(e).__name__} after the request "
+                    f"was sent - the order may be live at TradeStation; rejected in NT "
+                    f"(check /orders)")
             self._log.error(f"Failed to submit order {order.client_order_id}: {e}")
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
@@ -1757,6 +1777,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 [(None, t) for t in e.landed_order_ids] + [(o, None) for o in orders],
                 "GROUP-PARTIAL", f"group partially placed and cancelled: {e.ts_message}"[:200])
         except Exception as e:
+            if _is_ambiguous_submit(e):
+                self._log.error(
+                    f"[SUBMIT-AMBIGUOUS] {group_type} group OrderList {command.order_list.id} "
+                    f"({len(orders)} legs): {type(e).__name__} after the request was sent - "
+                    f"legs may be live at TradeStation; rejected in NT (check /orders)")
             self._log.error(
                 f"Failed to submit {group_type} order group for "
                 f"OrderList {command.order_list.id}: {e}"
