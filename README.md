@@ -157,10 +157,13 @@ pytest tests/ -q
 
 ## Order Idempotency
 
-`place_order()` and `place_order_group()` automatically inject an `OrderConfirmId` (max
-22 chars) into every POST. TradeStation uses this field to deduplicate — if the same
-confirm ID is received twice, the broker rejects the second submission without creating a
-duplicate order. This protects against duplicate fills on 5xx retries.
+`place_order()` and `place_order_group()` send an `OrderConfirmID` (spec spelling; max 22
+chars) with every order. TradeStation rejects a re-used id: verified on the sim account
+(2026-10-16), where the second submit with the same id was rejected with
+"OrderConfirmID must be unique". The adapter never re-sends an order itself (`_request`
+retries only HTTP 429, which TradeStation did not process), and broker orders do not echo
+the id, so a duplicate report cannot be resolved to the original order: it raises
+`DuplicateOrderConfirmIdException` ("the original may be live").
 
 You can supply your own ID via the optional kwarg:
 ```python
@@ -168,14 +171,26 @@ await client.place_order(..., order_confirm_id="my-unique-id-22chars")
 ```
 If omitted, the adapter auto-generates a valid ID.
 
-**HTTP 200 does not mean success.** TradeStation returns 200 for rejected orders; the
-rejection is in the body (`Orders[0]["Error"] == "FAILED"`). The adapter raises:
-- `OrderRejectedException` — business rejection (insufficient margin, invalid symbol, etc.)
-- `DuplicateOrderConfirmIdException` — dedup-ack received but original order unfindable
+A submit whose answer is lost after the POST was sent (read timeout, dropped connection)
+may have placed the order: the execution client logs `[SUBMIT-AMBIGUOUS]` and still rejects
+it in NautilusTrader - check the broker's order list.
 
-Both exceptions are exported from the top-level package:
+**HTTP 200 does not mean success.** TradeStation returns 200 for rejected orders; the
+rejection is in the body (`Orders[i].Error` or top-level `Errors[]`). The adapter raises:
+- `OrderRejectedException` — business rejection (insufficient margin, invalid symbol, etc.)
+- `OrderGroupPartialException` — a group where only some legs landed; the landed ids cannot
+  be mapped to legs, so the execution client cancels them all (`[GROUP-PARTIAL]`)
+- `DuplicateOrderConfirmIdException` — TradeStation saw the confirm id before; the original
+  may be live
+
+A replace/cancel answered HTTP 200 with an `Error` is logged as `[ORDER-BODY-ERROR]`
+(observe-only for now).
+
+All three exceptions are exported from the top-level package:
 ```python
-from tradestation_nt_community import OrderRejectedException, DuplicateOrderConfirmIdException
+from tradestation_nt_community import (
+    DuplicateOrderConfirmIdException, OrderGroupPartialException, OrderRejectedException,
+)
 ```
 
 ## Known Constraints

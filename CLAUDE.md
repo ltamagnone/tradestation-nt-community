@@ -72,6 +72,7 @@ Execution follows the same pattern through `TradeStationExecutionClient` -> HTTP
 The data client supports two modes configured via `use_streaming`:
 - **HTTP polling (default):** Periodic REST requests at intervals (60s for MINUTE bars, 300s for HOUR/DAY, 1s for quotes)
 - **SSE streaming (recommended):** Real-time delivery via Server-Sent Events; quote and trade tick subscriptions share a single SSE connection per instrument
+- **Bars (both modes, strategies LESSONS §207):** emitted when TradeStation marks them `BarStatus` Closed (~0.1 s after the boundary), through one `BarCloseGate` per bar type (`bar_gate.py`). Its watermark (newest bar end delivered) is seeded from warm-up history and survives reconnects, so seeds and repeats are dropped; every (re)connect asks for `_STREAM_BARSBACK` (10) bars so bars that closed during a gap are replayed. Bar history drops the still-forming bar (`BarStatus` Open). A bar released without a Closed event logs `[BAR-CLOSE-FALLBACK]`. Keep the DEBUG line `Bar emitted for {bar_type}: ts=...` unchanged: `scripts/diagnostics/bar_stream_latency_report.py` (strategies repo) parses it.
 
 ### Order groups
 
@@ -85,13 +86,21 @@ Tests use a `MockTradeStationHttpClient` (in `tests/mock_http_client.py`) that r
 
 Core dependencies for the adapter: `nautilus_trader >= 1.200`, `httpx >= 0.27`, `pandas`.
 
-> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **352 passed**. Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
+> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **707 passed, 2 skipped** (2026-10-16). Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
 
 ## Observability (June 2026)
 
-Two structured, greppable log lines aid post-incident reconstruction (both additive, no behavior change):
+Structured, greppable log lines aid post-incident reconstruction:
 - **`[ORDER-SUBMIT]`** — emitted by `execution._submit_order` for every order we submit, carrying the order attribution (`client_order_id`, `strategy_id`, `instrument_id`, side, type, `tags`, `ts_order_id`) from `_attribution.order_attribution`. TradeStation has no round-tripping tag field, so attribution is kept on our side.
 - **`[RECON-SHADOW]`** (observe-only) — emitted by `generate_order_status_reports` for any broker order absent from `_ts_order_id_to_client_order_id` **and** the NT cache: the "adopted/external order" gap where `_check_order_statuses` (the §95 safety poll) double-skips, so a dropped fill is invisible. This **measures** the gap (it does not fix it — no map registration, no behavior change); a later phase uses the soak data to close it.
+- **TradeStation API spec alignment (strategies LESSONS §207, 2026-10-16):**
+  - `[BAR-CLOSE-FALLBACK]` (INFO) — a bar emitted on the next bar's first update because no `BarStatus` Closed came for it.
+  - `[STREAM-GOAWAY]` (WARNING) — the server announced shutdown (`{"Error":"GoAway"}` market data, `{"StreamStatus":"GoAway"}` brokerage); reconnect at once, or after the max delay if the connection was < 30 s old.
+  - `[STREAM-ERROR]` (ERROR) — an in-band stream error (`BadRequest`, `DualLogon`, `Forbidden`, `Failed`...); the next reconnect waits the max delay so two logons cannot loop. `[STREAM-STATUS]` logs `EndSnapshot` (DEBUG) and other statuses. A quote's own per-symbol `Error` (it carries `Symbol`) is data, never control.
+  - `[ORDERS-PAGE-CAP]` (ERROR) — `/orders` still paging after 20 pages of 600; the list is truncated. `get_orders` always pages (`pageSize`/`nextToken`); single-order reads use `get_orders_by_id` (`GET /orders/{ids}`, HTTP 404 = none found).
+  - `[GROUP-PARTIAL]` (ERROR) — a group POST where only some legs landed: the landed ids are cancelled at the broker and every leg is rejected in NT (no strategy submits brackets as of 2026-10-16).
+  - `[SUBMIT-AMBIGUOUS]` (ERROR, observe-only) — a submit failed after the POST was sent (read timeout, dropped connection, duplicate-confirm report): the order may be live; it is still rejected in NT.
+  - `[ORDER-BODY-ERROR]` (WARNING, observe-only) — a replace/cancel answered HTTP 200 with an `Error`; promote to a raise once the soak shows real bodies.
 
 ## Known Constraints
 
