@@ -642,3 +642,24 @@ def test_parse_order_status_follows_categories():
     assert parse_order_status("REJ") == OrderStatus.REJECTED
     assert parse_order_status("FLL") == OrderStatus.FILLED
     assert parse_order_status("XYZ") == OrderStatus.ACCEPTED   # unknown: assume live
+
+
+class TestPriceIncrementSchedule:
+    """IncrementStyle Schedule: finest increment at the precision every row needs (§207)."""
+
+    def test_simple_style_unchanged(self):
+        from tradestation_nt_community.parsing.instruments import _price_increment
+        assert str(_price_increment({"IncrementStyle": "Simple", "Increment": "0.25"})) == "0.25"
+        assert str(_price_increment({})) == "0.01"
+
+    def test_schedule_uses_the_finest_row_at_the_widest_precision(self):
+        from tradestation_nt_community.parsing.instruments import _price_increment
+        pf = {"IncrementStyle": "Schedule", "IncrementSchedule": [
+            {"Increment": "0.05", "StartsAt": "0"}, {"Increment": "0.1", "StartsAt": "3"},
+            {"Increment": "0.25", "StartsAt": "100"}]}
+        inc = _price_increment(pf)
+        assert str(inc) == "0.05" and inc.precision == 2
+
+    def test_schedule_without_rows_falls_back_to_increment(self):
+        from tradestation_nt_community.parsing.instruments import _price_increment
+        assert str(_price_increment({"IncrementStyle": "Schedule", "Increment": "0.5"})) == "0.5"

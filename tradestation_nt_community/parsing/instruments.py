@@ -2,6 +2,7 @@
 Parsing functions for TradeStation instrument definitions.
 """
 import logging
+from decimal import Decimal
 
 import pandas as pd
 
@@ -12,6 +13,28 @@ from nautilus_trader.model.objects import Currency, Price, Quantity
 
 
 _log = logging.getLogger(__name__)
+
+
+def _price_increment(price_format: dict) -> Price:
+    """Tick size from a TradeStation ``PriceFormat``.
+
+    ``IncrementStyle: Schedule`` gives a table of increments by price level (spec
+    ``IncrementSchedule``); NautilusTrader holds one increment, so the finest row is used, at
+    the widest precision any row needs - every valid price is representable (strategies
+    LESSONS §207). Prices between levels may still be rejected by TradeStation.
+    """
+    if price_format.get("IncrementStyle") == "Schedule":
+        rows = [r.get("Increment") for r in price_format.get("IncrementSchedule") or []
+                if r.get("Increment")]
+        if rows:
+            precision = max(max(-Decimal(r).as_tuple().exponent, 0) for r in rows)
+            finest = min(rows, key=Decimal)
+            _log.warning(
+                f"PriceFormat IncrementStyle=Schedule {rows}: using the finest increment "
+                f"{finest} at precision {precision}"
+            )
+            return Price.from_str(f"{Decimal(finest):.{precision}f}")
+    return Price.from_str(price_format.get("Increment", "0.01"))
 
 
 def parse_instrument(
@@ -42,7 +65,7 @@ def parse_instrument(
         price_format = data.get("PriceFormat", {})
         qty_format = data.get("QuantityFormat", {})
 
-        price_increment = Price.from_str(price_format.get("Increment", "0.01"))
+        price_increment = _price_increment(price_format)
         # price_precision must match price_increment.precision (NautilusTrader enforces this)
         price_precision = price_increment.precision
         lot_size = Quantity.from_str(qty_format.get("MinimumTradeQuantity", "1"))
