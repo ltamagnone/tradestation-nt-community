@@ -81,8 +81,11 @@ def _stub(cache, orders=None, fail=False, requested=False):
     s._cancel_requested_coids = {coid: None} if requested else {}
     if fail:
         s._client.get_orders = AsyncMock(side_effect=RuntimeError("HTTP 500"))
+        s._client.get_orders_by_id = AsyncMock(side_effect=RuntimeError("HTTP 500"))
     else:
         s._client.get_orders = AsyncMock(return_value=orders or [])
+        s._client.get_orders_by_id = AsyncMock(
+            side_effect=lambda acct, ids: [o for o in orders or [] if o.get("OrderID") in ids])
     from tradestation_nt_community.parsing.execution import parse_order_status_report
     now = CLOSED_NS + 10**9
     s._parse_order_status_report = lambda o, i, c: parse_order_status_report(o, i, c, ACCT, now)
@@ -125,6 +128,14 @@ def test_broker_read_failure_returns_none():
 def test_order_missing_from_broker_list_returns_none():
     loop, _, cache, _ = _engine("submitted")
     assert _query(loop, _stub(cache, [{"OrderID": "other", "Status": "OPN"}])) is None
+
+
+def test_inflight_reads_the_one_order_by_id_not_the_full_list():
+    loop, _, cache, _ = _engine("submitted")
+    s = _stub(cache, [ts_order("OPN")])
+    assert _query(loop, s).order_status == OrderStatus.ACCEPTED
+    s._client.get_orders_by_id.assert_awaited_once_with("SIM0000001F", [TS_ID])
+    s._client.get_orders.assert_not_awaited()
 
 
 def test_rej_is_rejected():

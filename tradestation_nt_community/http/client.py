@@ -789,6 +789,10 @@ class TradeStationHttpClient:
         except Exception:
             return {"OrderID": order_id, "Status": "Cancelled"}
 
+    _ORDERS_PAGE_SIZE = 600  # the spec maximum
+    _ORDERS_MAX_PAGES = 20   # loop guard (12,000 orders), not a business limit
+    _ORDERS_BY_ID_CHUNK = 50  # the spec maximum ids per GET /orders/{orderIds}
+
     async def get_orders(
         self,
         account_keys: str,
@@ -796,46 +800,86 @@ class TradeStationHttpClient:
         status: str | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Get today's and open orders for account(s) (``GET /orders``).
+        Get today's and open orders for account(s) (``GET /orders``), every page.
 
-        Window semantics (Q3 probe, sim account, 2026-10-12): ``/orders`` returns
-        the current/last trading-day window plus every open order and is
-        **disjoint from** ``/historicalorders``. It **ignores ``since``** (same
-        orders for any date, with or without it) and was never seen to page
-        (no ``NextToken``). Older closed orders are NOT reachable here: use
-        ``GET /historicalorders`` (``since`` is REQUIRED, HTTP 400 without it;
-        it excludes the current day; pages at 600 orders via ``NextToken``).
+        Window semantics (Q3 probe, sim account, 2026-10-12): ``/orders`` returns the
+        current/last trading-day window plus every open order and is **disjoint from**
+        ``/historicalorders`` (``since`` REQUIRED there; it excludes the current day).
+        Without ``pageSize`` TradeStation returns at most 600 orders, so this always pages
+        (``pageSize`` 600, ``nextToken``; probed 2026-10-16) - strategies LESSONS §207.
 
         Parameters
         ----------
         account_keys : str
             Account key(s) — single or comma-separated.
         since : str, optional
-            Accepted for compatibility but **ignored by TradeStation on
-            ``/orders``** — do not rely on it to reach older orders.
+            Accepted for compatibility and **never sent** - not a ``/orders`` parameter
+            (TradeStation ignored it). Use ``/historicalorders`` for older orders.
         status : str, optional
-            Filter by order status. Use ``'Open'`` to retrieve only working
-            orders (ACK/OPN/DON) without the day's closed orders cluttering
-            the response. Case-sensitive — 'Open' not 'OPN'.
+            Filter by order status: ``Open``, ``Filled``, ``Canceled``, ``Rejected``
+            (comma-separated allowed). Case-sensitive.
 
         Return
         -------
         list[dict[str, Any]]
-            List of order dictionaries.
+            Order dictionaries from every page.
 
         """
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/orders"
-        params: dict[str, str] = {}
-        if since:
-            params["since"] = since
+        params: dict[str, str] = {"pageSize": str(self._ORDERS_PAGE_SIZE)}
         if status:
             params["status"] = status
-        response = await self._request("GET", url, params=params)
-        if response.status_code != 200:
-            _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"Get orders failed: HTTP {response.status_code}")
-        data = response.json()
-        return data.get("Orders", []) if isinstance(data, dict) else data
+        orders: list[dict[str, Any]] = []
+        for _page in range(self._ORDERS_MAX_PAGES):
+            response = await self._request("GET", url, params=params)
+            if response.status_code != 200:
+                _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")
+                raise Exception(f"Get orders failed: HTTP {response.status_code}")
+            data = response.json()
+            if not isinstance(data, dict):
+                return orders + list(data)
+            orders.extend(data.get("Orders") or [])
+            if data.get("Errors"):
+                _log.warning(f"Get orders: TradeStation reported errors: {data['Errors'][:3]}")
+            token = data.get("NextToken")
+            if not token:
+                return orders
+            params = {**params, "nextToken": token}
+        _log.error(
+            f"[ORDERS-PAGE-CAP] /orders still paging after {self._ORDERS_MAX_PAGES} pages "
+            f"({len(orders)} orders) - the list is truncated"
+        )
+        return orders
+
+    async def get_orders_by_id(
+        self, account_keys: str, order_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """
+        Get specific orders (``GET /orders/{orderIds}``, at most 50 ids per request).
+
+        Only the orders found are returned. TradeStation lists unknown ids in ``Errors``
+        (``NotFound``) and answers **HTTP 404 when none of the ids is found** (probed
+        2026-10-16) - both mean "not found", never a failure.
+        """
+        ids = [str(i) for i in order_ids if i]
+        out: list[dict[str, Any]] = []
+        for k in range(0, len(ids), self._ORDERS_BY_ID_CHUNK):
+            chunk = ",".join(ids[k:k + self._ORDERS_BY_ID_CHUNK])
+            url = f"{self.base_url}/brokerage/accounts/{account_keys}/orders/{chunk}"
+            response = await self._request("GET", url)
+            if response.status_code == 404:
+                continue
+            if response.status_code != 200:
+                _log.debug(
+                    f"Get orders by id failed (HTTP {response.status_code}): {response.text[:500]}"
+                )
+                raise Exception(f"Get orders by id failed: HTTP {response.status_code}")
+            data = response.json()
+            out.extend(data.get("Orders") or [])
+            other = [e for e in data.get("Errors") or [] if e.get("Error") != "NotFound"]
+            if other:
+                _log.warning(f"Get orders by id: TradeStation reported errors: {other[:3]}")
+        return out
 
     async def place_order_group(
         self,

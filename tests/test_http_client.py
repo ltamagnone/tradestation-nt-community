@@ -807,3 +807,65 @@ class TestCachedHttpClientFactory:
             "run_paper_trading.py and factories.py must share the same HTTP client "
             "so that _token_keepalive_loop refreshes the token used by HEAL/RECON/SWEEP"
         )
+
+
+class TestGetOrdersPaging:
+    """GET /orders pages via pageSize/NextToken; without it TS caps at 600 (§207)."""
+
+    @pytest.mark.asyncio
+    async def test_follows_next_token_until_the_last_page(self, http_client):
+        http_client._httpx.get = AsyncMock(side_effect=[
+            _mock_resp(200, {"Orders": [{"OrderID": "1"}, {"OrderID": "2"}], "Errors": [],
+                             "NextToken": "t1"}),
+            _mock_resp(200, {"Orders": [{"OrderID": "3"}], "Errors": []}),
+        ])
+        orders = await http_client.get_orders("SIM1", status="Open")
+        assert [o["OrderID"] for o in orders] == ["1", "2", "3"]
+        first, second = (c.kwargs["params"] for c in http_client._httpx.get.call_args_list)
+        assert first == {"pageSize": "600", "status": "Open"}
+        assert second == {"pageSize": "600", "status": "Open", "nextToken": "t1"}
+
+    @pytest.mark.asyncio
+    async def test_since_is_accepted_but_not_sent(self, http_client):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(200, {"Orders": []}))
+        await http_client.get_orders("SIM1", since="2026-10-01")
+        assert "since" not in http_client._httpx.get.call_args.kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_page_cap_logs_and_returns_what_it_has(self, http_client, caplog):
+        http_client._httpx.get = AsyncMock(side_effect=lambda *a, **k: _mock_resp(
+            200, {"Orders": [{"OrderID": "x"}], "NextToken": "again"}))
+        orders = await http_client.get_orders("SIM1")
+        assert len(orders) == TradeStationHttpClient._ORDERS_MAX_PAGES
+        assert "[ORDERS-PAGE-CAP]" in caplog.text
+
+
+class TestGetOrdersById:
+    """GET /orders/{ids}: found orders only; 404 = none found (probed 2026-10-16)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_found_orders_and_skips_not_found(self, http_client):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(200, {
+            "Orders": [{"OrderID": "1"}],
+            "Errors": [{"OrderID": "9", "Error": "NotFound", "Message": "Order ID not found."}]}))
+        assert await http_client.get_orders_by_id("SIM1", ["1", "9"]) == [{"OrderID": "1"}]
+        assert http_client._httpx.get.call_args.args[0].endswith(
+            "/brokerage/accounts/SIM1/orders/1,9")
+
+    @pytest.mark.asyncio
+    async def test_http_404_means_none_found(self, http_client):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(404, {
+            "Error": "NotFound", "Message": "No orders were found for the specified Order IDs."}))
+        assert await http_client.get_orders_by_id("SIM1", ["9"]) == []
+
+    @pytest.mark.asyncio
+    async def test_chunks_of_50_ids(self, http_client):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(200, {"Orders": []}))
+        await http_client.get_orders_by_id("SIM1", [str(i) for i in range(120)])
+        assert http_client._httpx.get.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_other_http_errors_raise(self, http_client):
+        http_client._httpx.get = AsyncMock(return_value=_mock_resp(500, {}))
+        with pytest.raises(Exception, match="HTTP 500"):
+            await http_client.get_orders_by_id("SIM1", ["1"])

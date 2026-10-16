@@ -1045,9 +1045,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         # Fetch order from TradeStation
         try:
-            orders = await self._client.get_orders(
-                account_keys=self._account_id,
-            )
+            orders = await self._client.get_orders_by_id(self._account_id, [ts_order_id])
 
             # Find matching order
             ts_order = None
@@ -1084,7 +1082,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         if not ts_order_id:
             return None
         try:
-            orders = await self._client.get_orders(account_keys=self._account_id)
+            orders = await self._client.get_orders_by_id(self._account_id, [ts_order_id])
         except Exception as e:
             self._log.error(
                 f"[INFLIGHT-QUERY] broker read failed for {client_order_id} "

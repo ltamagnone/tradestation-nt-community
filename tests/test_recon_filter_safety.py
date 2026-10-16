@@ -149,6 +149,8 @@ def _own_order_engine(loop):
 def _adapter_stub(cache, ts_orders):
     stub = MagicMock()
     stub._client.get_orders = AsyncMock(return_value=ts_orders)
+    stub._client.get_orders_by_id = AsyncMock(
+        side_effect=lambda acct, ids: [o for o in ts_orders if o.get("OrderID") in ids])
     stub._account_id = "SIM0000001F"
     stub._account_id_nautilus = ACCT
     stub._clock.timestamp_ns = lambda: 1
