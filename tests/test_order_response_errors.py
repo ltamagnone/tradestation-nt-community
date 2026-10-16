@@ -93,12 +93,7 @@ SPEC_DELETE_OK = {"Message": "Cancel request sent", "OrderID": "123456789"}
 async def test_spec_success_bodies_pass_silently(http_client, caplog):  # noqa: F811
     http_client._httpx.put = AsyncMock(return_value=_mock_resp(200, SPEC_PUT_OK))
     http_client._httpx.delete = AsyncMock(return_value=_mock_resp(200, SPEC_DELETE_OK))
-    assert (
-        await http_client.replace_order(
-            "77", "SIM1", "GCZ26", "1", "StopMarket", "Sell", stop_price="1"
-        )
-        == SPEC_PUT_OK
-    )
+    assert await http_client.replace_order("77", "1", "StopMarket", stop_price="1") == SPEC_PUT_OK
     assert await http_client.cancel_order("77") == SPEC_DELETE_OK
     assert "[ORDER-BODY-ERROR]" not in caplog.text
 
@@ -106,12 +101,7 @@ async def test_spec_success_bodies_pass_silently(http_client, caplog):  # noqa: 
 async def test_replace_body_error_is_logged_not_raised(http_client, caplog):  # noqa: F811
     body = {"Error": "FAILED", "Message": "Invalid stop price"}
     http_client._httpx.put = AsyncMock(return_value=_mock_resp(200, body))
-    assert (
-        await http_client.replace_order(
-            "77", "SIM1", "GCZ26", "1", "StopMarket", "Sell", stop_price="1"
-        )
-        == body
-    )
+    assert await http_client.replace_order("77", "1", "StopMarket", stop_price="1") == body
     assert "[ORDER-BODY-ERROR]" in caplog.text and "Invalid stop price" in caplog.text
 
 
@@ -132,3 +122,12 @@ async def test_group_partial_cancels_landed_legs_and_rejects_every_leg():
     assert stub.generate_order_rejected.call_count == 2
     stub.generate_order_accepted.assert_not_called()
     assert any("[GROUP-PARTIAL]" in str(c.args[0]) for c in stub._log.error.call_args_list)
+
+
+async def test_replace_sends_only_spec_fields(http_client):  # noqa: F811
+    http_client._httpx.put = AsyncMock(return_value=_mock_resp(200, {"OrderID": "77"}))
+    await http_client.replace_order("77", "1", "StopMarket", stop_price="2000.5")
+    assert http_client._httpx.put.call_args.kwargs["json"] == {
+        "Quantity": "1",
+        "StopPrice": "2000.5",
+    }

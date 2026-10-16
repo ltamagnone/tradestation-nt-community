@@ -565,7 +565,7 @@ class TradeStationHttpClient:
         """
         Place an order with TradeStation.
 
-        An ``OrderConfirmId`` (≤ 22 chars) is sent with every order. TradeStation
+        An ``OrderConfirmID`` (≤ 22 chars) is sent with every order. TradeStation
         rejects a re-used id; this adapter never re-sends one (``_request`` retries
         only HTTP 429, which TradeStation did not process), so a duplicate report
         means the original may be live - see ``DuplicateOrderConfirmIdException``
@@ -619,7 +619,7 @@ class TradeStationHttpClient:
             "OrderType": order_type,
             "TradeAction": trade_action,
             "TimeInForce": {"Duration": time_in_force},
-            "OrderConfirmId": confirm_id,
+            "OrderConfirmID": confirm_id,
         }
         if order_type in ("Limit", "StopLimit") and limit_price:
             order_data["LimitPrice"] = limit_price
@@ -651,48 +651,24 @@ class TradeStationHttpClient:
     async def replace_order(
         self,
         order_id: str,
-        account_id: str,
-        symbol: str,
         quantity: str,
         order_type: str,
-        trade_action: str,
-        time_in_force: str = "DAY",
         limit_price: str | None = None,
         stop_price: str | None = None,
     ) -> dict[str, Any]:
         """
-        Replace (modify) an existing open order.
+        Replace (modify) an existing open order (``PUT /orderexecution/orders/{orderID}``).
 
-        TradeStation replaces the order atomically — the original order is
-        updated in-place with no cancel/resubmit race window.
-
-        Parameters
-        ----------
-        order_id : str
-            The TradeStation order ID to replace.
-        account_id, symbol, quantity, order_type, trade_action, time_in_force,
-        limit_price, stop_price : same semantics as place_order.
-
-        Return
-        -------
-        dict[str, Any]
-            Replacement confirmation response.
-
+        Sends only the spec ``OrderReplaceRequest`` fields - Quantity, LimitPrice, StopPrice.
+        ``order_type`` selects which prices apply; it is not sent (the spec allows changing
+        OrderType only to Market). Verified on the sim account 2026-10-16 (§207).
         """
         url = f"{self.base_url}/orderexecution/orders/{order_id}"
-        order_data: dict[str, Any] = {
-            "AccountID": account_id,
-            "Symbol": symbol,
-            "Quantity": quantity,
-            "OrderType": order_type,
-            "TradeAction": trade_action,
-            "TimeInForce": {"Duration": time_in_force},
-        }
+        order_data: dict[str, Any] = {"Quantity": quantity}
         if order_type in ("Limit", "StopLimit") and limit_price:
             order_data["LimitPrice"] = limit_price
         if order_type in ("StopMarket", "StopLimit") and stop_price:
             order_data["StopPrice"] = stop_price
-
         response = await self._request("PUT", url, json=order_data)
         if response.status_code not in (200, 201):
             _log.debug(f"Replace order failed (HTTP {response.status_code}): {response.text[:500]}")
@@ -700,8 +676,6 @@ class TradeStationHttpClient:
         body = response.json()
         failures = self._body_failures(body)
         if failures:
-            # Observe-only (strategies LESSONS §207): no real error body was ever captured;
-            # promote to a raise once the soak shows what TradeStation sends.
             _log.warning(f"[ORDER-BODY-ERROR] replace {order_id}: HTTP 200 with {failures}")
         return body
 
@@ -841,7 +815,7 @@ class TradeStationHttpClient:
         ``POST /v3/orderexecution/ordergroups`` and link orders so that
         fills or cancellations on one leg affect the others.
 
-        An ``OrderConfirmId`` is sent with each leg (same rules as ``place_order``:
+        An ``OrderConfirmID`` is sent with each leg (same rules as ``place_order``:
         never re-sent, so a duplicate report means the originals may be live).
 
         Parameters
@@ -877,7 +851,7 @@ class TradeStationHttpClient:
         Exception
             If TS returns a non-200/201 HTTP status.
         """
-        # Inject OrderConfirmId into each leg
+        # Inject OrderConfirmID into each leg
         confirm_ids: list[str] = list(order_confirm_ids or [])
         stamped_orders: list[dict[str, Any]] = []
         for i, leg in enumerate(orders):
@@ -886,7 +860,7 @@ class TradeStationHttpClient:
             else:
                 cid = self._generate_order_confirm_id()
                 confirm_ids.append(cid)
-            stamped_orders.append({**leg, "OrderConfirmId": cid})
+            stamped_orders.append({**leg, "OrderConfirmID": cid})
 
         url = f"{self.base_url}/orderexecution/ordergroups"
         payload = {"Type": group_type, "Orders": stamped_orders}

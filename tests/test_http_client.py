@@ -607,8 +607,8 @@ class TestPlaceOrderConfirmId:
         )
 
         body = captured["body"]
-        assert "OrderConfirmId" in body
-        cid = body["OrderConfirmId"]
+        assert "OrderConfirmID" in body
+        cid = body["OrderConfirmID"]
         assert len(cid) == 22
         assert all(c in "0123456789abcdef" for c in cid)
 
@@ -629,7 +629,7 @@ class TestPlaceOrderConfirmId:
             order_confirm_id=custom_id,
         )
 
-        assert captured["body"]["OrderConfirmId"] == custom_id
+        assert captured["body"]["OrderConfirmID"] == custom_id
 
     @pytest.mark.asyncio
     async def test_place_order_normal_success_returns_response_as_is(self, http_client):

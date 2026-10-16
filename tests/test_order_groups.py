@@ -305,7 +305,7 @@ class TestPlaceOrderGroupConfirmId:
 
         orders_in_payload = captured["payload"]["Orders"]
         assert len(orders_in_payload) == 2
-        cids = [o["OrderConfirmId"] for o in orders_in_payload]
+        cids = [o["OrderConfirmID"] for o in orders_in_payload]
         # Each must be 22 hex chars
         for cid in cids:
             assert len(cid) == 22
@@ -329,8 +329,8 @@ class TestPlaceOrderGroupConfirmId:
         )
 
         orders_in_payload = captured["payload"]["Orders"]
-        assert orders_in_payload[0]["OrderConfirmId"] == "cid-1"
-        assert orders_in_payload[1]["OrderConfirmId"] == "cid-2"
+        assert orders_in_payload[0]["OrderConfirmID"] == "cid-1"
+        assert orders_in_payload[1]["OrderConfirmID"] == "cid-2"
 
     @pytest.mark.asyncio
     async def test_place_order_group_normal_success_returns_response_as_is(self, http_client_for_groups):

@@ -1856,10 +1856,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._pending_modify_trigger_price[client_order_id] = command.trigger_price
 
         try:
-            symbol = str(order.instrument_id.symbol)
             ts_order_type = self._convert_order_type(order)
-            ts_tif = self._convert_time_in_force(order.time_in_force)
-            ts_side = "Buy" if order.side == OrderSide.BUY else "Sell"
 
             # Resolve new prices from the command (None = unchanged)
             if command.trigger_price is not None:
@@ -1878,12 +1875,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
             response = await self._client.replace_order(
                 order_id=ts_order_id,
-                account_id=self._account_id,
-                symbol=symbol,
                 quantity=str(order.quantity),
                 order_type=ts_order_type,
-                trade_action=ts_side,
-                time_in_force=ts_tif,
                 limit_price=limit_price,
                 stop_price=stop_price,
             )
