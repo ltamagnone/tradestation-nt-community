@@ -348,6 +348,14 @@ class TradeStationDataClient(LiveMarketDataClient):
         ts_ns = bar_end_ns(event.get("TimeStamp", ""))
         if ts_ns is None:
             return
+        # A gate release advances the watermark; an event that cannot become a Bar must not
+        # get that far, or the bar is lost for good (seeds never replay it) - §207 review M4.
+        if not self._parse_bars([event], bar_type, instrument):
+            self._log.warning(
+                f"[BAR-PARSE-SKIP] {bar_type} ts={event.get('TimeStamp')}: event does not parse "
+                f"- not fed to the gate"
+            )
+            return
         for raw in gate.on_event(event, ts_ns):
             if raw.get("BarStatus") != "Closed":
                 self._log.info(

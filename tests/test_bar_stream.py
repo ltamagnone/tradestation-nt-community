@@ -227,3 +227,16 @@ async def test_polled_bars_are_not_tagged_gap_replay(monkeypatch):
     await C._poll_bars(fake, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None, 300.0)
     assert fake.emitted == ["16:05"]
     assert not any("[BAR-GAP-REPLAY]" in str(c.args[0]) for c in fake._log.info.call_args_list)
+
+
+async def test_unparseable_event_never_reaches_the_gate():
+    """A malformed Closed event must not consume the watermark: the bar's last good update is
+    still released (fallback) when the next bar starts."""
+    bad = {**ev("16:10", "Closed"), "Close": "bad"}
+    f = _fake([ev("16:10"), bad, ev("16:15")])
+    f._parse_bars = lambda raws, bt, inst: (
+        [] if raws[0].get("Close") == "bad" else [r["TimeStamp"][11:16] for r in raws]
+    )
+    await C._stream_bars(f, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None)
+    assert f.emitted == ["16:10"]
+    assert any("[BAR-PARSE-SKIP]" in str(c.args[0]) for c in f._log.warning.call_args_list)
