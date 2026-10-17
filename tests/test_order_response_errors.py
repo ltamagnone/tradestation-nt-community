@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -131,3 +131,44 @@ async def test_replace_sends_only_spec_fields(http_client):  # noqa: F811
         "Quantity": "1",
         "StopPrice": "2000.5",
     }
+
+
+async def test_partial_group_with_a_leg_both_sent_and_failed(http_client):  # noqa: F811
+    """An Orders[] entry carrying OrderID AND Error is a failure, not a landed leg."""
+    body = {"Orders": [{"OrderID": "11", "Message": "ok"},
+                       {"OrderID": "12", "Error": "FAILED", "Message": "leg 2 rejected"}]}
+    http_client._httpx.post = AsyncMock(return_value=_mock_resp(200, body))
+    with pytest.raises(OrderGroupPartialException) as ei:
+        await http_client.place_order_group("OCO", [LEG, LEG])
+    assert ei.value.landed_order_ids == ["11"]
+    assert ei.value.body == body
+
+
+async def test_group_partial_rejects_a_leg_missing_from_the_cache():
+    stub, cmd = _group_stub([False, False])
+    stub._cache.order.side_effect = lambda coid: None
+    stub._client.place_order_group = AsyncMock(
+        side_effect=OrderGroupPartialException("leg 2 rejected", ["90"], body={"Orders": []}))
+    await C._submit_order_group(stub, cmd, "OCO", [{}, {}])
+    stub._client.cancel_order.assert_awaited_once_with("90")
+    assert stub.generate_order_rejected.call_count == 2
+
+
+async def test_group_partial_error_log_carries_the_body():
+    stub, cmd = _group_stub([False, False])
+    stub._client.place_order_group = AsyncMock(side_effect=OrderGroupPartialException(
+        "leg 2 rejected", ["90"], body={"Orders": [{"OrderID": "90"}]}))
+    await C._submit_order_group(stub, cmd, "OCO", [{}, {}])
+    logged = [str(c.args[0]) for c in stub._log.error.call_args_list if "[GROUP-PARTIAL]" in str(c.args[0])]
+    assert logged and '"OrderID": "90"' in logged[0]
+
+
+async def test_late_accept_still_skips_uncached_legs():
+    """The late-accept path keeps its old rule: a closed leg and an UNCACHED leg are both
+    left alone (only still-open cached legs are rejected)."""
+    stub, cmd = _group_stub([True, False])
+    closed = MagicMock()
+    closed.is_closed = True
+    stub._cache.order.side_effect = lambda coid: {"O-0": closed}.get(coid)   # O-1 uncached
+    await C._submit_order_group(stub, cmd, "OCO", [{}, {}])
+    assert stub.generate_order_rejected.call_count == 0

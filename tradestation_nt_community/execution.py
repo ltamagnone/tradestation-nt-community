@@ -1771,11 +1771,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(
                 f"[GROUP-PARTIAL] {group_type} group for OrderList {command.order_list.id}: "
                 f"{len(e.landed_order_ids)}/{len(orders)} legs landed ({e.ts_message}) - "
-                f"cancelling the landed legs at the broker; every leg rejected in NT")
+                f"cancelling the landed legs at the broker; every leg rejected in NT; "
+                f"body={json.dumps(e.body)[:500] if e.body is not None else 'n/a'}")
             await TradeStationExecutionClient._cancel_group_legs_and_reject(
                 self, command,
                 [(None, t) for t in e.landed_order_ids] + [(o, None) for o in orders],
-                "GROUP-PARTIAL", f"group partially placed and cancelled: {e.ts_message}"[:200])
+                "GROUP-PARTIAL", f"group partially placed and cancelled: {e.ts_message}"[:200],
+                reject_uncached=True)
         except Exception as e:
             if _is_ambiguous_submit(e):
                 self._log.error(
@@ -1797,7 +1799,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
 
-    async def _cancel_group_legs_and_reject(self, command, pairs, tag: str, reason: str) -> None:
+    async def _cancel_group_legs_and_reject(
+        self, command, pairs, tag: str, reason: str, reject_uncached: bool = False,
+    ) -> None:
         """Cancel each TS id at the broker and reject each still-open NT leg.
 
         ``pairs`` is ``[(nt_order | None, ts_order_id | None), ...]``: a TS id with no NT
@@ -1816,7 +1820,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if o is not None:
                 TradeStationExecutionClient._forget_cancel_after_ack(self, o.client_order_id)
                 c = self._cache.order(o.client_order_id)
-                if c is not None and not c.is_closed:
+                if (c is None and reject_uncached) or (c is not None and not c.is_closed):
                     self.generate_order_rejected(
                         strategy_id=command.strategy_id,
                         instrument_id=o.instrument_id,

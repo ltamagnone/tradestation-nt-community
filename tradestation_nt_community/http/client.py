@@ -75,9 +75,12 @@ class OrderGroupPartialException(OrderRejectedException):
     be cancelled and the whole group treated as rejected (strategies LESSONS §207).
     """
 
-    def __init__(self, ts_message: str, landed_order_ids: list[str]) -> None:
+    def __init__(
+        self, ts_message: str, landed_order_ids: list[str], body: dict | None = None,
+    ) -> None:
         super().__init__(ts_message)
         self.landed_order_ids = landed_order_ids
+        self.body = body  # the raw HTTP-200 response, so the first real case can be classified
 
 
 class SymbolNotFoundException(Exception):
@@ -890,7 +893,7 @@ class TradeStationHttpClient:
         if landed:
             # (c) Some legs landed: they cannot be mapped to request legs - caller cancels them
             _log.debug(f"Place order group partially placed: {raw_msg}")
-            raise OrderGroupPartialException(raw_msg, landed)
+            raise OrderGroupPartialException(raw_msg, landed, body=response_json)
         # (d) Nothing landed — a real rejection
         _log.debug(f"Place order group rejected by TS (body-level): {raw_msg}")
         raise OrderRejectedException(raw_msg)
