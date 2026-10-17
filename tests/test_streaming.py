@@ -744,3 +744,27 @@ class TestControlEvents:
             if e.get("OrderID"):
                 break
         assert sleeps == [sc._max_delay]
+
+    @pytest.mark.asyncio
+    async def test_no_data_available_is_info_not_error(self, monkeypatch, caplog):
+        """A closed market's idle stream ends with "No data available": INFO, still paused."""
+        from tradestation_nt_community.streaming import client as streaming_mod
+        sc = _make_client()
+        sleeps = []
+
+        async def mock_sleep(s):
+            sleeps.append(s)
+
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+        monkeypatch.setattr(streaming_mod.httpx, "AsyncClient",
+                            TestHeartbeatTimeout()._make_mock_client([
+                                ['{"Error": "Failed", "Message": "No data available."}'],
+                                ['{"OrderID": "A", "Status": "OPN"}'],
+                            ]))
+        caplog.set_level("INFO")
+        async for e in sc._stream("https://mock.ts.com/marketdata/stream/barcharts/FDAXZ26"):
+            if e.get("OrderID"):
+                break
+        assert "[STREAM-ERROR]" not in caplog.text
+        assert "[STREAM-STATUS]" in caplog.text and "No data available" in caplog.text
+        assert sleeps == [sc._max_delay]

@@ -207,7 +207,12 @@ class TradeStationStreamClient:
                                     # DualLogon included: if the server then closes cleanly, the
                                     # loop would reconnect at once and two logons would loop.
                                     pause_next = True
-                                    _log.error(f"[STREAM-ERROR] {url}: {detail}")
+                                    if "No data available" in detail:
+                                        # A closed market's idle stream (FDAX/FCX after their
+                                        # close, 2026-10-16): expected, not an error.
+                                        _log.info(f"[STREAM-STATUS] {url}: {detail} (market closed)")
+                                    else:
+                                        _log.error(f"[STREAM-ERROR] {url}: {detail}")
                                 elif kind == "EndSnapshot":
                                     _log.debug(f"[STREAM-STATUS] EndSnapshot: {url}")
                                 else:
