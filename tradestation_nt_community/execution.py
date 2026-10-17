@@ -276,6 +276,33 @@ def _resolve_fill_price(client, ts_order: dict, order, client_order_id) -> "floa
     return None
 
 
+def _pending_modify_prices(entry) -> tuple:
+    """The (trigger_price, price) a 5xx-pending modify requested. ``entry`` is the stored
+    tuple, or a bare value (a trigger price only, the pre-§212 shape), or None."""
+    if isinstance(entry, tuple):
+        return (entry + (None, None))[:2]
+    return entry, None
+
+
+def _modify_prices_match(ts_order: dict, trigger_price, price) -> bool:
+    """§212: True when the broker order carries EVERY price the modify requested —
+    StopPrice == trigger_price (when requested) and LimitPrice == price (when requested).
+    Nothing requested, or a requested field missing/unparseable at the broker -> False
+    (the recovery then rejects the modify, the safe direction)."""
+    wanted = [(v, f) for v, f in ((trigger_price, "StopPrice"), (price, "LimitPrice"))
+              if v is not None]
+    if not wanted:
+        return False
+    for v, f in wanted:
+        raw = ts_order.get(f)
+        try:
+            if raw in (None, "") or abs(float(v) - float(raw)) >= 1e-6:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _track_partial(client, ts_order: dict, client_order_id, ts_now: int) -> None:
     """FPR (partial, still working): remember it per own order, WARN once, emit no NT
     event. The runner reads ``partial_orders()`` to decide when to stop waiting."""
@@ -713,7 +740,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # On 5xx the adapter emits no event, leaving the order stuck in PENDING_UPDATE
         # indefinitely. _check_order_statuses uses this dict to compare TS's actual stop
         # price and resolve PENDING_UPDATE within the next poll cycle (≤5 s).
-        self._pending_modify_trigger_price: dict[ClientOrderId, "Price | None"] = {}
+        # (trigger_price, price) requested by a 5xx-pending modify (§212; a bare value = trigger)
+        self._pending_modify_trigger_price: dict[ClientOrderId, tuple] = {}
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
         self._token_keepalive_task: asyncio.Task | None = None
@@ -1855,9 +1883,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
 
-        # Track the requested trigger price so _check_order_statuses can recover
-        # PENDING_UPDATE if a 5xx prevents the response from arriving.
-        self._pending_modify_trigger_price[client_order_id] = command.trigger_price
+        # Track the requested prices (trigger, limit) so _check_order_statuses can recover
+        # PENDING_UPDATE if a 5xx prevents the response from arriving. A LIMIT modify
+        # carries only ``price``; storing the trigger alone (None) made every LIMIT
+        # recovery a "rejected" even when TS had the new LimitPrice (§212).
+        self._pending_modify_trigger_price[client_order_id] = (
+            command.trigger_price, command.price)
 
         try:
             ts_order_type = self._convert_order_type(order)
@@ -2443,12 +2474,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     # fall through — no continue
                 else:
                     # Order is still open: compare prices to determine amend outcome.
-                    pending_tp = self._pending_modify_trigger_price.pop(client_order_id, None)
-                    ts_stop_str = ts_order.get("StopPrice") or ts_order.get("LimitPrice") or ""
+                    pending_tp, pending_px = _pending_modify_prices(
+                        self._pending_modify_trigger_price.pop(client_order_id, None))
                     try:
-                        _price_match = False
-                        if pending_tp is not None and ts_stop_str:
-                            _price_match = abs(float(pending_tp) - float(ts_stop_str)) < 1e-6
+                        _price_match = _modify_prices_match(ts_order, pending_tp, pending_px)
                         if _price_match:
                             # TS has the new price — modify succeeded before the 5xx
                             self.generate_order_updated(
@@ -2457,7 +2486,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                                 client_order_id=client_order_id,
                                 venue_order_id=VenueOrderId(ts_order_id),
                                 quantity=cached_order.quantity,
-                                price=None,
+                                price=pending_px,
                                 trigger_price=pending_tp,
                                 ts_event=self._clock.timestamp_ns(),
                             )
@@ -2472,7 +2501,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                                 client_order_id=client_order_id,
                                 venue_order_id=VenueOrderId(ts_order_id),
                                 reason=(
-                                    "5xx recovery: TS stop price unchanged "
+                                    "5xx recovery: TS price(s) unchanged "
                                     "— treating as rejected"
                                 ),
                                 ts_event=self._clock.timestamp_ns(),

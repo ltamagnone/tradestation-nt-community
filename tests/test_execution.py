@@ -1444,3 +1444,76 @@ class TestUncachedFillWarning:
         warns = self._uncached_warnings(m)
         assert len(warns) == 1
         assert m._log.info.call_count == 0
+
+
+# =============================================================================
+# §212: price-aware PENDING_UPDATE recovery for LIMIT / STOP_LIMIT modifies
+# =============================================================================
+
+class TestPendingUpdateRecoveryPrices:
+    """A LIMIT modify stores (trigger=None, price); the recovery compares LimitPrice."""
+
+    async def _run(self, ts_order: dict, stored):
+        coid = ClientOrderId("O-STOP")
+        m = _make_check_statuses_mock(ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN",
+                                                  **ts_order}])
+        m._pending_modify_trigger_price[coid] = stored
+        await TradeStationExecutionClient._check_order_statuses(m)
+        assert coid not in m._pending_modify_trigger_price
+        return m
+
+    @pytest.mark.asyncio
+    async def test_limit_modify_recovered_as_updated_when_broker_has_new_limit(self):
+        m = await self._run({"LimitPrice": "101.0"}, (None, Price(101.0, 2)))
+        m.generate_order_updated.assert_called_once()
+        kw = m.generate_order_updated.call_args.kwargs
+        assert kw["price"] == Price(101.0, 2) and kw["trigger_price"] is None
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_limit_modify_rejected_when_broker_kept_old_limit(self):
+        m = await self._run({"LimitPrice": "100.0"}, (None, Price(101.0, 2)))
+        m.generate_order_modify_rejected.assert_called_once()
+        m.generate_order_updated.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_modify_recovery_unchanged(self):
+        m = await self._run({"StopPrice": "99.0"}, (Price(99.0, 2), None))
+        kw = m.generate_order_updated.call_args.kwargs
+        assert kw["trigger_price"] == Price(99.0, 2) and kw["price"] is None
+
+    @pytest.mark.asyncio
+    async def test_stop_limit_modify_needs_both_prices(self):
+        m = await self._run({"StopPrice": "99.0", "LimitPrice": "98.0"},
+                            (Price(99.0, 2), Price(98.5, 2)))
+        m.generate_order_modify_rejected.assert_called_once()
+        m.generate_order_updated.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stop_limit_modify_both_match_is_updated(self):
+        m = await self._run({"StopPrice": "99.0", "LimitPrice": "98.5"},
+                            (Price(99.0, 2), Price(98.5, 2)))
+        kw = m.generate_order_updated.call_args.kwargs
+        assert kw["trigger_price"] == Price(99.0, 2) and kw["price"] == Price(98.5, 2)
+
+    @pytest.mark.asyncio
+    async def test_limit_price_not_mistaken_for_stop(self):
+        """Pre-§212 the stop comparison fell back to LimitPrice: a stop modify must match
+        StopPrice only."""
+        m = await self._run({"LimitPrice": "99.0"}, (Price(99.0, 2), None))
+        m.generate_order_modify_rejected.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_modify_order_stores_both_prices(self):
+        cmd = ModifyOrder(
+            TraderId("TRADER-001"), StrategyId("S-001"),
+            InstrumentId(Symbol("NQM26"), Venue("TRADESTATION")),
+            ClientOrderId("O-LIM"), VenueOrderId("TS-LIM"),
+            None, Price(101.0, 2), None, UUID4(), 0,
+        )
+        m = _make_exec_mock(cmd)
+        m._pending_modify_trigger_price = {}
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable"))
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        assert m._pending_modify_trigger_price[cmd.client_order_id] == (None, Price(101.0, 2))
