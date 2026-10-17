@@ -240,3 +240,35 @@ async def test_unparseable_event_never_reaches_the_gate():
     await C._stream_bars(f, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None)
     assert f.emitted == ["16:10"]
     assert any("[BAR-PARSE-SKIP]" in str(c.args[0]) for c in f._log.warning.call_args_list)
+
+
+async def test_request_bars_answers_even_without_bars():
+    """No history (API error or empty): answer anyway, or the requester waits forever."""
+    fake = types.SimpleNamespace(
+        _cache=types.SimpleNamespace(instrument=lambda iid: object()),
+        _historical=types.SimpleNamespace(get_bars=AsyncMock(return_value=[])),
+        _handle_bars=MagicMock(),
+        _bar_gates={},
+        _log=MagicMock(),
+    )
+    req = types.SimpleNamespace(bar_type=BT, start=None, end=None, limit=2, id="r", params={})
+    await C._request_bars(fake, req)
+    fake._handle_bars.assert_called_once()
+    assert fake._handle_bars.call_args.args[1] == []
+    assert BT not in fake._bar_gates
+
+
+async def test_request_bars_answers_when_the_instrument_is_missing():
+    fake = types.SimpleNamespace(
+        _cache=types.SimpleNamespace(instrument=lambda iid: None),
+        _instrument_provider=types.SimpleNamespace(load_async=AsyncMock()),
+        _historical=types.SimpleNamespace(get_bars=AsyncMock()),
+        _handle_bars=MagicMock(),
+        _bar_gates={},
+        _log=MagicMock(),
+    )
+    req = types.SimpleNamespace(bar_type=BT, start=None, end=None, limit=2, id="r", params={})
+    await C._request_bars(fake, req)
+    fake._handle_bars.assert_called_once()
+    assert fake._handle_bars.call_args.args[1] == []
+    fake._historical.get_bars.assert_not_awaited()

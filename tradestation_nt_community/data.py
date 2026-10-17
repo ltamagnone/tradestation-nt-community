@@ -764,6 +764,11 @@ class TradeStationDataClient(LiveMarketDataClient):
             self._log.error(
                 f"Cannot request bars: instrument not found for {bar_type.instrument_id}"
             )
+            # Answer anyway: without a response NT never calls the requester's callback
+            # (the runner's warm-up would wait for a live bar) - LESSONS §207 follow-ups.
+            self._handle_bars(
+                bar_type, [], request.id, request.start, request.end, request.params,
+            )
             return
 
         start_ts = pd.Timestamp(request.start) if request.start is not None else None
@@ -775,14 +780,18 @@ class TradeStationDataClient(LiveMarketDataClient):
             limit=request.limit,
         )
 
-        if not bars:
-            return
-
-        # The history holds only closed bars (historical client): the stream must not
-        # re-emit them (strategies LESSONS §207).
-        self._bar_gates.setdefault(bar_type, BarCloseGate()).seed_from_history(
-            bars[-1].ts_event
-        )
+        if bars:
+            # The history holds only closed bars (historical client): the stream must not
+            # re-emit them (strategies LESSONS §207).
+            self._bar_gates.setdefault(bar_type, BarCloseGate()).seed_from_history(
+                bars[-1].ts_event
+            )
+        else:
+            self._log.warning(
+                f"Historical: no bars for {bar_type} - answering empty so the requester is "
+                f"not left waiting"
+            )
+            bars = []
 
         self._handle_bars(
             bar_type,
