@@ -86,7 +86,7 @@ Tests use a `MockTradeStationHttpClient` (in `tests/mock_http_client.py`) that r
 
 Core dependencies for the adapter: `nautilus_trader >= 1.200`, `httpx >= 0.27`, `pandas`.
 
-> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **709 passed, 2 skipped** (2026-10-16). Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
+> **Test interpreter:** run the adapter suite with the system `pytest` (`/usr/bin/python3` + `.[dev]` extras) — full green is **717 passed, 2 skipped** in a worktree, **719 passed** on the main checkout (the 2 OpenAPI-spec tests find the sibling strategies repo only from there) (2026-10-17). Do NOT use the consumer's vendored nautilus venv; it pins a different httpx that fails `tests/test_streaming.py::TestAuthErrorRefresh` (environment artifact, not a regression).
 
 ## Observability (June 2026)
 
@@ -97,11 +97,13 @@ Structured, greppable log lines aid post-incident reconstruction:
   - `[BAR-CLOSE-FALLBACK]` (INFO) — a bar emitted on the next bar's first update because no `BarStatus` Closed came for it.
   - `[BAR-GAP-REPLAY]` (INFO) — a closed bar replayed from a stream reconnect seed (it closed while the stream was down); counted as `gap_recovery` by the strategies' `bar_stream_latency_report.py`. Polling never tags.
   - `[STREAM-GOAWAY]` (WARNING) — the server announced shutdown (`{"Error":"GoAway"}` market data, `{"StreamStatus":"GoAway"}` brokerage); reconnect at once, or after the max delay if the connection was < 30 s old.
-  - `[STREAM-ERROR]` (ERROR) — an in-band stream error (`BadRequest`, `DualLogon`, `Forbidden`, `Failed`...); the next reconnect waits the max delay so two logons cannot loop. `[STREAM-STATUS]` logs `EndSnapshot` (DEBUG) and other statuses. A quote's own per-symbol `Error` (it carries `Symbol`) is data, never control.
+  - `[STREAM-ERROR]` (ERROR) — an in-band stream error (`BadRequest`, `DualLogon`, `Forbidden`, `Failed`...; except `Failed: No data available.`, a closed market's idle stream, which logs `[STREAM-STATUS] ... (market closed)` at INFO — strategies LESSONS §210); the next reconnect waits the max delay so two logons cannot loop. `[STREAM-STATUS]` logs `EndSnapshot` (DEBUG) and other statuses. A quote's own per-symbol `Error` (it carries `Symbol`) is data, never control.
   - `[ORDERS-PAGE-CAP]` (ERROR) — `/orders` still paging after 20 pages of 600; the list is truncated. `get_orders` always pages (`pageSize`/`nextToken`); single-order reads use `get_orders_by_id` (`GET /orders/{ids}`, HTTP 404 = none found).
-  - `[GROUP-PARTIAL]` (ERROR) — a group POST where only some legs landed: the landed ids are cancelled at the broker and every leg is rejected in NT (no strategy submits brackets as of 2026-10-16).
+  - `[GROUP-PARTIAL]` (ERROR) — a group POST where only some legs landed: the landed ids are cancelled at the broker and every leg is rejected in NT (no strategy submits brackets as of 2026-10-16). The ERROR carries the raw response body (`OrderGroupPartialException.body`, truncated) and every leg is rejected, cached or not (§210).
   - `[SUBMIT-AMBIGUOUS]` (ERROR, observe-only) — a submit failed after the POST was sent (read timeout, dropped connection, duplicate-confirm report): the order may be live; it is still rejected in NT.
   - `[ORDER-BODY-ERROR]` (WARNING, observe-only) — a replace/cancel answered HTTP 200 with an `Error`; promote to a raise once the soak shows real bodies.
+  - `[BAR-PARSE-SKIP]` (WARNING) — a bar event that does not parse is not fed to the `BarCloseGate`, so it cannot consume the watermark (§210).
+  - A bar request (`_request_bars`) is always answered — with `[]` when the instrument or the history is missing — so a requester's callback always fires; the strategies runner's `[WARMUP-HOLD]` relies on it (§210).
 
 ## Known Constraints
 
