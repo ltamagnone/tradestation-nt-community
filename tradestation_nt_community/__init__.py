@@ -25,6 +25,7 @@ from tradestation_nt_community.constants import TRADESTATION_VENUE
 from tradestation_nt_community.data import TradeStationDataClient
 from tradestation_nt_community.factories import TradeStationLiveDataClientFactory
 from tradestation_nt_community.factories import TradeStationLiveExecClientFactory
+from tradestation_nt_community.http.client import BrokerReadError
 from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
 from tradestation_nt_community.http.client import GetBarsFailedException
 from tradestation_nt_community.http.client import OrderGroupPartialException
@@ -38,6 +39,7 @@ __all__ = [
     "TRADESTATION",
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",
+    "BrokerReadError",
     "DuplicateOrderConfirmIdException",
     "GetBarsFailedException",
     "OrderGroupPartialException",

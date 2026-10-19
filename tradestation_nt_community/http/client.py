@@ -128,6 +128,36 @@ class GetBarsFailedException(Exception):
         super().__init__(f"TradeStation get bars failed: HTTP {status_code}")
         self.status_code = status_code
 
+
+class BrokerReadError(Exception):
+    """
+    Raised when a TradeStation READ failed, after the bounded retry (strategies LESSONS §217).
+
+    "HTTP 200 != data": TradeStation answers an outage with HTTP 200 and an account-level
+    ``Errors`` entry (e.g. ``{"Errors":[{"AccountID":...,"Error":"ServiceUnavailable"}]}``)
+    and no ``Orders`` / ``Positions`` container. Returning ``[]`` for that made the book look
+    flat (2026-10-19 incident). A read now raises instead, so every caller takes its existing
+    "could not read -> do nothing" branch. Also raised for HTTP 5xx and an unparseable body.
+
+    Attributes
+    ----------
+    endpoint : str
+        The read that failed, e.g. ``"GET /orders"``.
+    errors : list
+        TradeStation's ``Errors`` entries (or one synthetic entry for an HTTP / JSON failure).
+    """
+
+    def __init__(self, endpoint: str, errors: list | None = None, detail: str = "") -> None:
+        self.endpoint = endpoint
+        self.errors = list(errors or [])
+        shown = detail or "; ".join(
+            ": ".join(str(e.get(k)) for k in ("Error", "Message") if e.get(k))
+            if isinstance(e, dict) else str(e)
+            for e in self.errors[:3]
+        ) or "unknown error"
+        super().__init__(f"TradeStation read failed: {endpoint}: {shown}")
+
+
 from tradestation_nt_community.common.enums import TradeStationBarUnit
 
 _ALLOWED_HOSTS = frozenset({
@@ -321,6 +351,113 @@ class TradeStationHttpClient:
             return resp
         return resp  # type: ignore[return-value]  # exhausted retries
 
+    # -- §217 read-side "HTTP 200 != data" ------------------------------------------------
+    # Sleeps between the 3 attempts of a READ. Never used for a write (POST/PUT/DELETE):
+    # a re-sent order is a second order (§37/§207).
+    _READ_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+
+    @staticmethod
+    def _check_read_body(
+        data: Any,
+        *,
+        container: str,
+        endpoint: str,
+        scoped_keys: tuple = (),
+        scoped_errors: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return ``data`` if it is a real answer, else raise :class:`BrokerReadError` (§217).
+
+        - The body must be a dict holding ``container`` as a list. A missing container is a
+          failed read, never "empty": TS answers an outage with HTTP 200 and only ``Errors``.
+        - An ``Errors`` entry is *scoped* (data about one item, not a failure) when it carries
+          one of ``scoped_keys`` (``OrderID`` / ``Symbol``) and, if ``scoped_errors`` is given,
+          its lower-cased ``Error`` is one of them (``get_orders_by_id``: only ``notfound``).
+          Every other entry - no scope key, e.g. ``{"AccountID":..,"Error":"ServiceUnavailable"}``
+          - is account-level and raises even when the container is present: partial data
+          next to an account error is not the truth.
+        """
+        if not isinstance(data, dict):
+            raise BrokerReadError(
+                endpoint, [], f"no '{container}' in the reply (got {type(data).__name__})")
+        errors = data.get("Errors") or []
+        if not isinstance(errors, list):
+            errors = [errors]
+
+        def _scoped(e: Any) -> bool:
+            if not isinstance(e, dict) or not any(e.get(k) for k in scoped_keys):
+                return False
+            return scoped_errors is None or str(e.get("Error") or "").lower() in scoped_errors
+
+        failing = [e for e in errors if not _scoped(e)]
+        if not isinstance(data.get(container), list):
+            raise BrokerReadError(
+                endpoint, errors, "" if errors else f"no '{container}' in the reply")
+        if failing:
+            raise BrokerReadError(endpoint, failing)
+        return data
+
+    async def _read(
+        self,
+        url: str,
+        *,
+        label: str,
+        endpoint: str,
+        container: str,
+        params: dict[str, str] | None = None,
+        scoped_keys: tuple = (),
+        scoped_errors: frozenset[str] | None = None,
+        not_found_ok: bool = False,
+    ) -> dict[str, Any] | None:
+        """One GET with the §217 bounded retry; returns the checked body.
+
+        Retried (3 attempts, sleeps ``_READ_RETRY_DELAYS``): a body that fails
+        ``_check_read_body``, HTTP 5xx, an unparseable body. Not retried: 4xx (429 is
+        already retried by ``_request``; 404 is "none found" when ``not_found_ok``, which
+        returns None) and transport exceptions (they raise as before). WARNING per failed
+        attempt with the TS error text, ERROR when the retries are exhausted.
+        """
+        kwargs: dict[str, Any] = {"params": params} if params is not None else {}
+        attempts = len(self._READ_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self._request("GET", url, **kwargs)
+                status = response.status_code
+                if status == 404 and not_found_ok:
+                    return None
+                if status >= 500:
+                    raise BrokerReadError(
+                        endpoint,
+                        [{"Error": f"HTTP {status}", "Message": str(response.text)[:200]}],
+                        f"{label} failed: HTTP {status}",
+                    )
+                if status != 200:
+                    _log.debug(f"{label} failed (HTTP {status}): {response.text[:500]}")
+                    raise Exception(f"{label} failed: HTTP {status}")
+                try:
+                    data = response.json()
+                except ValueError as e:
+                    raise BrokerReadError(endpoint, [], f"unparseable body: {e}") from e
+                return self._check_read_body(
+                    data, container=container, endpoint=endpoint,
+                    scoped_keys=scoped_keys, scoped_errors=scoped_errors,
+                )
+            except BrokerReadError as e:
+                if attempt < attempts:
+                    delay = self._READ_RETRY_DELAYS[attempt - 1]
+                    _log.warning(
+                        f"[TS-READ-RETRY] {e} (attempt {attempt}/{attempts}) - "
+                        f"retrying in {delay:g}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                _log.warning(f"[TS-READ-RETRY] {e} (attempt {attempt}/{attempts})")
+                _log.error(
+                    f"[TS-READ-FAILED] {e} - gave up after {attempts} attempts; raising "
+                    f"(never read as empty / flat). Errors: {e.errors[:3]}"
+                )
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
     async def get_bars(
         self,
         symbol: str,
@@ -383,7 +520,22 @@ class TradeStationHttpClient:
         if response.status_code != 200:
             _log.debug(f"Get bars failed (HTTP {response.status_code}): {response.text[:500]}")
             raise GetBarsFailedException(response.status_code)
-        return response.json().get("Bars", [])
+        # §217 on HTTP 200: the body check, WITHOUT the read retry - the warm-up history
+        # layer ([HIST-RETRY], §210 addendum) is the single retrier for bars and treats a
+        # BrokerReadError as permanent (one ERROR, answers []); polling backs off 5 s.
+        endpoint = f"GET /marketdata/barcharts/{symbol}"
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise BrokerReadError(endpoint, [], f"unparseable body: {e}") from e
+        try:
+            checked = self._check_read_body(
+                data, container="Bars", endpoint=endpoint, scoped_keys=("Symbol",),
+            )
+        except BrokerReadError as e:
+            _log.warning(f"[TS-READ-FAILED] {e} (get_bars: not retried here)")
+            raise
+        return checked["Bars"]
 
     async def search_symbols(
         self,
@@ -504,15 +656,12 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/balances"
-        response = await self._request("GET", url)
-        if response.status_code != 200:
-            _log.debug(f"Get balances failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"Get balances failed: HTTP {response.status_code}")
-        data = response.json()
-        if isinstance(data, dict) and "Balances" in data:
-            balances = data.get("Balances", [])
-            return balances[0] if balances else {}
-        return data
+        data = await self._read(
+            url, label="Get balances", endpoint=f"GET /accounts/{account_keys}/balances",
+            container="Balances",
+        )
+        balances = data["Balances"]
+        return balances[0] if balances else {}
 
     async def get_positions(self, account_keys: str) -> list[dict[str, Any]]:
         """
@@ -530,12 +679,11 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/brokerage/accounts/{account_keys}/positions"
-        response = await self._request("GET", url)
-        if response.status_code != 200:
-            _log.debug(f"Get positions failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"Get positions failed: HTTP {response.status_code}")
-        data = response.json()
-        return data.get("Positions", []) if isinstance(data, dict) else data
+        data = await self._read(
+            url, label="Get positions", endpoint=f"GET /accounts/{account_keys}/positions",
+            container="Positions",
+        )
+        return data["Positions"]
 
     def _generate_order_confirm_id(self) -> str:
         """Generate a unique 22-character order confirm ID (TS max length)."""
@@ -762,6 +910,9 @@ class TradeStationHttpClient:
         ``/historicalorders`` (``since`` REQUIRED there; it excludes the current day).
         Without ``pageSize`` TradeStation returns at most 600 orders, so this always pages
         (``pageSize`` 600, ``nextToken``; probed 2026-10-16) - strategies LESSONS §207.
+        A page answered with an ``Errors`` entry or without ``Orders`` (HTTP 200 outage) is
+        retried, then raises :class:`BrokerReadError` - never an empty or truncated list
+        (§217). ``{"Orders": []}`` with no ``Errors`` is a genuine empty.
 
         Parameters
         ----------
@@ -785,17 +936,15 @@ class TradeStationHttpClient:
         if status:
             params["status"] = status
         orders: list[dict[str, Any]] = []
-        for _page in range(self._ORDERS_MAX_PAGES):
-            response = await self._request("GET", url, params=params)
-            if response.status_code != 200:
-                _log.debug(f"Get orders failed (HTTP {response.status_code}): {response.text[:500]}")
-                raise Exception(f"Get orders failed: HTTP {response.status_code}")
-            data = response.json()
-            if not isinstance(data, dict):
-                return orders + list(data)
-            orders.extend(data.get("Orders") or [])
-            if data.get("Errors"):
-                _log.warning(f"Get orders: TradeStation reported errors: {data['Errors'][:3]}")
+        for page in range(self._ORDERS_MAX_PAGES):
+            # Each page is checked and retried on its own (same nextToken): a failed page
+            # raises, never returns the truncated list (§217).
+            data = await self._read(
+                url, label="Get orders",
+                endpoint=f"GET /accounts/{account_keys}/orders (page {page + 1})",
+                container="Orders", params=params,
+            )
+            orders.extend(data["Orders"])
             token = data.get("NextToken")
             if not token:
                 return orders
@@ -814,26 +963,24 @@ class TradeStationHttpClient:
 
         Only the orders found are returned. TradeStation lists unknown ids in ``Errors``
         (``NotFound``) and answers **HTTP 404 when none of the ids is found** (probed
-        2026-10-16) - both mean "not found", never a failure.
+        2026-10-16) - both mean "not found", never a failure. Any other error (unscoped, or
+        a non-NotFound error on an id) raises :class:`BrokerReadError` after the retry: that
+        order's state is unknown, not absent (§217 M10).
         """
         ids = [str(i) for i in order_ids if i]
         out: list[dict[str, Any]] = []
         for k in range(0, len(ids), self._ORDERS_BY_ID_CHUNK):
             chunk = ",".join(ids[k:k + self._ORDERS_BY_ID_CHUNK])
             url = f"{self.base_url}/brokerage/accounts/{account_keys}/orders/{chunk}"
-            response = await self._request("GET", url)
-            if response.status_code == 404:
+            data = await self._read(
+                url, label="Get orders by id",
+                endpoint=f"GET /accounts/{account_keys}/orders/{chunk}",
+                container="Orders", scoped_keys=("OrderID",),
+                scoped_errors=frozenset({"notfound"}), not_found_ok=True,
+            )
+            if data is None:  # HTTP 404: none of these ids found
                 continue
-            if response.status_code != 200:
-                _log.debug(
-                    f"Get orders by id failed (HTTP {response.status_code}): {response.text[:500]}"
-                )
-                raise Exception(f"Get orders by id failed: HTTP {response.status_code}")
-            data = response.json()
-            out.extend(data.get("Orders") or [])
-            other = [e for e in data.get("Errors") or [] if e.get("Error") != "NotFound"]
-            if other:
-                _log.warning(f"Get orders by id: TradeStation reported errors: {other[:3]}")
+            out.extend(data["Orders"])
         return out
 
     async def place_order_group(
@@ -946,12 +1093,13 @@ class TradeStationHttpClient:
 
         """
         url = f"{self.base_url}/marketdata/quotes/{symbols}"
-        response = await self._request("GET", url)
-        if response.status_code != 200:
-            _log.debug(f"Get quotes failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"Get quotes failed: HTTP {response.status_code}")
-        data = response.json()
-        return data.get("Quotes", []) if isinstance(data, dict) else data
+        # A per-symbol error (it carries Symbol, e.g. an invalid symbol) is data: the other
+        # quotes are returned. Only an unscoped error or a missing Quotes raises (§217).
+        data = await self._read(
+            url, label="Get quotes", endpoint=f"GET /marketdata/quotes/{symbols}",
+            container="Quotes", scoped_keys=("Symbol",),
+        )
+        return data["Quotes"]
 
     async def close(self) -> None:
         """Close the underlying HTTP client and clear credentials from memory."""

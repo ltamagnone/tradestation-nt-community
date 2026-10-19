@@ -13,6 +13,7 @@ import pandas as pd
 
 from tradestation_nt_community._attribution import order_attribution
 from tradestation_nt_community.common import order_status as _st
+from tradestation_nt_community.http.client import BrokerReadError
 from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
 from tradestation_nt_community.http.client import OrderGroupPartialException
 from tradestation_nt_community.http.client import TradeStationHttpClient
@@ -1103,6 +1104,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
             return self._parse_order_status_report(ts_order, instrument_id, client_order_id)
 
+        except BrokerReadError as e:
+            # §217 M10: the read FAILED (HTTP 200 + Errors / 5xx, after retries) - the order's
+            # state is unknown, which is not "not found". Same None, its own line.
+            self._log.error(
+                f"[ORDER-STATUS-READ-FAILED] {client_order_id} (TS {ts_order_id}): {e} - "
+                f"state unknown, no report"
+            )
+            return None
         except Exception as e:
             self._log.error(f"Failed to generate order status report: {e}")
             return None
@@ -1126,6 +1135,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return None
         try:
             orders = await self._client.get_orders_by_id(self._account_id, [ts_order_id])
+        except BrokerReadError as e:
+            # §217 M10: TS answered with an error (HTTP 200 + Errors / 5xx, after retries):
+            # the order's state is unknown - never "absent". NT retries (None).
+            self._log.error(
+                f"[INFLIGHT-QUERY-READ-FAILED] {client_order_id} (TS {ts_order_id}): {e} - "
+                f"state unknown, no report, NT will retry"
+            )
+            return None
         except Exception as e:
             self._log.error(
                 f"[INFLIGHT-QUERY] broker read failed for {client_order_id} "
@@ -1392,7 +1409,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return reports
 
         except Exception as e:
-            self._log.error(f"Failed to generate order status reports: {e}")
+            # §217 L4: [] is what NT needs on a failed read, but [] also means "the venue has
+            # nothing" to NT's reconciliation. Safe only while these run at startup / on the
+            # evidence-triggered recon: NEVER enable open_check_interval_secs (or reconnect
+            # mass-status) while this returns [] on failure - NT would infer flattening fills.
+            self._log.error(f"[RECON-REPORT-READ-FAILED] order status reports: {e} - "
+                            f"returning [] (read failed, NOT an empty venue)")
             return []
 
     async def generate_fill_reports(
@@ -1474,7 +1496,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return reports
 
         except Exception as e:
-            self._log.error(f"Failed to generate fill reports: {e}")
+            # §217 L4: [] is what NT needs on a failed read, but [] also means "the venue has
+            # nothing" to NT's reconciliation. Safe only while these run at startup / on the
+            # evidence-triggered recon: NEVER enable open_check_interval_secs (or reconnect
+            # mass-status) while this returns [] on failure - NT would infer flattening fills.
+            self._log.error(f"[RECON-REPORT-READ-FAILED] fill reports: {e} - "
+                            f"returning [] (read failed, NOT an empty venue)")
             return []
 
     async def generate_position_status_reports(
@@ -1529,7 +1556,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return reports
 
         except Exception as e:
-            self._log.error(f"Failed to generate position status reports: {e}")
+            # §217 L4: [] is what NT needs on a failed read, but [] also means "the venue has
+            # nothing" to NT's reconciliation. Safe only while these run at startup / on the
+            # evidence-triggered recon: NEVER enable open_check_interval_secs (or reconnect
+            # mass-status) while this returns [] on failure - NT would infer flattening fills.
+            self._log.error(f"[RECON-REPORT-READ-FAILED] position status reports: {e} - "
+                            f"returning [] (read failed, NOT an empty venue)")
             return []
 
     # -- COMMAND HANDLERS -----------------------------------------------------------------
