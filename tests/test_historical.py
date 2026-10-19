@@ -183,3 +183,16 @@ class TestTradeStationHistoricalClient:
             pd.Timestamp("2026-10-16T16:06:00Z").value,
             pd.Timestamp("2026-10-16T16:07:00Z").value,
         ]
+
+    @pytest.mark.asyncio
+    async def test_real_v3_response_drops_only_the_forming_bar(self, instrument):
+        import json
+        from pathlib import Path
+        from unittest.mock import AsyncMock
+        raw = json.loads((Path(__file__).parent / "resources" / "bars_response_v3.json")
+                         .read_text())["Bars"]
+        mock_client = MockTradeStationHttpClient()
+        mock_client.get_bars = AsyncMock(return_value=raw)
+        bars = await TradeStationHistoricalClient(http_client=mock_client).get_bars(
+            bar_type=_make_bar_type(instrument, 5), instrument=instrument)
+        assert len(bars) == len(raw) - 1

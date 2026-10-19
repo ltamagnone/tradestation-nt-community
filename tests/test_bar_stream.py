@@ -272,3 +272,36 @@ async def test_request_bars_answers_when_the_instrument_is_missing():
     fake._handle_bars.assert_called_once()
     assert fake._handle_bars.call_args.args[1] == []
     fake._historical.get_bars.assert_not_awaited()
+
+
+def _v3_bars():
+    import json
+    from pathlib import Path
+    p = Path(__file__).parent / "resources" / "bars_response_v3.json"
+    return json.loads(p.read_text())["Bars"]
+
+
+def test_v3_fixture_carries_the_fields_the_gate_reads():
+    bars = _v3_bars()
+    assert all("BarStatus" in b and "IsRealtime" in b for b in bars)
+    assert bars[-1]["BarStatus"] == "Open" and all(b["IsRealtime"] is False for b in bars)
+
+
+async def test_first_poll_of_real_bars_only_seeds(monkeypatch):
+    polls = iter([_v3_bars()])
+
+    async def get_bars(**kw):
+        try:
+            return next(polls)
+        except StopIteration:
+            raise asyncio.CancelledError
+
+    async def no_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    fake = _fake([])
+    fake._client = types.SimpleNamespace(get_bars=get_bars)
+    await C._poll_bars(fake, BT, "ESZ26", "5", TradeStationBarUnit.MINUTE, None, 300.0)
+    assert fake.emitted == []
+    assert fake._bar_gates[BT].last_emitted_ns == bar_end_ns(_v3_bars()[-2]["TimeStamp"])
