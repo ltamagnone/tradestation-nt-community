@@ -362,21 +362,26 @@ class TradeStationHttpClient:
         *,
         container: str,
         endpoint: str,
-        scoped_keys: tuple = ("OrderID", "Symbol"),
+        scoped_keys: tuple = (),
+        scoped_errors: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Return ``data`` if it is a real answer, else raise :class:`BrokerReadError` (§217).
 
-        One rule for every read, shared with the runner's ``_sync_ts_get_json`` (§217):
+        Same rule as the runner's ``_sync_ts_get_json`` (§217):
         - The body must be a dict holding ``container`` as a list. A missing or null
           container is a failed read, never "empty": TS answers an outage with HTTP 200 and
           only ``Errors``. This holds even when every ``Errors`` entry is scoped (e.g. /quotes
           answering only per-symbol errors and no ``Quotes``): it raises on purpose - the
           conservative side.
-        - An ``Errors`` entry is *scoped* (data about one item, not a failure) when it carries
-          a non-empty ``OrderID`` or ``Symbol`` (``scoped_keys``), whatever its ``Error``.
-          Every other entry, e.g. ``{"AccountID":..,"Error":"ServiceUnavailable"}``, is
-          account-level and raises even when the container is present: partial data next to
-          an account error is not the truth.
+        - An ``Errors`` entry is *scoped* (data about one item, not a failure) only when it
+          carries a non-empty value for one of ``scoped_keys`` and, if ``scoped_errors`` is
+          given, its lower-cased ``Error`` is one of them. Per read:
+          list reads (orders / positions / balances) pass ``()`` - ANY entry fails, because a
+          scoped error there means that item is missing from the list; ``get_orders_by_id``
+          passes ``OrderID`` + ``{"notfound"}``; ``get_quotes`` / ``get_bars`` pass ``Symbol``
+          (an invalid symbol beside good data). Every other entry, e.g.
+          ``{"AccountID":..,"Error":"ServiceUnavailable"}``, raises even when the container
+          is present: partial data next to an error is not the truth.
         """
         if not isinstance(data, dict):
             raise BrokerReadError(
@@ -386,7 +391,9 @@ class TradeStationHttpClient:
             errors = [errors]
 
         def _scoped(e: Any) -> bool:
-            return isinstance(e, dict) and any(e.get(k) for k in scoped_keys)
+            if not isinstance(e, dict) or not any(e.get(k) for k in scoped_keys):
+                return False
+            return scoped_errors is None or str(e.get("Error") or "").lower() in scoped_errors
 
         failing = [e for e in errors if not _scoped(e)]
         if not isinstance(data.get(container), list):
@@ -404,6 +411,8 @@ class TradeStationHttpClient:
         endpoint: str,
         container: str,
         params: dict[str, str] | None = None,
+        scoped_keys: tuple = (),
+        scoped_errors: frozenset[str] | None = None,
         not_found_ok: bool = False,
     ) -> dict[str, Any] | None:
         """One GET with the §217 bounded retry; returns the checked body.
@@ -435,7 +444,10 @@ class TradeStationHttpClient:
                     data = response.json()
                 except ValueError as e:
                     raise BrokerReadError(endpoint, [], f"unparseable body: {e}") from e
-                return self._check_read_body(data, container=container, endpoint=endpoint)
+                return self._check_read_body(
+                    data, container=container, endpoint=endpoint,
+                    scoped_keys=scoped_keys, scoped_errors=scoped_errors,
+                )
             except BrokerReadError as e:
                 if attempt < attempts:
                     delay = self._READ_RETRY_DELAYS[attempt - 1]
@@ -958,9 +970,9 @@ class TradeStationHttpClient:
 
         Only the orders found are returned. TradeStation lists unknown ids in ``Errors``
         (``NotFound``) and answers **HTTP 404 when none of the ids is found** (probed
-        2026-10-16) - both mean "not found", never a failure. An error that carries an
-        ``OrderID`` is scoped to that id (whatever its ``Error``); an unscoped error or a
-        missing ``Orders`` raises :class:`BrokerReadError` after the retry (§217).
+        2026-10-16) - both mean "not found", never a failure. Any other error (unscoped, or
+        a non-NotFound error on an id) raises :class:`BrokerReadError` after the retry: that
+        order's state is unknown, not absent (§217 M10).
         """
         ids = [str(i) for i in order_ids if i]
         out: list[dict[str, Any]] = []
@@ -970,7 +982,8 @@ class TradeStationHttpClient:
             data = await self._read(
                 url, label="Get orders by id",
                 endpoint=f"GET /accounts/{account_keys}/orders/{chunk}",
-                container="Orders", not_found_ok=True,
+                container="Orders", scoped_keys=("OrderID",),
+                scoped_errors=frozenset({"notfound"}), not_found_ok=True,
             )
             if data is None:  # HTTP 404: none of these ids found
                 continue
@@ -1093,7 +1106,7 @@ class TradeStationHttpClient:
         # (deliberately conservative; callers already catch and skip).
         data = await self._read(
             url, label="Get quotes", endpoint=f"GET /marketdata/quotes/{symbols}",
-            container="Quotes",
+            container="Quotes", scoped_keys=("Symbol",),
         )
         return data["Quotes"]
 

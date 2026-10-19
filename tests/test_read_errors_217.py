@@ -222,25 +222,36 @@ def test_orders_by_id_unscoped_error_raises(client):
     assert get.await_count == 3
 
 
-def test_orders_by_id_non_notfound_error_on_an_id_is_scoped(client):
-    """Controller ruling (shared with the runner): an entry carrying OrderID is scoped to that
-    id whatever its Error - the good orders beside it are returned, no retry."""
+def test_orders_by_id_non_notfound_error_on_an_id_raises(client):
+    """M10: a non-NotFound error on one id means its state is unknown, not that it is absent."""
     body = {"Orders": [O1], "Errors": [{"OrderID": "2", "Error": "Failed", "Message": "busy"}]}
-    get = _get(client, _resp(200, body))
-    assert asyncio.run(client.get_orders_by_id("SIM1", ["1", "2"])) == [O1]
-    assert get.await_count == 1
+    get = _get(client, *(_resp(200, body) for _ in range(3)))
+    with pytest.raises(BrokerReadError, match="busy"):
+        asyncio.run(client.get_orders_by_id("SIM1", ["1", "2"]))
+    assert get.await_count == 3
+
+
+def test_orders_by_id_notfound_with_empty_order_id_raises(client):
+    body = {"Orders": [O1], "Errors": [{"OrderID": "", "Error": "NotFound"}]}
+    _get(client, *(_resp(200, body) for _ in range(3)))
+    with pytest.raises(BrokerReadError):
+        asyncio.run(client.get_orders_by_id("SIM1", ["1"]))
 
 
 @pytest.mark.parametrize("method,container", [("get_orders", "Orders"),
-                                              ("get_positions", "Positions")])
-def test_scoped_non_notfound_error_beside_good_data_does_not_raise(client, method, container):
-    """The one rule: OrderID/Symbol-scoped entries are data whatever their Error value."""
-    rows = [{"Symbol": "GCZ26", "OrderID": "1"}]
-    body = {container: rows, "Errors": [{"Symbol": "XYZ", "Error": "InvalidSymbol"},
-                                        {"OrderID": "7", "Error": "Failed"}]}
-    get = _get(client, _resp(200, body))
-    assert asyncio.run(getattr(client, method)("SIM1")) == rows
-    assert get.await_count == 1
+                                              ("get_positions", "Positions"),
+                                              ("get_balances", "Balances")])
+@pytest.mark.parametrize("entry", [{"Symbol": "XYZ", "Error": "InvalidSymbol"},
+                                   {"OrderID": "7", "Error": "NotFound"}],
+                         ids=["symbol-scoped", "orderid-scoped"])
+def test_list_read_with_any_scoped_error_raises(client, method, container, entry):
+    """Final ruling: on a LIST read any Errors entry fails it - a scoped error there means
+    that item is missing from the list, so the list is not the truth."""
+    body = {container: [{"Symbol": "GCZ26", "OrderID": "1"}], "Errors": [entry]}
+    get = _get(client, *(_resp(200, body) for _ in range(3)))
+    with pytest.raises(BrokerReadError):
+        asyncio.run(getattr(client, method)("SIM1"))
+    assert get.await_count == 3
 
 
 def test_empty_scope_value_is_not_scoped(client):
@@ -264,6 +275,13 @@ def test_quotes_symbol_scoped_error_returns_good_quote(client):
     get = _get(client, _resp(200, body))
     assert asyncio.run(client.get_quotes("GCZ26,XXZ26")) == [q]
     assert get.await_count == 1
+
+
+def test_quotes_order_id_scoped_error_is_not_a_quote_scope(client):
+    body = {"Quotes": [{"Symbol": "GCZ26"}], "Errors": [{"OrderID": "7", "Error": "Failed"}]}
+    _get(client, *(_resp(200, body) for _ in range(3)))
+    with pytest.raises(BrokerReadError):
+        asyncio.run(client.get_quotes("GCZ26"))
 
 
 def test_quotes_invalid_symbol_example_returns_good_quote(client):
