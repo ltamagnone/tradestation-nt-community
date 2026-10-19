@@ -108,6 +108,26 @@ class SymbolNotFoundException(Exception):
         self.ts_error = ts_error
         self.ts_message = ts_message
 
+
+class GetBarsFailedException(Exception):
+    """
+    Raised by :meth:`TradeStationHttpClient.get_bars` on a non-200 answer.
+
+    Carries ``status_code`` so the warm-up history retry can tell a transient 5xx from a
+    permanent 4xx (strategies LESSONS §210 addendum, 2026-10-19). The message text is the
+    one the plain ``Exception`` had (``TradeStation get bars failed: HTTP <code>``): log
+    greps and callers that test ``"HTTP 5" in str(e)`` still match.
+
+    Attributes
+    ----------
+    status_code : int
+        The HTTP status code TradeStation answered.
+    """
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"TradeStation get bars failed: HTTP {status_code}")
+        self.status_code = status_code
+
 from tradestation_nt_community.common.enums import TradeStationBarUnit
 
 _ALLOWED_HOSTS = frozenset({
@@ -330,6 +350,12 @@ class TradeStationHttpClient:
         list[dict[str, Any]]
             List of bar data dictionaries.
 
+        Raises
+        ------
+        GetBarsFailedException
+            On any non-200 answer (after ``_request``'s own 429 retries); carries
+            ``status_code``.
+
         Notes
         -----
         TradeStation enforces a hard per-request cap of 57,600 intraday bars —
@@ -351,7 +377,7 @@ class TradeStationHttpClient:
         response = await self._request("GET", url, params=params)
         if response.status_code != 200:
             _log.debug(f"Get bars failed (HTTP {response.status_code}): {response.text[:500]}")
-            raise Exception(f"TradeStation get bars failed: HTTP {response.status_code}")
+            raise GetBarsFailedException(response.status_code)
         return response.json().get("Bars", [])
 
     async def search_symbols(

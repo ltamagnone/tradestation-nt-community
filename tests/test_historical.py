@@ -196,3 +196,194 @@ class TestTradeStationHistoricalClient:
         bars = await TradeStationHistoricalClient(http_client=mock_client).get_bars(
             bar_type=_make_bar_type(instrument, 5), instrument=instrument)
         assert len(bars) == len(raw) - 1
+
+
+# ---------------------------------------------------------------------------
+# Bar-history retry (strategies LESSONS §210 addendum, 2026-10-19): a failed warm-up history
+# request is retried on transient failures only (timeout / transport / HTTP 5xx), 3 attempts,
+# backoff 1 s then 3 s. Never on 4xx (incl. an exhausted 429) or a parse error.
+# ---------------------------------------------------------------------------
+
+def _raw_bars() -> list[dict]:
+    import json
+    from pathlib import Path
+    return json.loads(
+        (Path(__file__).parent / "resources" / "bars_response.json").read_text())["Bars"]
+
+
+class _Sleeps:
+    """Injectable sleep: records the backoff instead of waiting."""
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    async def __call__(self, secs: float) -> None:
+        self.calls.append(secs)
+
+
+def _retry_client(side_effect):
+    from unittest.mock import AsyncMock
+    http = MockTradeStationHttpClient()
+    http.get_bars = AsyncMock(side_effect=side_effect)
+    sleeps = _Sleeps()
+    return TradeStationHistoricalClient(http_client=http, sleep=sleeps), http, sleeps
+
+
+def _records(caplog, text: str, level: str | None = None) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if text in r.getMessage() and (level is None or r.levelname == level)]
+
+
+class TestHistoryRetry:
+
+    async def test_5xx_then_success_returns_the_bars(self, instrument, caplog):
+        from tradestation_nt_community.http.client import GetBarsFailedException
+        client, http, sleeps = _retry_client([GetBarsFailedException(503), _raw_bars()])
+        caplog.set_level("INFO")
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert len(bars) == 3
+        assert http.get_bars.await_count == 2
+        assert sleeps.calls == [1.0]
+        retry = _records(caplog, "[HIST-RETRY]", "WARNING")
+        assert len(retry) == 1
+        assert "attempt 2/3 after" in retry[0] and "HTTP 503" in retry[0]
+        assert str(_make_bar_type(instrument, 1)) in retry[0]
+        assert not _records(caplog, "Historical bar request failed for")
+
+    async def test_504_three_times_gives_up_after_three_attempts(self, instrument, caplog):
+        from tradestation_nt_community.http.client import GetBarsFailedException
+        client, http, sleeps = _retry_client([GetBarsFailedException(504)] * 3)
+        caplog.set_level("INFO")
+        bar_type = _make_bar_type(instrument, 1)
+        bars = await client.get_bars(bar_type=bar_type, instrument=instrument)
+        assert bars == []
+        assert http.get_bars.await_count == 3
+        assert sleeps.calls == [1.0, 3.0]
+        retry = _records(caplog, "[HIST-RETRY]", "WARNING")
+        assert len(retry) == 2
+        assert "attempt 2/3" in retry[0] and "attempt 3/3" in retry[1]
+        # the final failure keeps today's ERROR line, byte for byte
+        assert _records(caplog, "Historical bar request failed for", "ERROR") == [
+            f"Historical bar request failed for {bar_type}: TradeStation get bars failed: HTTP 504"
+        ]
+
+    async def test_4xx_is_never_retried(self, instrument, caplog):
+        from tradestation_nt_community.http.client import GetBarsFailedException
+        client, http, sleeps = _retry_client([GetBarsFailedException(400), _raw_bars()])
+        caplog.set_level("INFO")
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert bars == []
+        assert http.get_bars.await_count == 1
+        assert sleeps.calls == []
+        assert not _records(caplog, "[HIST-RETRY]")
+        assert _records(caplog, "Historical bar request failed for", "ERROR")
+
+    async def test_read_timeout_then_success_returns_the_bars(self, instrument, caplog):
+        import httpx
+        client, http, sleeps = _retry_client([httpx.ReadTimeout(""), _raw_bars()])
+        caplog.set_level("INFO")
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert len(bars) == 3
+        assert sleeps.calls == [1.0]
+        retry = _records(caplog, "[HIST-RETRY]", "WARNING")
+        # a timeout's message is empty: the line must still say what failed
+        assert len(retry) == 1 and "ReadTimeout" in retry[0]
+
+    async def test_connect_error_then_success_returns_the_bars(self, instrument):
+        import httpx
+        client, http, sleeps = _retry_client([httpx.ConnectError("refused"), _raw_bars()])
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert len(bars) == 3
+        assert http.get_bars.await_count == 2
+
+    async def test_parse_error_is_never_retried(self, instrument, caplog):
+        import json
+        client, http, sleeps = _retry_client(
+            [json.JSONDecodeError("Expecting value", "<html>", 0), _raw_bars()])
+        caplog.set_level("INFO")
+        bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert bars == []
+        assert http.get_bars.await_count == 1
+        assert sleeps.calls == []
+        assert not _records(caplog, "[HIST-RETRY]")
+
+    async def test_httpx_decoding_error_is_never_retried(self, instrument):
+        import httpx
+        client, http, sleeps = _retry_client([httpx.DecodingError("bad gzip"), _raw_bars()])
+        assert await client.get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument) == []
+        assert http.get_bars.await_count == 1
+
+    async def test_untyped_exception_is_never_retried(self, instrument):
+        client, http, sleeps = _retry_client([Exception("API error"), _raw_bars()])
+        assert await client.get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument) == []
+        assert http.get_bars.await_count == 1
+        assert sleeps.calls == []
+
+
+class TestHistoryRetryThroughTheHttpClient:
+    """End to end through the real TradeStationHttpClient: proves get_bars raises the typed
+    error (a plain Exception would make every 5xx look permanent)."""
+
+    @staticmethod
+    def _http(responses, max_retries: int = 3):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import AsyncMock
+        from tests.test_http_client import _mock_resp
+        from tradestation_nt_community.http.client import TradeStationHttpClient
+        http = TradeStationHttpClient(
+            client_id="c", client_secret="s", refresh_token="r", use_sandbox=True,
+            max_retries=max_retries)
+        http._access_token = "t"
+        http.token_expiry = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        http._httpx.get = AsyncMock(
+            side_effect=[_mock_resp(code, data) for code, data in responses])
+        return http
+
+    async def test_504_then_200_returns_the_bars(self, instrument):
+        http = self._http([(504, None), (200, {"Bars": _raw_bars()})])
+        sleeps = _Sleeps()
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert len(bars) == 3
+        assert http._httpx.get.await_count == 2
+        assert sleeps.calls == [1.0]
+
+    async def test_404_is_one_request(self, instrument):
+        http = self._http([(404, None), (200, {"Bars": _raw_bars()})])
+        sleeps = _Sleeps()
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert bars == []
+        assert http._httpx.get.await_count == 1
+        assert sleeps.calls == []
+
+    async def test_an_exhausted_429_is_not_retried_here(self, instrument, caplog, monkeypatch):
+        """429 stays _request's job: once it gives up, this layer sees a 4xx and stops."""
+        from tradestation_nt_community.http import client as http_mod
+
+        async def no_sleep(_s):
+            return None
+
+        monkeypatch.setattr(http_mod.asyncio, "sleep", no_sleep)  # _request's 429 wait
+        http = self._http([(429, None), (200, {"Bars": _raw_bars()})], max_retries=1)
+        sleeps = _Sleeps()
+        caplog.set_level("INFO")
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert bars == []
+        assert http._httpx.get.await_count == 1
+        assert sleeps.calls == []
+        assert not _records(caplog, "[HIST-RETRY]")
+
+    async def test_get_bars_error_keeps_its_message_and_carries_the_status(self):
+        from tradestation_nt_community.common.enums import TradeStationBarUnit
+        from tradestation_nt_community.http.client import GetBarsFailedException
+        http = self._http([(504, None)])
+        with pytest.raises(GetBarsFailedException) as ei:
+            await http.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=3)
+        assert isinstance(ei.value, Exception)
+        assert ei.value.status_code == 504
+        # log greps and the agent's data_downloader ("HTTP 5" in str(e)) match on this text
+        assert str(ei.value) == "TradeStation get bars failed: HTTP 504"
