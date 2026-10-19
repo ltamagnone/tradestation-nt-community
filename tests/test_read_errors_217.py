@@ -30,12 +30,17 @@ INCIDENT = {"Errors": [{"AccountID": "SIM2736556F", "Error": "ServiceUnavailable
 O1 = {"OrderID": "1", "Status": "OPN"}
 
 
+_JSON_NULL = object()  # a body that parses to JSON ``null``
+
+
 def _resp(status: int = 200, data=None, *, bad_json: bool = False) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status
-    resp.text = str(data or "")
+    resp.text = "null" if data is _JSON_NULL else str(data or "")
     if bad_json:
         resp.json.side_effect = ValueError("Expecting value")
+    elif data is _JSON_NULL:
+        resp.json.return_value = None
     else:
         resp.json.return_value = data if data is not None else {}
     resp.headers = {}
@@ -149,7 +154,8 @@ def test_genuine_empty_stays_empty(client, caplog):
     assert _warnings(caplog) == [] and _errors(caplog) == []
 
 
-@pytest.mark.parametrize("body", [{}, {"NextToken": None}, [O1], None])
+@pytest.mark.parametrize("body", [{}, {"NextToken": None}, {"Orders": None}, [O1], _JSON_NULL],
+                         ids=["empty", "token-only", "null-container", "list", "json-null"])
 def test_missing_container_raises(client, body):
     get = _get(client, *(_resp(200, body) for _ in range(3)))
     with pytest.raises(BrokerReadError):
@@ -216,12 +222,32 @@ def test_orders_by_id_unscoped_error_raises(client):
     assert get.await_count == 3
 
 
-def test_orders_by_id_non_notfound_error_on_an_id_raises(client):
-    """M10: a non-NotFound error on one id means its state is unknown, not that it is absent."""
-    body = {"Orders": [], "Errors": [{"OrderID": "1", "Error": "Failed", "Message": "busy"}]}
+def test_orders_by_id_non_notfound_error_on_an_id_is_scoped(client):
+    """Controller ruling (shared with the runner): an entry carrying OrderID is scoped to that
+    id whatever its Error - the good orders beside it are returned, no retry."""
+    body = {"Orders": [O1], "Errors": [{"OrderID": "2", "Error": "Failed", "Message": "busy"}]}
+    get = _get(client, _resp(200, body))
+    assert asyncio.run(client.get_orders_by_id("SIM1", ["1", "2"])) == [O1]
+    assert get.await_count == 1
+
+
+@pytest.mark.parametrize("method,container", [("get_orders", "Orders"),
+                                              ("get_positions", "Positions")])
+def test_scoped_non_notfound_error_beside_good_data_does_not_raise(client, method, container):
+    """The one rule: OrderID/Symbol-scoped entries are data whatever their Error value."""
+    rows = [{"Symbol": "GCZ26", "OrderID": "1"}]
+    body = {container: rows, "Errors": [{"Symbol": "XYZ", "Error": "InvalidSymbol"},
+                                        {"OrderID": "7", "Error": "Failed"}]}
+    get = _get(client, _resp(200, body))
+    assert asyncio.run(getattr(client, method)("SIM1")) == rows
+    assert get.await_count == 1
+
+
+def test_empty_scope_value_is_not_scoped(client):
+    body = {"Orders": [O1], "Errors": [{"OrderID": "", "Error": "ServiceUnavailable"}]}
     _get(client, *(_resp(200, body) for _ in range(3)))
-    with pytest.raises(BrokerReadError, match="busy"):
-        asyncio.run(client.get_orders_by_id("SIM1", ["1"]))
+    with pytest.raises(BrokerReadError):
+        asyncio.run(client.get_orders("SIM1"))
 
 
 def test_orders_by_id_404_still_means_none_found(client):
@@ -238,6 +264,22 @@ def test_quotes_symbol_scoped_error_returns_good_quote(client):
     get = _get(client, _resp(200, body))
     assert asyncio.run(client.get_quotes("GCZ26,XXZ26")) == [q]
     assert get.await_count == 1
+
+
+def test_quotes_invalid_symbol_example_returns_good_quote(client):
+    q = {"Symbol": "GCZ26", "Bid": "1"}
+    _get(client, _resp(200, {"Quotes": [q], "Errors": [{"Symbol": "XYZ",
+                                                         "Error": "InvalidSymbol"}]}))
+    assert asyncio.run(client.get_quotes("GCZ26,XYZ")) == [q]
+
+
+def test_quotes_no_container_with_only_scoped_errors_raises_on_purpose(client):
+    """LOW 1: no Quotes key is never read as "no quotes", even if every error is per-symbol."""
+    body = {"Errors": [{"Symbol": "XYZ", "Error": "InvalidSymbol"}]}
+    get = _get(client, *(_resp(200, body) for _ in range(3)))
+    with pytest.raises(BrokerReadError):
+        asyncio.run(client.get_quotes("XYZ"))
+    assert get.await_count == 3
 
 
 def test_quotes_account_level_error_raises(client):
