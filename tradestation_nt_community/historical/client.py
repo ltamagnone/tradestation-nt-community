@@ -31,7 +31,8 @@ _MAX_BARS_PER_REQUEST: int = 3_000
 _MIN_BARS: int = 10
 
 # Warm-up history retry (strategies LESSONS §210 addendum, 2026-10-19): a failed request is
-# tried at most _HIST_ATTEMPTS times, waiting _HIST_BACKOFF_S[i] before attempt i + 2.
+# tried at most _HIST_ATTEMPTS times, waiting _HIST_BACKOFF_S[i] before attempt i + 2 (the
+# last entry is reused if _HIST_ATTEMPTS outgrows the table).
 _HIST_ATTEMPTS: int = 3
 _HIST_BACKOFF_S: tuple[float, ...] = (1.0, 3.0)
 
@@ -130,6 +131,14 @@ class TradeStationHistoricalClient:
         self._http = http_client
         self._sleep = sleep
 
+    def _http_closed(self) -> bool:
+        """True once the shared HTTP client was closed (node shutdown).
+
+        ``getattr`` with a default and ``is True``: a mock or other http object without a
+        real ``is_closed`` counts as open.
+        """
+        return getattr(self._http, "is_closed", False) is True
+
     async def get_bars(
         self,
         bar_type: BarType,
@@ -162,7 +171,9 @@ class TradeStationHistoricalClient:
         -----
         A failed request is retried only on a transient failure (an httpx timeout or
         transport error, or HTTP 5xx): at most 3 attempts, waiting 1 s then 3 s. HTTP 4xx
-        and parse errors fail at once. Each retry logs WARNING
+        and parse errors fail at once, and so does any failure once the shared HTTP client is
+        closed (``is_closed``: a node shutdown closes it under an in-flight GET, which then
+        raises ``ReadError('')``; checked again after the backoff). Each retry logs WARNING
         ``[HIST-RETRY] {bar_type} attempt {n}/3 after {error}``, ``n`` being the attempt
         about to run (2, then 3). The final failure logs the ERROR
         ``Historical bar request failed for {bar_type}: {e}`` and returns ``[]``, as before.
@@ -203,16 +214,21 @@ class TradeStationHistoricalClient:
                 )
                 break
             except Exception as e:
-                if attempt >= _HIST_ATTEMPTS or not _is_transient(e):
+                # A closed client is a node shutdown (the ReadError('') of 2026-06-22 and
+                # 2026-09-06), not an API failure: today's ERROR, no retry.
+                if attempt >= _HIST_ATTEMPTS or not _is_transient(e) or self._http_closed():
                     _log.error(f"Historical bar request failed for {bar_type}: {e}")
                     return []
-                delay = _HIST_BACKOFF_S[attempt - 1]
+                delay = _HIST_BACKOFF_S[min(attempt, len(_HIST_BACKOFF_S)) - 1]
                 attempt += 1
                 _log.warning(
                     f"[HIST-RETRY] {bar_type} attempt {attempt}/{_HIST_ATTEMPTS} after "
                     f"{_describe(e)}"
                 )
                 await (self._sleep or asyncio.sleep)(delay)
+                if self._http_closed():  # shut down during the backoff: no further GET
+                    _log.error(f"Historical bar request failed for {bar_type}: {e}")
+                    return []
 
         if not raw_bars:
             _log.warning(f"No historical bars received for {bar_type}")

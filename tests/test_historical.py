@@ -387,3 +387,111 @@ class TestHistoryRetryThroughTheHttpClient:
         assert ei.value.status_code == 504
         # log greps and the agent's data_downloader ("HTTP 5" in str(e)) match on this text
         assert str(ei.value) == "TradeStation get bars failed: HTTP 504"
+
+
+class TestHistoryRetryShutdownGuard:
+    """A node shutdown closes the shared httpx client while the warm-up GET is in flight:
+    httpx raises ReadError(''). That is not an API failure (6 of the 7 kept-log "history
+    failures", 2026-06-22 and 2026-09-06): no retry, no [HIST-RETRY], today's ERROR."""
+
+    @staticmethod
+    def _closable(side_effect, closed: bool):
+        import types
+        from unittest.mock import AsyncMock
+        http = MockTradeStationHttpClient()
+        http._httpx = types.SimpleNamespace(is_closed=closed)
+        http.get_bars = AsyncMock(side_effect=side_effect)
+        return http
+
+    async def test_read_error_on_a_closed_client_is_not_retried(self, instrument, caplog):
+        import httpx
+        http = self._closable([httpx.ReadError(""), _raw_bars()], closed=True)
+        sleeps = _Sleeps()
+        caplog.set_level("INFO")
+        bar_type = _make_bar_type(instrument, 1)
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=bar_type, instrument=instrument)
+        assert bars == []
+        assert http.get_bars.await_count == 1
+        assert sleeps.calls == []
+        assert not _records(caplog, "[HIST-RETRY]")
+        assert _records(caplog, "Historical bar request failed for", "ERROR") == [
+            f"Historical bar request failed for {bar_type}: "]
+
+    async def test_client_closed_during_the_backoff_stops_before_the_next_get(
+        self, instrument, caplog,
+    ):
+        import httpx
+        http = self._closable([httpx.ReadError(""), _raw_bars()], closed=False)
+
+        async def closing_sleep(_s):
+            http._httpx.is_closed = True   # node shutdown while we wait
+
+        caplog.set_level("INFO")
+        bar_type = _make_bar_type(instrument, 1)
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=closing_sleep).get_bars(
+            bar_type=bar_type, instrument=instrument)
+        assert bars == []
+        assert http.get_bars.await_count == 1
+        assert _records(caplog, "Historical bar request failed for", "ERROR") == [
+            f"Historical bar request failed for {bar_type}: "]
+
+    async def test_real_client_closed_mid_request_is_not_retried(self, instrument, caplog):
+        """End to end: TradeStationHttpClient.close() while the GET awaits -> ReadError."""
+        import httpx
+        http = TestHistoryRetryThroughTheHttpClient._http([])
+
+        async def get_then_shutdown(*_a, **_kw):
+            await http.close()
+            raise httpx.ReadError("")
+
+        http._httpx.get = get_then_shutdown
+        sleeps = _Sleeps()
+        caplog.set_level("INFO")
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert bars == []
+        assert sleeps.calls == []
+        assert not _records(caplog, "[HIST-RETRY]")
+        assert _records(caplog, "Historical bar request failed for", "ERROR")
+
+    async def test_http_client_is_closed_property(self):
+        http = TestHistoryRetryThroughTheHttpClient._http([])
+        assert http.is_closed is False
+        await http.close()
+        assert http.is_closed is True
+
+    async def test_an_http_object_without_is_closed_still_retries(self, instrument):
+        """A mock / other http object with no is_closed: treated as open (getattr default)."""
+        import types
+        from unittest.mock import AsyncMock
+        from tradestation_nt_community.http.client import GetBarsFailedException
+        http = types.SimpleNamespace(
+            get_bars=AsyncMock(side_effect=[GetBarsFailedException(502), _raw_bars()]))
+        sleeps = _Sleeps()
+        bars = await TradeStationHistoricalClient(http_client=http, sleep=sleeps).get_bars(
+            bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+        assert len(bars) == 3
+        assert sleeps.calls == [1.0]
+
+
+async def test_backoff_never_runs_past_its_table(instrument, caplog, monkeypatch):
+    """M1: more attempts than backoff entries reuse the last delay (no IndexError)."""
+    from tradestation_nt_community.historical import client as hist_mod
+    from tradestation_nt_community.http.client import GetBarsFailedException
+    monkeypatch.setattr(hist_mod, "_HIST_ATTEMPTS", 4)
+    client, http, sleeps = _retry_client([GetBarsFailedException(504)] * 4)
+    caplog.set_level("INFO")
+    bars = await client.get_bars(bar_type=_make_bar_type(instrument, 1), instrument=instrument)
+    assert bars == []
+    assert http.get_bars.await_count == 4
+    assert sleeps.calls == [1.0, 3.0, 3.0]
+    assert _records(caplog, "Historical bar request failed for", "ERROR")
+
+
+def test_get_bars_failed_exception_is_exported():
+    from tradestation_nt_community import GetBarsFailedException
+    import tradestation_nt_community as pkg
+    from tradestation_nt_community.http.client import GetBarsFailedException as Direct
+    assert GetBarsFailedException is Direct
+    assert "GetBarsFailedException" in pkg.__all__

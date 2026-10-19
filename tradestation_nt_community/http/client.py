@@ -224,6 +224,11 @@ class TradeStationHttpClient:
         """Current OAuth access token (read-only)."""
         return self._access_token
 
+    @property
+    def is_closed(self) -> bool:
+        """True once :meth:`close` closed the underlying httpx client (read-only)."""
+        return self._httpx.is_closed
+
     def set_token_rotation_callback(self, callback: Callable[[str], None]) -> None:
         """Register a callback invoked whenever the OAuth refresh token rotates.
 
