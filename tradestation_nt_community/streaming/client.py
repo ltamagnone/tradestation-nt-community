@@ -209,8 +209,13 @@ class TradeStationStreamClient:
                                     pause_next = True
                                     if "No data available" in detail:
                                         # A closed market's idle stream (FDAX/FCX after their
-                                        # close, 2026-10-16): expected, not an error.
-                                        _log.info(f"[STREAM-STATUS] {url}: {detail} (market closed)")
+                                        # close, 2026-10-16): expected, not an error. During
+                                        # market hours only a listed, never-traded contract
+                                        # (ESZ28) gives it (strategies LESSONS §210).
+                                        _log.info(
+                                            f"[STREAM-STATUS] {url}: {detail} "
+                                            "(market closed or contract not traded yet)"
+                                        )
                                     else:
                                         _log.error(f"[STREAM-ERROR] {url}: {detail}")
                                 elif kind == "EndSnapshot":

@@ -767,4 +767,9 @@ class TestControlEvents:
                 break
         assert "[STREAM-ERROR]" not in caplog.text
         assert "[STREAM-STATUS]" in caplog.text and "No data available" in caplog.text
+        # During market hours only a listed, never-traded contract (ESZ28) gives it (§210)
+        status = [r for r in caplog.records if "[STREAM-STATUS]" in r.getMessage()]
+        assert len(status) == 1 and status[0].levelname == "INFO"
+        assert status[0].getMessage().endswith(
+            "No data available. (market closed or contract not traded yet)")
         assert sleeps == [sc._max_delay]
