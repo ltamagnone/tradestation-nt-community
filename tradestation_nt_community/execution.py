@@ -1296,7 +1296,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 "avg_px_present": ts_fill_price(ts_order) is not None,
                 "requested_cancel": bool(requested),
             }
-            sig = json.dumps(rec, sort_keys=True)
+            sig = json.dumps(rec, sort_keys=True, default=str)
             if self._shadow_own_sig.get(client_order_id) == sig:
                 return
             self._remember_shadow_sig(client_order_id, sig)
@@ -1360,7 +1360,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                             "minted_coid": str(client_order_id),
                             "symbol": symbol,
                             "status": ts_order.get("Status", ""),
-                        }, sort_keys=True))
+                        }, sort_keys=True, default=str))
 
                 order_instrument_id = instrument_id or InstrumentId.from_str(
                     f"{symbol}.TRADESTATION",
@@ -1647,6 +1647,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 "[ORDER-SUBMIT] " + json.dumps(
                     {**order_attribution(order), "ts_order_id": ts_order_id},
                     sort_keys=True,
+                    default=str,
                 )
             )
 
@@ -1800,7 +1801,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"[GROUP-PARTIAL] {group_type} group for OrderList {command.order_list.id}: "
                 f"{len(e.landed_order_ids)}/{len(orders)} legs landed ({e.ts_message}) - "
                 f"cancelling the landed legs at the broker; every leg rejected in NT; "
-                f"body={json.dumps(e.body)[:500] if e.body is not None else 'n/a'}")
+                f"body={json.dumps(e.body, default=str)[:500] if e.body is not None else 'n/a'}")
             await TradeStationExecutionClient._cancel_group_legs_and_reject(
                 self, command,
                 [(None, t) for t in e.landed_order_ids] + [(o, None) for o in orders],

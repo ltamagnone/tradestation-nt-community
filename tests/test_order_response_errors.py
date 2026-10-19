@@ -172,3 +172,37 @@ async def test_late_accept_still_skips_uncached_legs():
     stub._cache.order.side_effect = lambda coid: {"O-0": closed}.get(coid)   # O-1 uncached
     await C._submit_order_group(stub, cmd, "OCO", [{}, {}])
     assert stub.generate_order_rejected.call_count == 0
+
+
+async def test_group_partial_unserialisable_body_still_cancels_and_rejects():
+    """A body json.dumps cannot render must not stop the landed legs from being cancelled:
+    the log line formats it with default=str (2026-10-19 item 4)."""
+    stub, cmd = _group_stub([False, False])
+    stub._client.place_order_group = AsyncMock(side_effect=OrderGroupPartialException(
+        "leg 2 rejected", ["90"], body={"Orders": [{"OrderID": "90", "x": object()}]}))
+    await C._submit_order_group(stub, cmd, "OCO", [{}, {}])
+    stub._client.cancel_order.assert_awaited_once_with("90")
+    assert stub.generate_order_rejected.call_count == 2
+    stub.generate_order_accepted.assert_not_called()
+    logged = [str(c.args[0]) for c in stub._log.error.call_args_list
+              if "[GROUP-PARTIAL]" in str(c.args[0])]
+    assert logged and '"OrderID": "90"' in logged[0] and "<object object at" in logged[0]
+
+
+async def test_order_submit_log_cannot_reject_a_placed_order(monkeypatch):
+    """[ORDER-SUBMIT] is formatted after TradeStation placed the order and before
+    OrderAccepted: a value json.dumps cannot render must not turn a live order into an NT
+    rejection (default=str, 2026-10-19 item 4)."""
+    from tests.test_kit import make_market_order
+    from tests.test_order_attribution import _build_submit_command, _make_submit_order_stub
+    from tradestation_nt_community import execution as exec_mod
+
+    marker = object()
+    monkeypatch.setattr(exec_mod, "order_attribution", lambda order: {"tags": [marker]})
+    stub = _make_submit_order_stub()
+    await C._submit_order(stub, _build_submit_command(make_market_order(tags=None)))
+    stub.generate_order_accepted.assert_called_once()
+    stub.generate_order_rejected.assert_not_called()
+    logged = [str(c.args[0]) for c in stub._log.info.call_args_list
+              if c.args and "[ORDER-SUBMIT]" in str(c.args[0])]
+    assert logged and '"ts_order_id": "TS-123"' in logged[0]
