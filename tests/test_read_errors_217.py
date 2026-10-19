@@ -306,13 +306,68 @@ def test_quotes_account_level_error_raises(client):
         asyncio.run(client.get_quotes("GCZ26"))
 
 
-def test_bars_missing_container_raises_and_good_body_returns(client):
-    _get(client, *(_resp(200, {"Errors": [{"Error": "ServiceUnavailable"}]}) for _ in range(3)))
+def test_bars_200_body_error_raises_once_without_the_read_retry(client):
+    """get_bars on HTTP 200: the §217 body check, but NO read retry - the warm-up history
+    layer ([HIST-RETRY], §210 addendum) is the single retrier for bars."""
+    get = _get(client, _resp(200, {"Errors": [{"Error": "ServiceUnavailable"}]}))
+    with pytest.raises(BrokerReadError, match="ServiceUnavailable"):
+        asyncio.run(client.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=2))
+    assert get.await_count == 1
+    client.sleeps.assert_not_awaited()
+
+
+@pytest.mark.parametrize("body", [{}, {"Bars": None}, _JSON_NULL],
+                         ids=["missing", "null-container", "json-null"])
+def test_bars_missing_container_raises_once(client, body):
+    get = _get(client, _resp(200, body))
     with pytest.raises(BrokerReadError):
         asyncio.run(client.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=2))
+    assert get.await_count == 1
+
+
+def test_bars_good_body_and_symbol_scoped_error_return_bars(client):
     _get(client, _resp(200, {"Bars": [{"Close": "1"}]}))
     assert asyncio.run(
         client.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=2)) == [{"Close": "1"}]
+    _get(client, _resp(200, {"Bars": [{"Close": "1"}],
+                             "Errors": [{"Symbol": "XYZ", "Error": "InvalidSymbol"}]}))
+    assert asyncio.run(
+        client.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=2)) == [{"Close": "1"}]
+
+
+def test_bars_non_200_keeps_get_bars_failed_exception_without_read_retry(client):
+    from tradestation_nt_community.http.client import GetBarsFailedException
+    get = _get(client, _resp(503, {}))
+    with pytest.raises(GetBarsFailedException) as ei:
+        asyncio.run(client.get_bars("GCZ26", "1", TradeStationBarUnit.MINUTE, barsback=2))
+    assert ei.value.status_code == 503
+    assert not isinstance(ei.value, BrokerReadError)
+    assert get.await_count == 1
+    client.sleeps.assert_not_awaited()
+
+
+def test_history_layer_treats_broker_read_error_as_permanent(client, caplog):
+    """Warm-up history: a 200 error body is one GET, no [HIST-RETRY], the usual ERROR and []."""
+    from nautilus_trader.model.data import BarSpecification, BarType
+    from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
+    from tests.test_kit import TSTestInstrumentStubs
+    from tradestation_nt_community.historical.client import TradeStationHistoricalClient
+
+    caplog.set_level(logging.WARNING)
+    instrument = TSTestInstrumentStubs.gc_futures_contract()
+    bar_type = BarType(instrument_id=instrument.id,
+                       bar_spec=BarSpecification(1, BarAggregation.MINUTE, PriceType.LAST),
+                       aggregation_source=AggregationSource.EXTERNAL)
+    get = _get(client, _resp(200, INCIDENT), _resp(200, {"Bars": []}))
+    hist_sleep = AsyncMock()
+    hist = TradeStationHistoricalClient(http_client=client, sleep=hist_sleep)
+    assert asyncio.run(hist.get_bars(bar_type=bar_type, instrument=instrument)) == []
+    assert get.await_count == 1
+    hist_sleep.assert_not_awaited()
+    client.sleeps.assert_not_awaited()
+    text = caplog.text
+    assert "[HIST-RETRY]" not in text
+    assert "Historical bar request failed" in text and "ServiceUnavailable" in text
 
 
 # ----------------------------------------------------------------------------- HTTP status
