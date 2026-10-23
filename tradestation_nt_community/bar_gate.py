@@ -21,8 +21,7 @@ The gate can therefore also
 All of it is pure state; the data client owns the timers and the I/O.
 """
 
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 
 import pandas as pd
 

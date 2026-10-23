@@ -5,15 +5,15 @@ These tests exercise bar_spec_to_ts_params() and parse_bars() directly via the
 module-level functions in data.py, requiring no live client or network calls.
 """
 import pytest
-
-from tradestation_nt_community.common.enums import TradeStationBarUnit
-from tradestation_nt_community.data import bar_spec_to_ts_params, parse_bars
 from nautilus_trader.model.data import Bar, BarSpecification, BarType
 from nautilus_trader.model.enums import AggregationSource, BarAggregation, PriceType
+
 from tests.test_kit import (
     TSTestDataStubs,
     TSTestInstrumentStubs,
 )
+from tradestation_nt_community.common.enums import TradeStationBarUnit
+from tradestation_nt_community.data import bar_spec_to_ts_params, parse_bars
 
 
 def _make_spec(step: int, aggregation: BarAggregation) -> BarSpecification:
@@ -199,3 +199,59 @@ class TestBarParsing:
         bars = parse_bars(raw, bar_type)
         timestamps = [b.ts_event for b in bars]
         assert timestamps == sorted(timestamps)
+
+
+def test_config_default_off_and_factory_passes_mode(monkeypatch):
+    """bar_release_mode (plan 2026-10-23): default off; the factory passes it through."""
+    from unittest.mock import MagicMock
+
+    from tradestation_nt_community import factories
+    from tradestation_nt_community.config import TradeStationDataClientConfig
+
+    assert TradeStationDataClientConfig().bar_release_mode == "off"
+    created = MagicMock()
+    monkeypatch.setattr(factories, "TradeStationDataClient", created)
+    monkeypatch.setattr(factories, "get_cached_tradestation_http_client", lambda **kw: object())
+    monkeypatch.setattr(
+        factories, "get_cached_tradestation_instrument_provider", lambda **kw: object()
+    )
+    factories.TradeStationLiveDataClientFactory.create(
+        loop=None, name="TS", config=TradeStationDataClientConfig(bar_release_mode="shadow"),
+        msgbus=None, cache=None, clock=None,
+    )
+    assert created.call_args.kwargs["bar_release_mode"] == "shadow"
+
+
+def test_unknown_bar_release_mode_falls_back_to_off():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from nautilus_trader.common.providers import InstrumentProvider
+    from nautilus_trader.test_kit.stubs.component import TestComponentStubs
+
+    from tradestation_nt_community.data import TradeStationDataClient
+
+    loop = asyncio.new_event_loop()
+    try:
+        client = TradeStationDataClient(
+            loop=loop,
+            client=MagicMock(),
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+            instrument_provider=InstrumentProvider(),
+            bar_release_mode="ON ",
+        )
+        assert client._bar_release_mode == "off"
+        ok = TradeStationDataClient(
+            loop=loop,
+            client=MagicMock(),
+            msgbus=TestComponentStubs.msgbus(),
+            cache=TestComponentStubs.cache(),
+            clock=TestComponentStubs.clock(),
+            instrument_provider=InstrumentProvider(),
+            bar_release_mode="shadow",
+        )
+        assert ok._bar_release_mode == "shadow"
+    finally:
+        loop.close()

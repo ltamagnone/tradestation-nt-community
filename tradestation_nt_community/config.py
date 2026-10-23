@@ -2,6 +2,8 @@
 TradeStation adapter configuration.
 """
 
+from typing import Literal
+
 from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 
@@ -36,6 +38,13 @@ class TradeStationDataClientConfig(LiveDataClientConfig, frozen=True):
         The initial delay (milliseconds) between retry attempts (exponential backoff).
     retry_delay_max_ms : int, default 60000
         The maximum delay (milliseconds) between retry attempts.
+    bar_release_mode : {"off", "shadow", "on"}, default "off"
+        Late thin-hour stream bars (strategies plan 2026-10-23). TradeStation can close a bar
+        only with the next trade, merge the next period's trades into it, and never send the
+        next bar. "on" emits a bar with no ``Closed`` by end + 10 s as it stood, and fetches a
+        missing period from REST history before the next bar. "shadow" only logs what "on"
+        would do (``[BAR-RELEASE-SHADOW]``, ``[BAR-BACKFILL-SHADOW]``, ``[BAR-SNAPSHOT]``);
+        emissions are unchanged. "off" is the plain gate. Never for DAY bars nor polling.
 
     """
 
@@ -54,6 +63,7 @@ class TradeStationDataClientConfig(LiveDataClientConfig, frozen=True):
     use_streaming: bool = True  # Use SSE streaming for bars (lower latency than polling)
     streaming_reconnect_delay_secs: float = 5.0  # Initial SSE reconnect delay (doubles on failure)
     extended_hours: bool = False  # If True, use USEQPreAndPost session template for equity bar streams
+    bar_release_mode: Literal["off", "shadow", "on"] = "off"  # late-bar release/backfill
 
 
 class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):

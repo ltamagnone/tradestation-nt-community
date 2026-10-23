@@ -9,6 +9,7 @@ import pandas as pd
 
 from tradestation_nt_community.bar_gate import BarCloseGate
 from tradestation_nt_community.bar_gate import bar_end_ns
+from tradestation_nt_community.bar_gate import ohlcv
 from tradestation_nt_community.common.enums import TradeStationBarUnit
 from tradestation_nt_community.constants import TRADESTATION_CLIENT_ID
 from tradestation_nt_community.constants import TRADESTATION_VENUE
@@ -52,6 +53,56 @@ _BAR_AGG_SECS = {
 # watermark are replayed, so a reconnect gap of up to 9 bars loses nothing (strategies
 # LESSONS §207). Older seed bars are dropped by the gate, so the extra history is harmless.
 _STREAM_BARSBACK = 10
+
+# Late thin-hour bars (plan 2026-10-23, ``bar_release_mode``). In thin hours TradeStation closes
+# a stream bar only with the next trade, can merge the next period's trades into it, and can
+# then never send the next bar. "shadow" measures what a release / backfill would do (log only,
+# emissions unchanged), "on" does it, "off" is the old path. Never for DAY bars, never polling.
+_CLOSE_GRACE_NS = 10_000_000_000  # no Closed by end + 10 s: release the bar as it stood
+_SNAPSHOT_OFFSETS_NS = (0, 2_000_000_000, 10_000_000_000, 30_000_000_000)  # [BAR-SNAPSHOT]
+_BACKFILL_DELAY_S = 120.0  # mode on: REST read at missing_end + this ...
+_BACKFILL_RETRY_S = 60.0  # ... and once more after this if a missing bar is still Open
+_BACKFILL_MAX_PERIODS = 3  # a longer gap is a session break or an outage, not a hole
+_BACKFILL_SHADOW_DELAYS_S = (60.0, 120.0, 180.0, 300.0)  # shadow: measure when REST has it
+_VERIFY_DELAY_S = 120.0  # [BAR-RELEASE-DIVERGED]: REST read at bar end + this
+_BAR_RELEASE_MODES = ("off", "shadow", "on")
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _intraday_step_ns(bar_type) -> int | None:
+    """Bar step in ns for MINUTE/HOUR bars; None for DAY and anything unknown."""
+    spec = getattr(bar_type, "spec", None)
+    if spec is None or getattr(spec, "aggregation", None) == BarAggregation.DAY:
+        return None
+    secs = _bar_interval_secs(bar_type)
+    return secs * 1_000_000_000 if secs else None
+
+
+def _ts_str(ts_ns: int) -> str:
+    return pd.Timestamp(ts_ns, unit="ns", tz="UTC").strftime(_TS_FMT)
+
+
+def _ohlcv_str(event: dict) -> str:
+    return "/".join(str(event.get(k)) for k in ("Open", "High", "Low", "Close", "TotalVolume"))
+
+
+def _cancel_bar_jobs(client, bar_type) -> None:
+    """Cancel a bar type's release timer and backfill (every reset / unsubscribe / reconnect /
+    disconnect path). A cancelled backfill rolls its hold back: parked bars never reached a
+    strategy, and the next connection's seed replays them in order."""
+    timers = getattr(client, "_release_timers", None)
+    if timers is None:  # a minimal fake self (older tests)
+        return
+    handle = timers.pop(bar_type, None)
+    if handle is not None:
+        handle.cancel()
+    client._release_targets.pop(bar_type, None)
+    task = client._backfill_tasks.pop(bar_type, None)
+    gate = client._bar_gates.get(bar_type)
+    if gate is not None:
+        gate.abort_backfill()
+    if task is not None:
+        task.cancel()
 
 
 def _bar_interval_secs(bar_type) -> int | None:
@@ -99,6 +150,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         use_streaming: bool = False,
         streaming_reconnect_delay_secs: float = 5.0,
         extended_hours: bool = False,
+        bar_release_mode: str = "off",
     ) -> None:
         super().__init__(
             loop=loop,
@@ -136,6 +188,20 @@ class TradeStationDataClient(LiveMarketDataClient):
         # One BarCloseGate per bar type; never cleared, so its watermark survives reconnects
         # and watchdog task restarts (strategies LESSONS §207).
         self._bar_gates: dict[BarType, BarCloseGate] = {}
+        # Late-bar release / backfill (plan 2026-10-23): asyncio timers only (no LiveClock
+        # timers, their callbacks run on a tokio thread - strategies LESSONS §210).
+        if bar_release_mode not in _BAR_RELEASE_MODES:
+            self._log.error(
+                f"bar_release_mode={bar_release_mode!r} is not one of {_BAR_RELEASE_MODES} - "
+                f"using 'off'"
+            )
+            bar_release_mode = "off"
+        self._bar_release_mode = bar_release_mode
+        self._release_timers: dict[BarType, asyncio.TimerHandle] = {}
+        self._release_targets: dict[BarType, int] = {}  # armed release time (ns) per bar type
+        self._release_fired: dict[BarType, int] = {}  # newest release time already handled
+        self._backfill_tasks: dict[BarType, asyncio.Task] = {}
+        self._verify_tasks: dict[BarType, set] = {}  # [BAR-RELEASE-DIVERGED] REST reads
 
         # Quote/trade tick state (polling or streaming tasks)
         self._quote_subscriptions: dict[InstrumentId, asyncio.Task] = {}
@@ -184,6 +250,13 @@ class TradeStationDataClient(LiveMarketDataClient):
                     pass
             tasks.clear()
 
+        for bar_type in set(self._release_timers) | set(self._backfill_tasks):
+            _cancel_bar_jobs(self, bar_type)
+        self._release_fired.clear()
+        for tasks in list(self._verify_tasks.values()):
+            for task in list(tasks):
+                task.cancel()
+        self._verify_tasks.clear()
         await _cancel(self._bar_subscriptions)
         await _cancel(self._quote_subscriptions)
         await _cancel(self._trade_subscriptions)
@@ -305,6 +378,7 @@ class TradeStationDataClient(LiveMarketDataClient):
         """
         self._log.info(f"Bar SSE stream started for {bar_type}")
         gate = self._bar_gates.setdefault(bar_type, BarCloseGate())
+        _cancel_bar_jobs(self, bar_type)
         gate.reset_connection()
 
         try:
@@ -325,6 +399,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                 barsback=_STREAM_BARSBACK,
             ):
                 if event.get("_reconnected"):
+                    _cancel_bar_jobs(self, bar_type)
                     gate.reset_connection()
                     continue
                 self._emit_gated(gate, event, bar_type, instrument)
@@ -343,7 +418,8 @@ class TradeStationDataClient(LiveMarketDataClient):
         """Feed one TradeStation bar event through ``gate`` and emit what it releases.
 
         ``live_stream`` is False for polling, where every bar is history: only a stream's
-        reconnect seed can replay a bar that closed during a gap.
+        reconnect seed can replay a bar that closed during a gap. Release / backfill
+        (``bar_release_mode``) run for intraday stream bars only.
         """
         ts_ns = bar_end_ns(event.get("TimeStamp", ""))
         if ts_ns is None:
@@ -356,21 +432,303 @@ class TradeStationDataClient(LiveMarketDataClient):
                 f"- not fed to the gate"
             )
             return
-        for raw in gate.on_event(event, ts_ns):
-            if raw.get("BarStatus") != "Closed":
-                self._log.info(
-                    f"[BAR-CLOSE-FALLBACK] {bar_type} ts={raw.get('TimeStamp')}: no Closed "
-                    f"event - emitted on the next bar's first update"
+        mode = self._bar_release_mode if live_stream else "off"
+        step_ns = _intraday_step_ns(bar_type) if mode != "off" else None
+        if step_ns is None:
+            mode = "off"  # DAY bars and polling: the plain gate
+        now_ns = self._clock.timestamp_ns() if mode != "off" else None
+        if mode != "off":
+            # Before on_event: in mode on the barrier must exist before the later bar is fed.
+            self._maybe_start_backfill(gate, ts_ns, step_ns, bar_type, instrument, mode)
+        for raw in gate.on_event(event, ts_ns, now_ns=now_ns):
+            self._log_emit_kind(raw, bar_type, live_stream)
+            if (
+                mode != "off"
+                and raw.get("BarStatus") == "Closed"
+                and raw.get("IsRealtime") is not False
+            ):
+                self._log_snapshot(gate, raw, bar_type, now_ns)
+            self._emit_released(raw, bar_type, instrument)
+        if mode == "off":
+            return
+        self._drain_diverged(gate, bar_type)
+        pending_ns = gate.pending_end_ns
+        if pending_ns is not None:
+            self._arm_release(bar_type, instrument, pending_ns + _CLOSE_GRACE_NS)
+
+    def _log_emit_kind(self, raw: dict, bar_type: BarType, live_stream: bool) -> None:
+        if raw.get("BarStatus") != "Closed":
+            self._log.info(
+                f"[BAR-CLOSE-FALLBACK] {bar_type} ts={raw.get('TimeStamp')}: no Closed "
+                f"event - emitted on the next bar's first update"
+            )
+        elif live_stream and raw.get("IsRealtime") is False:
+            self._log.info(
+                f"[BAR-GAP-REPLAY] {bar_type} ts={raw.get('TimeStamp')}: closed while the "
+                f"stream was down - replayed from the reconnect seed"
+            )
+
+    def _emit_released(
+        self,
+        raw: dict,
+        bar_type: BarType,
+        instrument: Instrument,
+        tag: str | None = None,
+    ) -> bool:
+        """Hand one raw bar to NT. ``tag`` is "[BAR-RELEASE]" or "[BAR-BACKFILL]"."""
+        if tag == "[BAR-RELEASE]":
+            self._log.info(
+                f"[BAR-RELEASE] {bar_type} ts={raw.get('TimeStamp')}: no Closed event by end + "
+                f"{_CLOSE_GRACE_NS // 1_000_000_000} s - emitted as it stood "
+                f"O/H/L/C/V={_ohlcv_str(raw)}"
+            )
+        elif tag == "[BAR-BACKFILL]":
+            self._log.info(
+                f"[BAR-BACKFILL] {bar_type} ts={raw.get('TimeStamp')}: never sent by the stream "
+                f"- emitted from REST history O/H/L/C/V={_ohlcv_str(raw)}"
+            )
+        bars = self._parse_bars([raw], bar_type, instrument)
+        for bar in bars:
+            self._handle_data(bar)
+            self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
+        self._log.debug(f"Bar emitted for {bar_type}: ts={raw.get('TimeStamp')}")
+        return bool(bars)
+
+    def _log_snapshot(self, gate: BarCloseGate, raw: dict, bar_type: BarType, now_ns) -> None:
+        """DEBUG [BAR-SNAPSHOT]: did the bar as it stood at end + N s equal its Closed?"""
+        ts_ns = bar_end_ns(raw.get("TimeStamp", ""))
+        snaps = gate.snapshots(ts_ns)
+        closed = ohlcv(raw)
+        parts = []
+        for off in _SNAPSHOT_OFFSETS_NS:
+            snap = snaps.get(off)
+            parts.append(
+                f"eq{off // 1_000_000_000}={None if snap is None else ohlcv(snap[1]) == closed}"
+            )
+        snap10 = snaps.get(_CLOSE_GRACE_NS)
+        self._log.debug(
+            f"[BAR-SNAPSHOT] {bar_type} ts={raw.get('TimeStamp')} "
+            f"closed_lag_s={(now_ns - ts_ns) / 1e9:.3f} {' '.join(parts)} "
+            f"vol_closed={raw.get('TotalVolume')} "
+            f"vol10={None if snap10 is None else snap10[1].get('TotalVolume')}"
+        )
+
+    def _arm_release(self, bar_type: BarType, instrument: Instrument, target_ns: int) -> None:
+        """Wake at ``target_ns`` (pending end + grace) for the forming bar; one timer per type."""
+        if self._release_targets.get(bar_type) == target_ns:
+            return
+        if target_ns <= self._release_fired.get(bar_type, -1):
+            return  # already handled (shadow keeps the pending bar for its real Closed)
+        old = self._release_timers.pop(bar_type, None)
+        if old is not None:
+            old.cancel()
+        delay = max(0.0, (target_ns - self._clock.timestamp_ns()) / 1e9)
+        self._release_timers[bar_type] = self._loop.call_later(
+            delay, self._on_release_due, bar_type, instrument, target_ns
+        )
+        self._release_targets[bar_type] = target_ns
+
+    def _on_release_due(self, bar_type: BarType, instrument: Instrument, target_ns: int) -> None:
+        """Release timer callback (event loop). A stale callback finds nothing to do."""
+        try:
+            if self._release_targets.get(bar_type) != target_ns:
+                return  # re-armed or cancelled since
+            self._release_timers.pop(bar_type, None)
+            self._release_targets.pop(bar_type, None)
+            gate = self._bar_gates.get(bar_type)
+            if gate is None or gate.pending_end_ns is None:
+                return  # its Closed came
+            if gate.pending_end_ns + _CLOSE_GRACE_NS != target_ns:
+                return  # another bar is forming now
+            now_ns = self._clock.timestamp_ns()
+            if now_ns < target_ns:  # call_later runs on monotonic time: fired marginally early
+                self._arm_release(bar_type, instrument, target_ns)
+                return
+            self._release_fired[bar_type] = target_ns
+            if self._bar_release_mode == "shadow":
+                for raw in gate.release_due(now_ns, _CLOSE_GRACE_NS, commit=False):
+                    self._log.info(
+                        f"[BAR-RELEASE-SHADOW] {bar_type} would emit ts={raw.get('TimeStamp')} "
+                        f"O/H/L/C/V={_ohlcv_str(raw)}"
+                    )
+            elif self._bar_release_mode == "on":
+                for raw in gate.release_due(now_ns, _CLOSE_GRACE_NS):
+                    self._emit_released(raw, bar_type, instrument, tag="[BAR-RELEASE]")
+        except Exception as e:  # noqa: BLE001 - asyncio would swallow it into its own logger
+            self._log.error(f"Bar release timer failed for {bar_type}: {e!r}")
+
+    def _drain_diverged(self, gate: BarCloseGate, bar_type: BarType) -> None:
+        """One REST read per released bar whose Closed differed (shadow and on)."""
+        while gate.diverged:
+            ts_ns, snap, event = gate.diverged.pop(0)
+            task = self._loop.create_task(self._verify_divergence(bar_type, ts_ns, snap, event))
+            tasks = self._verify_tasks.setdefault(bar_type, set())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _verify_divergence(
+        self, bar_type: BarType, ts_ns: int, snap: tuple, event: dict,
+    ) -> None:
+        """INFO [BAR-RELEASE-DIVERGED], exactly once: the snapshot vs the Closed vs REST.
+
+        ``rest_eq_snapshot``: True (TradeStation merged the next bar into the stream's Closed),
+        False, ``open`` (REST still forming), ``missing``, ``error`` or ``cancelled``.
+        """
+        result = "error"
+        try:
+            delay = ts_ns / 1e9 + _VERIFY_DELAY_S - self._clock.timestamp_ns() / 1e9
+            if delay > 0:
+                await asyncio.sleep(delay)
+            interval, unit = bar_spec_to_ts_params(bar_type.spec)
+            raws = await self._client.get_bars(
+                symbol=bar_type.instrument_id.symbol.value,
+                interval=interval,
+                unit=unit,
+                barsback=_STREAM_BARSBACK,
+            )
+            rest = next(
+                (r for r in raws or [] if bar_end_ns(r.get("TimeStamp", "")) == ts_ns), None
+            )
+            if rest is None:
+                result = "missing"
+            elif rest.get("BarStatus") != "Closed":
+                result = "open"
+            else:
+                result = str(ohlcv(rest) == snap)
+        except asyncio.CancelledError:
+            result = "cancelled"
+            raise
+        except Exception:  # noqa: BLE001 - any failure is reported as rest_eq_snapshot=error
+            result = "error"
+        finally:
+            self._log.info(
+                f"[BAR-RELEASE-DIVERGED] {bar_type} ts={_ts_str(ts_ns)} "
+                f"snapshot={'/'.join(map(str, snap))} closed={_ohlcv_str(event)} "
+                f"rest_eq_snapshot={result}"
+            )
+
+    def _maybe_start_backfill(
+        self,
+        gate: BarCloseGate,
+        ts_ns: int,
+        step_ns: int,
+        bar_type: BarType,
+        instrument: Instrument,
+        mode: str,
+    ) -> None:
+        """A later bar arrived over a hole: fetch the missing period(s) from REST history.
+
+        Triggered by the later bar, never by the wall clock (a no-trade period, a session
+        close or a dead stream sends no later bar). Mode on holds every emission above the
+        hole until the backfill is done, so strategies see the bars in order.
+        """
+        task = self._backfill_tasks.get(bar_type)
+        if task is not None and not task.done():
+            return
+        periods = gate.missing_periods(ts_ns, step_ns, _BACKFILL_MAX_PERIODS)
+        if not periods:
+            return
+        barrier_ns = gate.effective_watermark(ts_ns)
+        gate.begin_backfill(periods)
+        if mode == "on":
+            gate.hold(barrier_ns)
+        self._backfill_tasks[bar_type] = self._loop.create_task(
+            self._backfill(gate, bar_type, instrument, periods, mode)
+        )
+
+    async def _backfill(
+        self,
+        gate: BarCloseGate,
+        bar_type: BarType,
+        instrument: Instrument,
+        periods: list[int],
+        mode: str,
+    ) -> None:
+        """Read the missing period(s) from REST; log them (shadow) or emit them (on)."""
+        missing = ",".join(_ts_str(p) for p in periods)
+        wanted = set(periods)
+        last_end_s = periods[-1] / 1e9
+        targets = (
+            _BACKFILL_SHADOW_DELAYS_S
+            if mode == "shadow"
+            else (_BACKFILL_DELAY_S, _BACKFILL_DELAY_S + _BACKFILL_RETRY_S)
+        )
+        completed = False
+        try:
+            interval, unit = bar_spec_to_ts_params(bar_type.spec)
+            found: dict[int, dict] = {}
+            i = 0
+            while i < len(targets):
+                wait = last_end_s + targets[i] - self._clock.timestamp_ns() / 1e9
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                now_s = self._clock.timestamp_ns() / 1e9
+                while i + 1 < len(targets) and last_end_s + targets[i + 1] <= now_s:
+                    i += 1  # triggered late: the targets already passed are one poll
+                raws = await self._client.get_bars(
+                    symbol=bar_type.instrument_id.symbol.value,
+                    interval=interval,
+                    unit=unit,
+                    barsback=len(periods) + _STREAM_BARSBACK,
                 )
-            elif live_stream and raw.get("IsRealtime") is False:
-                self._log.info(
-                    f"[BAR-GAP-REPLAY] {bar_type} ts={raw.get('TimeStamp')}: closed while the "
-                    f"stream was down - replayed from the reconnect seed"
-                )
-            for bar in self._parse_bars([raw], bar_type, instrument):
-                self._handle_data(bar)
-                self._last_bar_ts[bar_type] = datetime.utcnow().isoformat() + "Z"  # §70
-            self._log.debug(f"Bar emitted for {bar_type}: ts={raw.get('TimeStamp')}")
+                found = {}
+                for r in raws or []:
+                    t = bar_end_ns(r.get("TimeStamp", ""))
+                    if t in wanted:
+                        found[t] = r
+                done = all(p not in found or found[p].get("BarStatus") == "Closed" for p in periods)
+                if mode == "shadow":
+                    status = ",".join(
+                        "absent" if p not in found else str(found[p].get("BarStatus"))
+                        for p in periods
+                    )
+                    closed = [p for p in periods if found.get(p, {}).get("BarStatus") == "Closed"]
+                    self._log.info(
+                        f"[BAR-BACKFILL-SHADOW] {bar_type} delay_s={now_s - last_end_s:.1f} "
+                        f"missing=[{missing}] status=[{status}] "
+                        f"history_has=[{','.join(_ts_str(p) for p in closed)}] "
+                        f"vol=[{','.join(str(found[p].get('TotalVolume')) for p in closed)}]"
+                    )
+                i += 1
+                if done:
+                    break
+            for p in periods:
+                raw = found.get(p)
+                if raw is None:
+                    self._log.info(
+                        f"[BAR-BACKFILL-SKIP] {bar_type} ts={_ts_str(p)}: no history bar "
+                        f"(no trades)"
+                    )
+                elif raw.get("BarStatus") != "Closed":
+                    self._log.info(
+                        f"[BAR-BACKFILL-SKIP] {bar_type} ts={_ts_str(p)}: history bar still "
+                        f"Open after the last read"
+                    )
+                elif (
+                    mode == "on"
+                    and gate.backfill_ok(p)
+                    and self._emit_released(raw, bar_type, instrument, tag="[BAR-BACKFILL]")
+                ):
+                    gate.mark_emitted(p)
+            completed = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - logged as [BAR-BACKFILL-FAILED], hold released
+            completed = True  # a failed episode is not retried by every later update
+            self._log.warning(f"[BAR-BACKFILL-FAILED] {bar_type} missing=[{missing}]: {e!r}")
+        finally:
+            if self._backfill_tasks.get(bar_type) is asyncio.current_task():
+                self._backfill_tasks.pop(bar_type, None)
+                if completed:
+                    gate.end_backfill()
+                else:
+                    gate.abort_backfill()
+                for raw, released in gate.release_hold():
+                    if released:
+                        self._emit_released(raw, bar_type, instrument, tag="[BAR-RELEASE]")
+                    else:
+                        self._log_emit_kind(raw, bar_type, True)
+                        self._emit_released(raw, bar_type, instrument)
 
     async def _poll_bars(
         self,
@@ -418,6 +776,8 @@ class TradeStationDataClient(LiveMarketDataClient):
         """Cancel the bar polling/streaming task for this bar type."""
         bar_type = command.bar_type
         task = self._bar_subscriptions.pop(bar_type, None)
+        _cancel_bar_jobs(self, bar_type)
+        getattr(self, "_release_fired", {}).pop(bar_type, None)
         if task:
             task.cancel()
             try:
@@ -493,6 +853,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                 # No timestamp → can't confirm freshness → fall through to reconnect (§70)
 
             task.cancel()
+            _cancel_bar_jobs(self, bar_type)
             try:
                 await task
             except (asyncio.CancelledError, Exception):

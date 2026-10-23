@@ -175,6 +175,7 @@ class TradeStationLiveDataClientFactory(LiveDataClientFactory):
             use_streaming=config.use_streaming,
             streaming_reconnect_delay_secs=config.streaming_reconnect_delay_secs,
             extended_hours=config.extended_hours,
+            bar_release_mode=config.bar_release_mode,
         )
 
 
