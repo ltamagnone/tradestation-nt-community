@@ -97,12 +97,16 @@ def _cancel_bar_jobs(client, bar_type) -> None:
     if handle is not None:
         handle.cancel()
     client._release_targets.pop(bar_type, None)
+    client._release_fired.pop(bar_type, None)  # the new connection's seed may re-arm it
     task = client._backfill_tasks.pop(bar_type, None)
     gate = client._bar_gates.get(bar_type)
+    periods = gate.backfill_periods if gate is not None else None
     if gate is not None:
         gate.abort_backfill()
-    if task is not None:
+    if task is not None and not task.done():
         task.cancel()
+        missing = ",".join(_ts_str(p) for p in periods or [])
+        client._log.info(f"[BAR-BACKFILL-CANCELLED] {bar_type} missing=[{missing}] reason=reset")
 
 
 def _bar_interval_secs(bar_type) -> int | None:
@@ -439,7 +443,12 @@ class TradeStationDataClient(LiveMarketDataClient):
         now_ns = self._clock.timestamp_ns() if mode != "off" else None
         if mode != "off":
             # Before on_event: in mode on the barrier must exist before the later bar is fed.
-            self._maybe_start_backfill(gate, ts_ns, step_ns, bar_type, instrument, mode)
+            try:
+                self._maybe_start_backfill(gate, ts_ns, step_ns, bar_type, instrument, mode)
+            except Exception as e:  # noqa: BLE001 - never into _stream_bars
+                if bar_type not in self._backfill_tasks:
+                    gate.abort_backfill()  # no task owns a hold or a pending backfill
+                self._log_release_error(bar_type, "backfill start", e)
         for raw in gate.on_event(event, ts_ns, now_ns=now_ns):
             self._log_emit_kind(raw, bar_type, live_stream)
             if (
@@ -447,14 +456,27 @@ class TradeStationDataClient(LiveMarketDataClient):
                 and raw.get("BarStatus") == "Closed"
                 and raw.get("IsRealtime") is not False
             ):
-                self._log_snapshot(gate, raw, bar_type, now_ns)
+                try:
+                    self._log_snapshot(gate, raw, bar_type, now_ns)
+                except Exception as e:  # noqa: BLE001 - a log line never blocks the bar
+                    self._log_release_error(bar_type, "snapshot", e)
             self._emit_released(raw, bar_type, instrument)
         if mode == "off":
             return
-        self._drain_diverged(gate, bar_type)
+        try:
+            self._drain_diverged(gate, bar_type)
+        except Exception as e:  # noqa: BLE001 - never into _stream_bars
+            gate.diverged.clear()
+            self._log_release_error(bar_type, "divergence check", e)
         pending_ns = gate.pending_end_ns
         if pending_ns is not None:
-            self._arm_release(bar_type, instrument, pending_ns + _CLOSE_GRACE_NS)
+            try:
+                self._arm_release(bar_type, instrument, pending_ns + _CLOSE_GRACE_NS)
+            except Exception as e:  # noqa: BLE001 - never into _stream_bars
+                self._log_release_error(bar_type, "release timer", e)
+
+    def _log_release_error(self, bar_type: BarType, what: str, e: Exception) -> None:
+        self._log.error(f"[BAR-RELEASE-ERROR] {bar_type} {what} failed: {e!r}")
 
     def _log_emit_kind(self, raw: dict, bar_type: BarType, live_stream: bool) -> None:
         if raw.get("BarStatus") != "Closed":

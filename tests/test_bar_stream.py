@@ -77,7 +77,7 @@ def _fake(events, gates=None, mode="off"):
     for name in (
         "_emit_gated", "_emit_released", "_log_emit_kind", "_log_snapshot", "_arm_release",
         "_on_release_due", "_drain_diverged", "_verify_divergence", "_maybe_start_backfill",
-        "_backfill",
+        "_backfill", "_log_release_error",
     ):
         setattr(fake, name, types.MethodType(getattr(C, name), fake))
     return fake
@@ -838,3 +838,64 @@ def test_snapshot_offsets_match_the_gate_default():
     assert data_mod._BACKFILL_SHADOW_DELAYS_S == (60.0, 120.0, 180.0, 300.0)
     assert (data_mod._BACKFILL_DELAY_S, data_mod._BACKFILL_RETRY_S,
             data_mod._BACKFILL_MAX_PERIODS) == (120.0, 60.0, 3)
+
+
+# -- review fix pass ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "broken", ["_maybe_start_backfill", "_log_snapshot", "_drain_diverged", "_arm_release"]
+)
+@pytest.mark.parametrize("mode", ["shadow", "on"])
+async def test_a_failing_release_helper_never_stops_the_stream(broken, mode, monkeypatch):
+    events = [ev("16:05"), ev("16:05", "Closed"), ev("16:15"), ev("16:15", "Closed")]
+    f = _fake(events, mode=mode)
+    f.now[0] = _ns("2026-10-16T16:05:00.1Z")
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    async def no_sleep(_s):
+        return None
+
+    setattr(f, broken, boom)
+    await C._stream_bars(f, BT, "FCX26", "5", TradeStationBarUnit.MINUTE, None)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    await asyncio.gather(*list(f._backfill_tasks.values()))  # let a live backfill finish
+    monkeypatch.setattr(asyncio, "sleep", REAL_SLEEP)
+    assert f.emitted == ["16:05", "16:15"]  # as today
+    errors = [str(c.args[0]) for c in f._log.error.call_args_list]
+    assert errors and all(e.startswith(f"[BAR-RELEASE-ERROR] {BT} ") for e in errors)
+    gate = f._bar_gates[BT]
+    assert gate._barrier_ns is None and gate.parked == [] and gate._backfill_active is None
+
+
+async def test_a_reset_lets_a_seed_replayed_open_re_arm_the_release():
+    fake = _fake([], mode="shadow")
+    end = _ns("2026-10-16T16:10:00Z")
+    fake.now[0] = end - S
+    _feed(fake, ev("16:05", "Closed"), ev("16:10"))
+    fake.now[0] = end + 10 * S
+    fake.timers[0].cb(*fake.timers[0].args)  # shadow fired for this target
+    data_mod._cancel_bar_jobs(fake, BT)  # a reset
+    fake._bar_gates[BT].reset_connection()
+    _feed(fake, ev("16:10", "Open", False))  # the new connection's seed
+    assert len(fake.timers) == 2 and not fake.timers[1].cancelled
+
+
+@pytest.mark.parametrize("mode", ["shadow", "on"])
+async def test_cancelled_backfill_is_logged(mode):
+    fake = _fake([], mode=mode)
+    fake.now[0] = _ns("2026-10-16T16:16:00Z")
+    _feed(fake, ev("16:05", "Closed"), ev("16:20"))  # 16:10 and 16:15 missing
+    task = fake._backfill_tasks[BT]
+    data_mod._cancel_bar_jobs(fake, BT)
+    await REAL_SLEEP(0)
+    assert task.cancelled()
+    lines = [str(c.args[0]) for c in fake._log.info.call_args_list
+             if "[BAR-BACKFILL-CANCELLED]" in str(c.args[0])]
+    assert lines == [(f"[BAR-BACKFILL-CANCELLED] {BT} "
+                      f"missing=[2026-10-16T16:10:00Z,2026-10-16T16:15:00Z] reason=reset")]
+    data_mod._cancel_bar_jobs(fake, BT)  # nothing in flight: no second line
+    assert sum("[BAR-BACKFILL-CANCELLED]" in str(c.args[0])
+               for c in fake._log.info.call_args_list) == 1

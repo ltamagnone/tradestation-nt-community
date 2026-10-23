@@ -178,6 +178,11 @@ class BarCloseGate:
         hwm = self._backfill_hwm
         return [p for p in periods if hwm is None or p > hwm]
 
+    @property
+    def backfill_periods(self) -> list[int] | None:
+        """Periods of the backfill in flight; None if there is none."""
+        return list(self._backfill_active) if self._backfill_active is not None else None
+
     def begin_backfill(self, periods: list[int]) -> None:
         self._backfill_active = sorted(periods)
 
