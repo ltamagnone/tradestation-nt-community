@@ -78,7 +78,7 @@ The data client supports two modes configured via `use_streaming`:
   - Backfill: a later bar arriving over a hole of 1-3 periods triggers a REST read of the missing period(s), never the wall clock. Mode on reads at missing_end + 120 s and retries once 60 s later; shadow reads at +60/120/180/300 s and stops once every period is Closed or absent.
   - Barrier (mode on): while a backfill is in flight, every emission above the hole is parked (and counts as emitted). The backfilled bar goes out first, then the parked bars in order. The watermark (`mark_emitted`) blocks any later seed or poll of a released or backfilled bar.
   - Every reset path cancels the timer and the backfill: stream start, `_reconnected`, unsubscribe, `reconnect_bar_streams` and disconnect. A cancelled hold rolls the watermark back to the barrier, so the new connection's seed replays the parked bars.
-  - Each session-break gap of at most 3 periods is also read once (expect `[BAR-BACKFILL-SKIP]`); in mode on it delays the first bar after the break by the backfill delay.
+  - A session break of at most 3 periods looks like a hole on bar types of 20 min or more (1-HOUR across CME's daily break: 1 period): one REST read per break per such bar type, `[BAR-BACKFILL-SKIP]`. Nothing is parked there, because the next bar closes after the read. The hold delays a later bar only on 1-3 minute bar types after a real hole (the design's cost).
 
 ### Order groups
 
@@ -112,7 +112,7 @@ Structured, greppable log lines aid post-incident reconstruction:
     - `[BAR-SNAPSHOT] {bar_type} ts=<end> closed_lag_s=<s.mmm> eq0=… eq2=… eq10=… eq30=… vol_closed=<V> vol10=<V|None>` (DEBUG, shadow+on, per realtime Closed emitted). `eqN` = the last non-Closed update at or before end + N s equals the Closed OHLCV; `None` = no update by then.
     - `[BAR-RELEASE-SHADOW] {bar_type} would emit ts=<end> O/H/L/C/V=o/h/l/c/v` (INFO, once per bar).
     - `[BAR-RELEASE] {bar_type} ts=<end>: no Closed event by end + 10 s - emitted as it stood O/H/L/C/V=…` (INFO, mode on).
-    - `[BAR-RELEASE-DIVERGED] {bar_type} ts=<end> snapshot=o/h/l/c/v closed=o/h/l/c/v rest_eq_snapshot=True|False|open|missing|error|cancelled` (INFO): a released bar (or shadow candidate) whose later Closed differs. Exactly one line, after one REST read at end + 120 s; `True` = TradeStation merged the next period into the stream's Closed.
+    - `[BAR-RELEASE-DIVERGED] {bar_type} ts=<end> snapshot=o/h/l/c/v closed=o/h/l/c/v rest_eq_snapshot=True|False|open|missing|error|cancelled rest=o/h/l/c/v|None` (INFO): a released bar (or shadow candidate) whose later Closed differs. Exactly one line, after one REST read at end + 120 s; `True` = TradeStation merged the next period into the stream's Closed.
     - `[BAR-BACKFILL-SHADOW] {bar_type} delay_s=<actual s after missing_end> missing=[ts,…] status=[Closed|Open|absent,…] history_has=[ts,…] vol=[V,…]` (INFO, one per poll).
     - `[BAR-BACKFILL] {bar_type} ts=<end>: never sent by the stream - emitted from REST history O/H/L/C/V=…` (INFO, mode on).
     - `[BAR-BACKFILL-SKIP] {bar_type} ts=<end>: no history bar (no trades)` or `…: history bar still Open after the last read` (INFO).

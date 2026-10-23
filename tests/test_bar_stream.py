@@ -563,7 +563,8 @@ async def test_shadow_scenarios_actually_measure(monkeypatch):
     merged = (await _scenario("merged", "shadow", monkeypatch)).lines()
     div = [x for x in merged if "[BAR-RELEASE-DIVERGED]" in x]
     assert div == [("info:[BAR-RELEASE-DIVERGED] {BT5} ts=2026-10-16T16:05:00Z "
-                    "snapshot=1.0/1.0/1.0/1.0/1.0 closed=1/2/1/2/3 rest_eq_snapshot=False")]
+                    "snapshot=1.0/1.0/1.0/1.0/1.0 closed=1/2/1/2/3 rest_eq_snapshot=False "
+                    "rest=1/2/1/2/3")]
     hole = (await _scenario("hole", "shadow", monkeypatch)).lines()
     bf = [x for x in hole if "[BAR-BACKFILL-SHADOW]" in x]
     assert bf == [("info:[BAR-BACKFILL-SHADOW] {BT5} delay_s=60.0 "

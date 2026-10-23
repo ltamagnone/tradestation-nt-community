@@ -572,9 +572,11 @@ class TradeStationDataClient(LiveMarketDataClient):
         """INFO [BAR-RELEASE-DIVERGED], exactly once: the snapshot vs the Closed vs REST.
 
         ``rest_eq_snapshot``: True (TradeStation merged the next bar into the stream's Closed),
-        False, ``open`` (REST still forming), ``missing``, ``error`` or ``cancelled``.
+        False, ``open`` (REST still forming), ``missing``, ``error`` or ``cancelled``. ``rest``
+        is the REST bar's O/H/L/C/V when it is Closed, else None.
         """
         result = "error"
+        rest_str = "None"
         try:
             delay = ts_ns / 1e9 + _VERIFY_DELAY_S - self._clock.timestamp_ns() / 1e9
             if delay > 0:
@@ -595,6 +597,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                 result = "open"
             else:
                 result = str(ohlcv(rest) == snap)
+                rest_str = _ohlcv_str(rest)
         except asyncio.CancelledError:
             result = "cancelled"
             raise
@@ -604,7 +607,7 @@ class TradeStationDataClient(LiveMarketDataClient):
             self._log.info(
                 f"[BAR-RELEASE-DIVERGED] {bar_type} ts={_ts_str(ts_ns)} "
                 f"snapshot={'/'.join(map(str, snap))} closed={_ohlcv_str(event)} "
-                f"rest_eq_snapshot={result}"
+                f"rest_eq_snapshot={result} rest={rest_str}"
             )
 
     def _maybe_start_backfill(
