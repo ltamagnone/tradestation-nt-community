@@ -279,3 +279,46 @@ def test_shadow_signature_dict_is_bounded():
     for i in range(2105):
         C._remember_shadow_sig(s, i, "x")
     assert len(s._shadow_own_sig) == 2000 and 0 not in s._shadow_own_sig
+
+
+# ---------------------------------------------------------------- §225 cancel-event dedup
+def _race_stub():
+    """A client whose REST cancel and stream OUT both report the same own cancel."""
+    m = _m()
+    m._client_order_id_to_ts_order_id = {COID: TS_ID}
+    m._emitted_cancel_coids = {}
+    return m
+
+
+async def test_stream_out_during_rest_cancel_emits_one_ordercanceled():
+    """§225 (es_30_1440, 2026-10-22/23): the stream's OUT arrived while the REST cancel
+    was still awaiting its response; both paths emitted OrderCanceled and NT logged
+    `InvalidStateTrigger: CANCELED -> CANCELED` (the strategy saw the event twice)."""
+    m = _race_stub()
+
+    async def _stream_wins(**_kw):
+        await _sse(m, ts_order("OUT"))
+
+    m._client.cancel_order = AsyncMock(side_effect=_stream_wins)
+    await C._cancel_order(m, _cmd())
+    assert m.generate_order_canceled.call_count == 1
+    m._register_cancel_verify.assert_any_call(TS_ID)  # §111/§149 re-issue keeps requested=True
+
+
+async def test_stream_out_after_rest_cancel_emits_one_ordercanceled():
+    """The other order: REST emitted first and NT has not applied it yet (cache open)."""
+    m = _race_stub()
+    m._client.cancel_order = AsyncMock(return_value=None)
+    await C._cancel_order(m, _cmd())
+    await _sse(m, ts_order("OUT"))
+    assert m.generate_order_canceled.call_count == 1
+
+
+async def test_cancels_of_different_orders_are_not_deduped():
+    m = _race_stub()
+    m._client.cancel_order = AsyncMock(return_value=None)
+    await C._cancel_order(m, _cmd())
+    other = NS(client_order_id="O-OTHER", instrument_id=IID, strategy_id=MagicMock())
+    m._client_order_id_to_ts_order_id["O-OTHER"] = "999"
+    await C._cancel_order(m, other)
+    assert m.generate_order_canceled.call_count == 2

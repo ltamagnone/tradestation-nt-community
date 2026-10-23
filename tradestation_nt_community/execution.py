@@ -342,8 +342,27 @@ def _clear_emitted_hwm(client, client_order_id) -> None:
     if isinstance(hwm, dict):
         hwm.pop(client_order_id, None)
     canceled = getattr(client, "_emitted_cancel_coids", None)
-    if isinstance(canceled, set):
-        canceled.discard(client_order_id)
+    if isinstance(canceled, dict):
+        canceled.pop(client_order_id, None)
+
+
+def _claim_cancel_emit(client, client_order_id) -> bool:
+    """True if no OrderCanceled was emitted for ``client_order_id`` yet, and records it.
+
+    §225: the REST cancel response and the stream/poll OUT for the same own cancel race;
+    the first to arrive emits, the other is skipped. NT applies events later (queued), so
+    ``cached_order.is_closed`` cannot be the guard. Check-and-add with no ``await`` in
+    between: atomic on the event loop. Insertion-ordered dict so the cap drops the oldest.
+    """
+    sent = getattr(client, "_emitted_cancel_coids", None)
+    if not isinstance(sent, dict):
+        return True
+    if client_order_id in sent:
+        return False
+    sent[client_order_id] = None
+    while len(sent) > 2000:   # bounded backstop; normally cleared once NT shows it closed
+        sent.pop(next(iter(sent)))
+    return True
 
 
 def _release_if_terminal_closed(client, status: str, client_order_id) -> None:
@@ -498,11 +517,11 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 return
             log.warning(f"[CANCEL-WITH-EXEC] {client_order_id}: {status} with {exec_c} "
                         f"executed - fill delivered before the cancel")
-        _sent = getattr(client, "_emitted_cancel_coids", None)
-        if isinstance(_sent, set) and client_order_id in _sent:
-            # FLP-then-CAN in one drain: the FLP path already queued the remainder cancel
-            # (NT has not applied it yet) - a second would be an InvalidStateTrigger warning.
-            log.info(f"[CANCEL-DUP] {client_order_id}: remainder cancel already emitted - "
+        if not _claim_cancel_emit(client, client_order_id):
+            # Already queued, NT has not applied it yet: FLP-then-CAN in one drain (the FLP
+            # path emitted the remainder cancel) or the REST cancel response (§225). A
+            # second would be an InvalidStateTrigger warning and a second strategy event.
+            log.info(f"[CANCEL-DUP] {client_order_id}: OrderCanceled already emitted - "
                      f"not repeated")
         else:
             client.generate_order_canceled(
@@ -555,7 +574,7 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             return
         _clear_partial(client, client_order_id)
         remainder = cached_order.quantity.as_decimal() - exec_total
-        if remainder > 0:
+        if remainder > 0 and _claim_cancel_emit(client, client_order_id):
             client.generate_order_canceled(
                 strategy_id=cached_order.strategy_id,
                 instrument_id=cached_order.instrument_id,
@@ -563,11 +582,6 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 venue_order_id=venue_order_id,
                 ts_event=_event_ts(ts_order, ts_now),
             )
-            _sent = getattr(client, "_emitted_cancel_coids", None)
-            if isinstance(_sent, set):
-                _sent.add(client_order_id)
-                while len(_sent) > 2000:   # bounded backstop; normally cleared on closed
-                    _sent.discard(next(iter(_sent)))
             client._pending_modify_trigger_price.pop(client_order_id, None)
             log.warning(
                 f"[FLP-TERMINAL] {client_order_id}: {exec_total} filled, remainder "
@@ -772,8 +786,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._partial_orders: dict = {}
         # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
         self._emitted_exec_hwm: dict = {}
-        # coids whose remainder OrderCanceled the FLP path already emitted (M-3 dedup)
-        self._emitted_cancel_coids: set = set()
+        # coids whose OrderCanceled was already emitted: FLP remainder (M-3), REST cancel
+        # response vs stream OUT (§225). Insertion-ordered dict, see _claim_cancel_emit.
+        self._emitted_cancel_coids: dict = {}
         # ts_order_id -> (monotonic first-seen, status, client_order_id) — §149 recheck
         self._status_watch: dict[str, tuple[float, str, str]] = {}
 
@@ -2051,7 +2066,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     f"partially filled order - OrderCanceled withheld until the broker's "
                     f"terminal FLP/FLL"
                 )
-            else:
+            elif _claim_cancel_emit(self, command.client_order_id):
                 self.generate_order_canceled(
                     strategy_id=command.strategy_id,
                     instrument_id=command.instrument_id,
@@ -2059,9 +2074,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     venue_order_id=VenueOrderId(ts_order_id),
                     ts_event=self._clock.timestamp_ns(),
                 )
+                self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
+            else:
+                # §225: the stream's OUT arrived during the HTTP call and already emitted it.
+                self._log.info(f"Order {command.client_order_id} cancelled "
+                               f"(OrderCanceled already emitted by the stream)", LogColor.GREEN)
             self._register_cancel_verify(ts_order_id)  # §111
-
-            self._log.info(f"Order {command.client_order_id} cancelled", LogColor.GREEN)
 
         except Exception as e:
             if "Not an open order" in str(e):
@@ -2145,7 +2163,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._note_cancel_requested(order.client_order_id)
             try:
                 await self._client.cancel_order(order_id=ts_order_id)
-                if order.client_order_id not in self._partial_orders:
+                if order.client_order_id in self._partial_orders:
+                    # FPR remainder: the terminal FLP/FLL applies the fill, then cancels
+                    self._log.info(f"[PARTIAL-CANCEL] {order.client_order_id}: "
+                                   f"OrderCanceled withheld until the broker's FLP/FLL")
+                elif _claim_cancel_emit(self, order.client_order_id):  # §225
                     self.generate_order_canceled(
                         strategy_id=command.strategy_id,
                         instrument_id=command.instrument_id,
@@ -2153,9 +2175,6 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         venue_order_id=venue_order_id,
                         ts_event=self._clock.timestamp_ns(),
                     )
-                else:  # FPR remainder: the terminal FLP/FLL applies the fill, then cancels
-                    self._log.info(f"[PARTIAL-CANCEL] {order.client_order_id}: "
-                                   f"OrderCanceled withheld until the broker's FLP/FLL")
                 self._register_cancel_verify(ts_order_id)  # §111
                 self._log.info(
                     f"Cancelled order {order.client_order_id} ({ts_order_id})"

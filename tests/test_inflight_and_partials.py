@@ -556,7 +556,7 @@ class TestDuplicateCancelAndCleanup:
         in the same drain must not queue a second OrderCanceled."""
         m = _m(qty=3)
         m._emitted_exec_hwm = {}
-        m._emitted_cancel_coids = set()
+        m._emitted_cancel_coids = {}
         await _sse(m, ts_order("FLP", exec_qty=2))
         assert m.generate_order_canceled.call_count == 1
         await _poll(m, ts_order("CAN", exec_qty=2))
