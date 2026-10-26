@@ -216,7 +216,17 @@ class TestHostingDecides233:
         m = _client(group="rolling", entry_group="stable")
         await C._process_order_event(m, _order(ALIVE - 3600))
         m._uncached_fill_callback.assert_not_called()
-        assert any("already delivered" in str(c) for c in m._log.info.call_args_list)
+        assert any("already delivered" in str(c) and "tagged group stable" in str(c)
+                   for c in m._log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_tag_set_node_group_unset_is_unknown_not_a_mismatch(self):
+        m = _client(group=None, entry_group="stable")
+        await C._process_order_event(m, _order(START + 10))
+        m._uncached_fill_callback.assert_called_once()
+        p = m._uncached_fill_callback.call_args[0][0]
+        assert p["kind"] == "unknown" and p["group"] == "stable" \
+            and p["tag_mismatch"] is False
 
     @pytest.mark.asyncio
     async def test_other_tag_no_own_alive_stamp_is_unknown_and_fires(self):

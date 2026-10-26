@@ -184,10 +184,13 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
             closed_s = None
     kind = classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
                                   alive_prev_s)
+    _tag_note = (f", tagged group {tag_group} (this node {node_group}): hosting "
+                 f"decides" if tag_group and node_group and tag_group != node_group
+                 else "")
     if kind == "delivered":
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) fill predates "
-            f"this session — already delivered by the previous process"
+            f"this session{_tag_note} — already delivered by the previous process"
         )
     elif kind == "delivered_other":
         log.info(
@@ -198,9 +201,6 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
         # A runner callback is registered: it resolves the owner (§233: by hosting, the
         # tag only breaks ties) and is the sole alerter. INFO + bare tag so the log
         # forwarder (which matches only the WARN tags) stays silent.
-        _tag_note = (f", tagged group {tag_group} (this node {node_group}): hosting "
-                     f"decides" if tag_group and node_group and tag_group != node_group
-                     else "")
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) {kind} fill, "
             f"not in the NT cache{_tag_note} — handed to the runner"
@@ -614,9 +614,9 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
     """Classify + log an uncached fill, then notify the registered callback (§151).
 
     Both fill paths (poll + SSE) call this. The callback fires for every kind except
-    ``delivered``, and for ``delivered_other`` only when NO callback is registered
-    (§233); it is scheduled with ``call_soon`` and wrapped
-    so it can never break the status poll. The callback runs ON the loop, so it must
+    ``delivered``; ``delivered_other`` is only produced when no callback is registered
+    (§233). It is scheduled with ``call_soon`` and wrapped so it can never break the
+    status poll. The callback runs ON the loop, so it must
     not block: the runner offloads HTTP/Telegram to executors. Returns the kind.
     """
     node_group = _str_or_none(getattr(client, "_node_group", None))
