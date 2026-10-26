@@ -322,3 +322,23 @@ async def test_cancels_of_different_orders_are_not_deduped():
     m._client_order_id_to_ts_order_id["O-OTHER"] = "999"
     await C._cancel_order(m, other)
     assert m.generate_order_canceled.call_count == 2
+
+
+async def test_cancel_all_skips_and_logs_a_cancel_the_stream_already_emitted():
+    """§225 cancel-all: the stream's OUT emitted first; the REST path emits nothing and
+    logs [CANCEL-DUP] so OPEN_POINTS 3.6 can see this path (it was silent)."""
+    from nautilus_trader.model.enums import OrderSide
+    m = MagicMock()
+    q = MagicMock()
+    q.client_order_id, q.venue_order_id = COID, VenueOrderId("2")
+    m._cache.orders_open.return_value = [q]
+    m._cache.orders_inflight.return_value = []
+    m._partial_orders = {}
+    m._emitted_cancel_coids = {COID: None}
+    m._client.cancel_order = AsyncMock()
+    cmd = NS(instrument_id=IID, strategy_id=MagicMock(), order_side=OrderSide.NO_ORDER_SIDE)
+    await C._cancel_all_orders(m, cmd)
+    m.generate_order_canceled.assert_not_called()
+    logged = " ".join(str(c.args[0]) for c in m._log.info.call_args_list)
+    assert f"[CANCEL-DUP] {COID}" in logged
+    m._register_cancel_verify.assert_called_once_with("2")

@@ -2175,6 +2175,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
                         venue_order_id=venue_order_id,
                         ts_event=self._clock.timestamp_ns(),
                     )
+                else:
+                    # §225: the stream's OUT arrived during the HTTP call and already emitted it.
+                    self._log.info(f"[CANCEL-DUP] {order.client_order_id}: OrderCanceled "
+                                   f"already emitted by the stream - not repeated")
                 self._register_cancel_verify(ts_order_id)  # §111
                 self._log.info(
                     f"Cancelled order {order.client_order_id} ({ts_order_id})"
