@@ -33,9 +33,11 @@ from tradestation_nt_community.http.client import OrderRejectedException
 from tradestation_nt_community.http.client import SymbolNotFoundException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.providers import TradeStationInstrumentProvider
+from tradestation_nt_community.execution import SUBMIT_AMBIGUOUS_REASON_PREFIX
 
 
 __all__ = [
+    "SUBMIT_AMBIGUOUS_REASON_PREFIX",
     "TRADESTATION",
     "TRADESTATION_CLIENT_ID",
     "TRADESTATION_VENUE",

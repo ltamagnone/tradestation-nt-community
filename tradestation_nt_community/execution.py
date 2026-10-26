@@ -99,6 +99,20 @@ def _is_ambiguous_submit(e: BaseException) -> bool:
     return isinstance(e, _AMBIGUOUS_SUBMIT_ERRORS)
 
 
+# The reject reason of an ambiguous submit starts with this marker, so a consumer can tell
+# "may be live at TradeStation" from a real reject and never resend it (strategies
+# OPEN_POINTS 1.7). Byte-stable: the strategies runner matches on it.
+SUBMIT_AMBIGUOUS_REASON_PREFIX = "SUBMIT-AMBIGUOUS: "
+
+
+def _reject_reason(e: BaseException) -> str:
+    """The NT reject reason for a failed submit: ``str(e)``, marked when ambiguous (an
+    httpx timeout's ``str`` can be empty, so the type always names it then)."""
+    if _is_ambiguous_submit(e):
+        return f"{SUBMIT_AMBIGUOUS_REASON_PREFIX}{type(e).__name__}: {e}"[:500]
+    return str(e)
+
+
 def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
                            alive_prev_s) -> str:
     """§151 classification of an FLL/FLP on a mapped TS order absent from the NT cache.
@@ -1730,7 +1744,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason=str(e),
+                reason=_reject_reason(e),
                 ts_event=self._clock.timestamp_ns(),
             )
 
@@ -1871,7 +1885,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     strategy_id=command.strategy_id,
                     instrument_id=order.instrument_id,
                     client_order_id=order.client_order_id,
-                    reason=str(e),
+                    reason=_reject_reason(e),
                     ts_event=self._clock.timestamp_ns(),
                 )
 
