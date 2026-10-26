@@ -114,18 +114,26 @@ class TestCallback:
         assert m._uncached_fill_callback.call_args[0][0]["kind"] == "unknown"
 
     @pytest.mark.asyncio
-    async def test_delivered_and_other_node_do_not_fire(self):
+    async def test_delivered_does_not_fire(self):
         m = _client()
         await C._process_order_event(m, _order(ALIVE - 3600))
-        m2 = _client(entry_group="rolling")
-        await C._process_order_event(m2, _order(START + 10))
         m._uncached_fill_callback.assert_not_called()
-        m2._uncached_fill_callback.assert_not_called()
-        # INFO text stays on the bare tag; no WARN tag
         assert not m._log.warning.call_args_list or all(
             "[UNCACHED-FILL-LIVE]" not in str(c) and "[DOWNTIME-FILL]" not in str(c)
             for c in m._log.warning.call_args_list)
         assert any("already delivered" in str(c) for c in m._log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_other_tag_without_callback_keeps_delivered_other(self):
+        """No runner callback (old runner / tests): today's behaviour, unchanged."""
+        m = _client(group="rolling", entry_group="stable")
+        m._uncached_fill_callback = None
+        from tradestation_nt_community.execution import _handle_uncached_fill
+        assert _handle_uncached_fill(m, _order(START + 10), "972944192", "O-OLD-1") \
+            == "delivered_other"
+        assert any("owned by the other node (group stable)" in str(c)
+                   for c in m._log.info.call_args_list)
+        assert not m._log.warning.call_args_list
 
     @pytest.mark.asyncio
     async def test_callback_exception_does_not_break_poll(self):
@@ -166,6 +174,71 @@ class TestCallback:
         cb = lambda p: None
         C.set_uncached_fill_callback(m, cb)
         assert m._uncached_fill_callback is cb
+
+
+class TestHostingDecides233:
+    """§233: with a runner callback the submit-time tag no longer decides ownership.
+    2026-10-25 #976210241: tagged `stable`, strategy hosted on rolling — rolling dropped
+    it as delivered_other, stable's runner said non-local: nobody held or alerted."""
+
+    @pytest.mark.asyncio
+    async def test_other_tag_with_callback_fires_live_sse(self):
+        m = _client(group="rolling", entry_group="stable")
+        await C._process_order_event(m, _order(START + 10))
+        m._uncached_fill_callback.assert_called_once()
+        p = m._uncached_fill_callback.call_args[0][0]
+        assert p["kind"] == "live" and p["group"] == "stable" and p["tag_mismatch"] is True
+        assert not m._log.warning.call_args_list           # runner is the sole alerter
+        infos = [str(c) for c in m._log.info.call_args_list]
+        assert any("tagged group stable (this node rolling)" in s
+                   and "handed to the runner" in s for s in infos)
+        assert not any("owned by the other node" in s for s in infos)
+
+    @pytest.mark.asyncio
+    async def test_other_tag_with_callback_fires_poll(self):
+        m = _client(group="rolling", entry_group="stable")
+        m._client = MagicMock()
+        m._client.get_orders = AsyncMock(return_value=[_order(START + 10)])
+        await C._check_order_statuses(m)
+        p = m._uncached_fill_callback.call_args[0][0]
+        assert p["kind"] == "live" and p["tag_mismatch"] is True
+
+    @pytest.mark.asyncio
+    async def test_other_tag_prestart_is_timed_by_own_alive_stamp(self):
+        # The tag group's stamp is irrelevant (R3): only rolling's own stamp times it.
+        m = _client(group="rolling", entry_group="stable")
+        m._previous_alive = {"rolling": ALIVE, "stable": START + 9999}
+        await C._process_order_event(m, _order(ALIVE + 10))
+        assert m._uncached_fill_callback.call_args[0][0]["kind"] == "downtime"
+
+    @pytest.mark.asyncio
+    async def test_other_tag_old_fill_is_delivered_and_not_fired(self):
+        m = _client(group="rolling", entry_group="stable")
+        await C._process_order_event(m, _order(ALIVE - 3600))
+        m._uncached_fill_callback.assert_not_called()
+        assert any("already delivered" in str(c) for c in m._log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_other_tag_no_own_alive_stamp_is_unknown_and_fires(self):
+        m = _client(group="rolling", entry_group="stable")
+        m._previous_alive = {"stable": ALIVE}            # rolling never stamped
+        await C._process_order_event(m, _order(ALIVE + 10))
+        assert m._uncached_fill_callback.call_args[0][0]["kind"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_own_tag_payload_unchanged(self):
+        m = _client()                                     # stable / stable
+        await C._process_order_event(m, _order(START + 10))
+        p = m._uncached_fill_callback.call_args[0][0]
+        assert p["kind"] == "live" and p["group"] == "stable" and p["tag_mismatch"] is False
+        assert not any("tagged group" in str(c) for c in m._log.info.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_no_tag_still_unknown_and_not_a_mismatch(self):
+        m = _client(entry_group=None)
+        await C._process_order_event(m, _order(START + 10))
+        p = m._uncached_fill_callback.call_args[0][0]
+        assert p["kind"] == "unknown" and p["group"] is None and p["tag_mismatch"] is False
 
 
 def _stub(path, group):

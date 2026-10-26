@@ -164,7 +164,7 @@ def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_ord
 
 def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
                        instance_started_s, entry_group=None, node_group=None,
-                       alive_prev_s=None, handed_to_runner=False) -> str:
+                       alive_prev_s=None, handed_to_runner=False, tag_group=None) -> str:
     """Log (and classify) an FLL/FLP fill for a mapped TS order absent from the NT cache.
 
     2026-09-29 13:23Z/13:28Z: after a restart the persisted order map is loaded but
@@ -195,12 +195,15 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
             f"other node (group {entry_group}) — its adapter classifies this fill"
         )
     elif handed_to_runner:
-        # A runner callback is registered: it resolves the owner, applies the locality
-        # filter and is the sole alerter. INFO + bare tag so the log forwarder (which
-        # matches only the WARN tags) stays silent and the non-hosting node never alerts.
+        # A runner callback is registered: it resolves the owner (§233: by hosting, the
+        # tag only breaks ties) and is the sole alerter. INFO + bare tag so the log
+        # forwarder (which matches only the WARN tags) stays silent.
+        _tag_note = (f", tagged group {tag_group} (this node {node_group}): hosting "
+                     f"decides" if tag_group and node_group and tag_group != node_group
+                     else "")
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) {kind} fill, "
-            f"not in the NT cache — handed to the runner"
+            f"not in the NT cache{_tag_note} — handed to the runner"
         )
     elif kind == "downtime":
         log.warning(_uncached_fill_message(
@@ -611,7 +614,8 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
     """Classify + log an uncached fill, then notify the registered callback (§151).
 
     Both fill paths (poll + SSE) call this. The callback fires for every kind except
-    ``delivered`` / ``delivered_other``; it is scheduled with ``call_soon`` and wrapped
+    ``delivered``, and for ``delivered_other`` only when NO callback is registered
+    (§233); it is scheduled with ``call_soon`` and wrapped
     so it can never break the status poll. The callback runs ON the loop, so it must
     not block: the runner offloads HTTP/Telegram to executors. Returns the kind.
     """
@@ -624,11 +628,20 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
     cb = getattr(client, "_uncached_fill_callback", None)
     if not callable(cb):
         cb = None
+    # §233 one ownership rule: with a runner callback, the runner's hosting test decides
+    # who owns an uncached fill; the order-map tag (the node that SUBMITTED the order,
+    # write-once) only goes along as a tiebreak. A kept exit keeps its submit-time tag
+    # after its strategy moves node (2026-10-25 btc #976210241: tag stable, hosted on
+    # rolling), so deciding by the tag left the fill with no handler. Time the fill
+    # against THIS node's own alive stamp, exactly like an own-tagged order (R3).
+    timing_group = entry_group
+    if cb is not None and entry_group and node_group and entry_group != node_group:
+        timing_group = node_group
     kind = _log_uncached_fill(
         client._log, ts_order, ts_order_id, client_order_id,
         getattr(client, "_instance_started_s", None),
-        entry_group=entry_group, node_group=node_group, alive_prev_s=alive_prev,
-        handed_to_runner=cb is not None,
+        entry_group=timing_group, node_group=node_group, alive_prev_s=alive_prev,
+        handed_to_runner=cb is not None, tag_group=entry_group,
     )
     if kind in ("delivered", "delivered_other"):
         return kind
@@ -643,6 +656,7 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
         "kind": kind,
         "exec_qty": leg.get("ExecQuantity") if isinstance(leg, dict) else None,
         "group": entry_group,
+        "tag_mismatch": bool(timing_group != entry_group),
     }
 
     tag = "[DOWNTIME-FILL]" if kind == "downtime" else "[UNCACHED-FILL-LIVE]"
@@ -832,8 +846,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """§151: register ``callback(payload: dict)`` for a genuine uncached fill.
 
         Called (via ``loop.call_soon``, exceptions swallowed) for kinds live /
-        downtime / unknown — not for fills the previous process delivered. Payload:
-        ts_order_id, client_order_id, status, closed, kind, exec_qty, group.
+        downtime / unknown — not for fills the previous process delivered. With a
+        callback registered an order-map tag of the other node no longer short-circuits
+        (§233): the fill is timed against this node's own alive stamp and handed over.
+        Payload: ts_order_id, client_order_id, status, closed, kind, exec_qty, group
+        (the order-map tag or None), tag_mismatch (tag present and != this node's group).
         Mirrors ``TradeStationHttpClient.set_token_rotation_callback``.
         """
         self._uncached_fill_callback = callback
