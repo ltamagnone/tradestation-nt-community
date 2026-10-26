@@ -69,3 +69,13 @@ async def test_ambiguous_group_reject_reasons_carry_the_marker():
     reasons = [c.kwargs["reason"] for c in stub.generate_order_rejected.call_args_list]
     assert len(reasons) == 2
     assert all(r.startswith(SUBMIT_AMBIGUOUS_REASON_PREFIX) for r in reasons), reasons
+
+
+async def test_every_ambiguous_kind_is_marked():
+    from tradestation_nt_community import SUBMIT_AMBIGUOUS_REASON_PREFIX
+    for exc in (httpx.WriteTimeout("w"), httpx.ReadError(""),
+                DuplicateOrderConfirmIdException("dup", "cid")):
+        stub = await _submit(exc)
+        reason = stub.generate_order_rejected.call_args.kwargs["reason"]
+        assert reason.startswith(SUBMIT_AMBIGUOUS_REASON_PREFIX), (exc, reason)
+        assert type(exc).__name__ in reason
