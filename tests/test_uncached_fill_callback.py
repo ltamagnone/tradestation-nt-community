@@ -57,6 +57,8 @@ def _client(group="stable", entry_group="stable"):
     m._instance_started_s = START
     m._order_last_status = {}
     m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
     m._cancel_verify_pending = {}
     m._verify_pending_cancels = AsyncMock()
     m._cache = MagicMock()

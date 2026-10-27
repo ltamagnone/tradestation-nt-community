@@ -95,6 +95,8 @@ def test_m1_inflight_recovery_failure_returns_none():
     from nautilus_trader.model.objects import Price
     s = _stub(cache, [ts_order("OPN")])
     s._pending_modify_trigger_price = {order.client_order_id: Price.from_str("99.0")}
+    s._modify_inflight = {}
+    s._pending_amend_meta = {}
     s._check_order_statuses = AsyncMock(side_effect=RuntimeError("HTTP 500"))
     assert _query(loop, s) is None  # no exception out of generate_order_status_report
 

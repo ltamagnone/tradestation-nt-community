@@ -5,6 +5,7 @@ TradeStation execution client implementation.
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -294,6 +295,49 @@ def _resolve_fill_price(client, ts_order: dict, order, client_order_id) -> "floa
     return None
 
 
+# §241: monotonic clock alias — tests patch ``execution._mono``, never ``time.monotonic``
+# (asyncio's loop clock uses it).
+_mono = time.monotonic
+
+
+@dataclass
+class _AmendMeta:
+    """§241: bookkeeping for an amend whose PUT failed ambiguously (5xx / exception).
+
+    ``sent``/``stamp``: ``_mono()`` when the PUT left / when it failed. Recovery reads
+    must START after ``stamp``. ``prev``: the (trigger_price, price) the order had before
+    the modify (None for a field not being modified). ``old_reads``: consecutive
+    non-overlapping reads that still showed ``prev``; ``last_read_done``: when the last
+    counted read was processed. ``warned``: the one [MODIFY-UNKNOWN] WARNING was logged."""
+    sent: float
+    stamp: float
+    prev: tuple
+    old_reads: int = 0
+    last_read_done: float = float("-inf")
+    warned: bool = False
+
+
+def _modify_inflight_begin(client, client_order_id) -> None:
+    """§241: one more PUT of this order is in flight (per-coid counter: overlapping
+    modifies of one order must not clear each other's flag)."""
+    client._modify_inflight[client_order_id] = (
+        client._modify_inflight.get(client_order_id, 0) + 1)
+
+
+def _modify_inflight_end(client, client_order_id) -> None:
+    n = client._modify_inflight.get(client_order_id, 0) - 1
+    if n > 0:
+        client._modify_inflight[client_order_id] = n
+    else:
+        client._modify_inflight.pop(client_order_id, None)
+
+
+def _drop_pending_amend(client, client_order_id) -> None:
+    """§241: forget a pending amend and its meta (every former bare pop goes through here)."""
+    client._pending_modify_trigger_price.pop(client_order_id, None)
+    client._pending_amend_meta.pop(client_order_id, None)
+
+
 def _pending_modify_prices(entry) -> tuple:
     """The (trigger_price, price) a 5xx-pending modify requested. ``entry`` is the stored
     tuple, or a bare value (a trigger price only, the pre-§212 shape), or None."""
@@ -550,7 +594,7 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
             )
         _clear_partial(client, client_order_id)
         client._register_cancel_verify(ts_order_id, requested=False)  # §111
-        client._pending_modify_trigger_price.pop(client_order_id, None)  # no stale entry
+        _drop_pending_amend(client, client_order_id)  # no stale entry
         log.info(f"{lead} canceled: {client_order_id} (status={status})")
 
     elif status == "DON":
@@ -599,7 +643,7 @@ def _apply_status_tail(client, status: str, ts_order: dict, ts_order_id: str,
                 venue_order_id=venue_order_id,
                 ts_event=_event_ts(ts_order, ts_now),
             )
-            client._pending_modify_trigger_price.pop(client_order_id, None)
+            _drop_pending_amend(client, client_order_id)
             log.warning(
                 f"[FLP-TERMINAL] {client_order_id}: {exec_total} filled, remainder "
                 f"{remainder} canceled (fill {'emitted' if emitted else 'NOT emitted'})"
@@ -779,12 +823,15 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # Fill detection — polling or streaming
         self._order_last_status: dict[str, str] = {}   # ts_order_id → last seen status
 
-        # PENDING_UPDATE recovery: stores the trigger_price requested by _modify_order.
-        # On 5xx the adapter emits no event, leaving the order stuck in PENDING_UPDATE
-        # indefinitely. _check_order_statuses uses this dict to compare TS's actual stop
-        # price and resolve PENDING_UPDATE within the next poll cycle (≤5 s).
-        # (trigger_price, price) requested by a 5xx-pending modify (§212; a bare value = trigger)
+        # Amend recovery (§212/§241). An entry exists ONLY after a modify PUT failed
+        # ambiguously (5xx / exception): the broker may or may not have applied it and NT
+        # sits in PENDING_UPDATE. _check_order_statuses resolves it from broker reads that
+        # started after the failure. (trigger_price, price) requested; meta in
+        # _pending_amend_meta. PUTs in flight are counted in _modify_inflight and are never
+        # "recovered" — their own answer decides.
         self._pending_modify_trigger_price: dict[ClientOrderId, tuple] = {}
+        self._pending_amend_meta: dict[ClientOrderId, _AmendMeta] = {}
+        self._modify_inflight: dict[ClientOrderId, int] = {}
         self._fill_poll_task: asyncio.Task | None = None
         self._fill_poll_interval: float = 5.0  # seconds between order status polls
         self._token_keepalive_task: asyncio.Task | None = None
@@ -1209,6 +1256,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
         cached = self._cache.order(client_order_id) if client_order_id is not None else None
         terminal = (status in _st.REJECTED or status in _st.FILLED
                     or (status in _st.CANCELED and status not in _st.WATCH))
+        if (not terminal and cached is not None
+                and cached.status == OrderStatus.PENDING_UPDATE
+                and client_order_id in self._modify_inflight):
+            # §241: the modify PUT has not answered yet. ACCEPTED would put NT back on the OLD
+            # price; a recovery run would compare against a broker that may not have the
+            # amend yet. No report: NT retries, and the PUT's own answer decides.
+            self._log.info(
+                f"[INFLIGHT-QUERY] {client_order_id} PENDING_UPDATE with a modify PUT in "
+                f"flight - no report, NT will retry"
+            )
+            return None
         if (not terminal and cached is not None
                 and cached.status == OrderStatus.PENDING_UPDATE
                 and client_order_id in self._pending_modify_trigger_price):
@@ -1946,7 +2004,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         On 5xx or network errors the rejection is intentionally suppressed: the
         modify may have already succeeded at the broker before the error was
         returned, and a false rejection event would create state drift in the
-        wrong direction. The next reconciliation cycle will correct state.
+        wrong direction. The amend is then recorded for recovery (§241: only after
+        the failure, never before the PUT) and nothing is emitted until a broker
+        read that started after the failure decides.
         """
         client_order_id = command.client_order_id
         ts_order_id = self._client_order_id_to_ts_order_id.get(client_order_id)
@@ -1962,13 +2022,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
 
-        # Track the requested prices (trigger, limit) so _check_order_statuses can recover
-        # PENDING_UPDATE if a 5xx prevents the response from arriving. A LIMIT modify
-        # carries only ``price``; storing the trigger alone (None) made every LIMIT
-        # recovery a "rejected" even when TS had the new LimitPrice (§212).
-        self._pending_modify_trigger_price[client_order_id] = (
-            command.trigger_price, command.price)
-
+        requested = (command.trigger_price, command.price)
+        # §241: what the order carried BEFORE this modify, per field being modified —
+        # the recovery's "old price" when the PUT fails ambiguously.
+        prev = (getattr(order, "trigger_price", None) if command.trigger_price is not None
+                else None,
+                getattr(order, "price", None) if command.price is not None else None)
+        sent = _mono()
+        _modify_inflight_begin(self, client_order_id)
         try:
             ts_order_type = self._convert_order_type(order)
 
@@ -2020,10 +2081,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 trigger_price=command.trigger_price,
                 ts_event=self._clock.timestamp_ns(),
             )
-            self._pending_modify_trigger_price.pop(client_order_id, None)  # resolved
+            _drop_pending_amend(self, client_order_id)  # resolved
 
             self._log.info(
-                f"Order {client_order_id} modified → venue {venue_order_id}",
+                f"Order {client_order_id} modified → venue {venue_order_id} "
+                f"(requested trigger={command.trigger_price} price={command.price})",
                 LogColor.GREEN,
             )
 
@@ -2034,7 +2096,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # as a rejection event so NT reverts PENDING_UPDATE and the
                 # strategy can react (retry, cancel, hedge).
                 self._log.error(
-                    f"Modify rejected by broker for {client_order_id}: {err}"
+                    f"Modify rejected by broker for {client_order_id} "
+                    f"(requested trigger={command.trigger_price} price={command.price}): {err}"
                 )
                 self.generate_order_modify_rejected(
                     strategy_id=command.strategy_id,
@@ -2044,16 +2107,22 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     reason=err[:150],
                     ts_event=self._clock.timestamp_ns(),
                 )
-                self._pending_modify_trigger_price.pop(client_order_id, None)  # resolved
+                _drop_pending_amend(self, client_order_id)  # resolved
             else:
-                # 5xx / network error: modify may have already succeeded at the
-                # broker before the error occurred. Emitting a rejection would
-                # create false state drift. Log and leave PENDING_UPDATE in place;
-                # _check_order_statuses will compare TS's actual price next poll.
+                # 5xx / network error / timeout: the broker may have applied it. Record the
+                # amend NOW (never before the PUT, §241): the recovery compares the broker's
+                # prices only on reads that start after this stamp.
+                self._pending_modify_trigger_price[client_order_id] = requested
+                self._pending_amend_meta[client_order_id] = _AmendMeta(
+                    sent=sent, stamp=_mono(), prev=prev)
                 self._log.error(
                     f"Failed to modify order {client_order_id} "
-                    f"(ambiguous — broker state unknown): {err}"
+                    f"(ambiguous — broker state unknown): {err} — amend pending "
+                    f"(requested trigger={command.trigger_price} price={command.price}, "
+                    f"previous trigger={prev[0]} price={prev[1]})"
                 )
+        finally:
+            _modify_inflight_end(self, client_order_id)
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         """Cancel an order."""
@@ -2536,7 +2605,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Skip if NautilusTrader already considers the order closed (idempotency guard).
             # Also clean up any stale pending-amend record (e.g. SSE filled it first).
             if cached_order.is_closed:
-                self._pending_modify_trigger_price.pop(client_order_id, None)
+                _drop_pending_amend(self, client_order_id)
                 _clear_partial(self, client_order_id)
                 _clear_emitted_hwm(self, client_order_id)
                 _log_fill_after_cancel(
@@ -2553,7 +2622,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     # Order closed/expired at TS (e.g. DAY order at market-close).
                     # Discard the amend record and fall through to normal CAN/FLL/REJ
                     # handling so the correct event is emitted.
-                    self._pending_modify_trigger_price.pop(client_order_id, None)
+                    _drop_pending_amend(self, client_order_id)
                     self._log.info(
                         f"[PENDING_UPDATE recovery] {client_order_id} no longer open "
                         f"(status={status}) — deferring to normal handling"
@@ -2562,7 +2631,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 else:
                     # Order is still open: compare prices to determine amend outcome.
                     pending_tp, pending_px = _pending_modify_prices(
-                        self._pending_modify_trigger_price.pop(client_order_id, None))
+                        self._pending_modify_trigger_price.get(client_order_id))
+                    _drop_pending_amend(self, client_order_id)
                     try:
                         _price_match = _modify_prices_match(ts_order, pending_tp, pending_px)
                         if _price_match:
@@ -2622,7 +2692,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     self._order_last_status.pop(ts_order_id, None)  # un-advance: retry
                     continue
                 _clear_partial(self, client_order_id)
-                self._pending_modify_trigger_price.pop(client_order_id, None)
+                _drop_pending_amend(self, client_order_id)
 
             else:
                 _apply_status_tail(
@@ -2734,7 +2804,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._order_last_status.pop(ts_order_id, None)  # the safety poll retries
                 return
             _clear_partial(self, client_order_id)
-            self._pending_modify_trigger_price.pop(client_order_id, None)  # prevent stale entry
+            _drop_pending_amend(self, client_order_id)  # prevent stale entry
 
         else:
             _apply_status_tail(

@@ -77,6 +77,8 @@ def _stub(cache, orders=None, fail=False, requested=False):
     s._client_order_id_to_ts_order_id = {coid: TS_ID}
     s._cancel_verify_pending = {}
     s._pending_modify_trigger_price = {}
+    s._modify_inflight = {}
+    s._pending_amend_meta = {}
     s._check_order_statuses = AsyncMock()
     s._cancel_requested_coids = {coid: None} if requested else {}
     if fail:
@@ -196,6 +198,8 @@ def _m(qty=3, filled=0):
     m._ts_order_id_to_client_order_id = {TS_ID: COID}
     m._order_last_status = {}
     m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
     m._cancel_verify_pending = {}
     m._status_watch = {}
     m._partial_orders = {}
@@ -417,6 +421,8 @@ def test_inflight_pending_update_runs_modify_recovery_instead_of_answering():
     assert order.status == OrderStatus.PENDING_UPDATE
     s = _stub(cache, [ts_order("OPN")])
     s._pending_modify_trigger_price = {order.client_order_id: Price.from_str("99.0")}
+    s._modify_inflight = {}
+    s._pending_amend_meta = {}
     assert _query(loop, s) is None
     s._check_order_statuses.assert_awaited_once()
     # no pending amend -> a normal ACCEPTED answer
@@ -425,7 +431,20 @@ def test_inflight_pending_update_runs_modify_recovery_instead_of_answering():
     # broker already terminal -> answer even with a pending amend
     s = _stub(cache, [ts_order("FLL", exec_qty=3)])
     s._pending_modify_trigger_price = {order.client_order_id: Price.from_str("99.0")}
+    s._modify_inflight = {}
+    s._pending_amend_meta = {}
     assert _query(loop, s).order_status == OrderStatus.FILLED
+    s._check_order_statuses.assert_not_awaited()
+
+
+def test_inflight_query_during_modify_put_returns_none():
+    """§241: NT's in-flight check on a PENDING_UPDATE order whose PUT is still in flight
+    gets no report (NT retries) - never ACCEPTED at the old price, never a recovery run."""
+    loop, _, cache, order = _engine("accepted")
+    order.apply(TestEventStubs.order_pending_update(order))
+    s = _stub(cache, [ts_order("OPN")])
+    s._modify_inflight = {order.client_order_id: 1}
+    assert _query(loop, s) is None
     s._check_order_statuses.assert_not_awaited()
 
 

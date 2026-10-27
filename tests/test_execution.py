@@ -8,6 +8,7 @@ client methods accept the correct NautilusTrader command types.
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from tradestation_nt_community.execution import (
@@ -394,6 +395,11 @@ def _make_exec_mock(command: ModifyOrder, ts_order_id: str = "TS-001") -> MagicM
     m._clock.timestamp_ns.return_value = 0
     m._log = MagicMock()
     m._account_id = "SIM001"
+    m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
+    order.trigger_price = Price(21000.0, 2)
+    order.price = None
     return m
 
 
@@ -841,6 +847,8 @@ def _make_check_statuses_mock(
     m._client_order_id_to_ts_order_id = {coid: ts_order_id}
     m._order_last_status = {ts_order_id: "OPN"}
     m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
     m._cancel_verify_pending = {}
     m._verify_pending_cancels = AsyncMock()
 
@@ -875,6 +883,8 @@ class TestPendingUpdateRecovery:
         cmd = _make_modify_command_with_trigger()
         m = _make_exec_mock(cmd)
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._client.replace_order = AsyncMock(
             side_effect=Exception("Replace order failed (HTTP 400): Invalid stop price")
         )
@@ -888,6 +898,8 @@ class TestPendingUpdateRecovery:
         cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
         m = _make_exec_mock(cmd)
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._client.replace_order = AsyncMock(
             side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable")
         )
@@ -901,6 +913,8 @@ class TestPendingUpdateRecovery:
         cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
         m = _make_exec_mock(cmd)
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._ts_order_id_to_client_order_id = {}
         m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-STOP"})
         await TradeStationExecutionClient._modify_order(m, cmd)
@@ -955,6 +969,8 @@ class TestPendingUpdateRecovery:
         m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
         m._order_last_status = {"TS-STOP": "OPN"}
         m._pending_modify_trigger_price = {coid: Price(21050.0, 2)}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._cancel_verify_pending = {}
         m._verify_pending_cancels = AsyncMock()
         m._cache = MagicMock()
@@ -1012,6 +1028,8 @@ class TestPendingUpdateRecovery:
         m._ts_order_id_to_client_order_id = {"TS-STOP": coid}
         m._order_last_status = {}
         m._pending_modify_trigger_price = {coid: Price(21050.0, 2)}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._cache = MagicMock()
         m._cache.order.return_value = cached_order
         m._cache.instrument.return_value = instrument
@@ -1028,6 +1046,112 @@ class TestPendingUpdateRecovery:
         await TradeStationExecutionClient._process_order_event(m, ts_fill_event)
 
         m.generate_order_filled.assert_called_once()
+
+
+# =============================================================================
+# §241: a modify PUT in flight is never "recovered"; the amend is pending only after
+# an ambiguous failure (5xx / exception), never before the PUT
+# =============================================================================
+
+from tradestation_nt_community import execution as ex  # noqa: E402
+
+
+def _race_mock(old_stop: str = "21000.00") -> MagicMock:
+    """One mock that both _modify_order and _check_order_statuses can run on."""
+    m = _make_check_statuses_mock(
+        ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": old_stop}])
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
+    m._account_id = "SIM001"
+    order = m._cache.order.return_value          # status PENDING_UPDATE
+    order.trigger_price = Price(21000.0, 2)      # the price before the modify
+    order.price = None
+    return m
+
+
+class TestModifyInflight241:
+
+    @pytest.mark.asyncio
+    async def test_poll_during_inflight_put_never_rejects(self):
+        """The 2026-10-27 FESX race: the safety poll runs while the PUT is in flight and
+        sees the OLD StopPrice. No reject; the PUT's 200 emits exactly one OrderUpdated."""
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+
+        async def put(**kw):
+            assert m._modify_inflight == {cmd.client_order_id: 1}
+            assert cmd.client_order_id not in m._pending_modify_trigger_price
+            await TradeStationExecutionClient._check_order_statuses(m)   # poll lands mid-PUT
+            return {"OrderID": "TS-STOP"}
+
+        m._client.replace_order = AsyncMock(side_effect=put)
+        await TradeStationExecutionClient._modify_order(m, cmd)
+
+        m.generate_order_modify_rejected.assert_not_called()
+        m.generate_order_updated.assert_called_once()
+        assert m.generate_order_updated.call_args.kwargs["trigger_price"] == Price(21050.0, 2)
+        assert m._modify_inflight == {}
+        assert cmd.client_order_id not in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_5xx_records_pending_amend_with_meta(self):
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable"))
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        coid = cmd.client_order_id
+        assert m._pending_modify_trigger_price[coid] == (Price(21050.0, 2), None)
+        meta = m._pending_amend_meta[coid]
+        assert meta.prev == (Price(21000.0, 2), None)
+        assert meta.sent <= meta.stamp and meta.old_reads == 0
+        assert m._modify_inflight == {}
+        m.generate_order_modify_rejected.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timeout_exception_is_ambiguous_too(self):
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+        m._client.replace_order = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        assert cmd.client_order_id in m._pending_amend_meta
+        assert m._modify_inflight == {}
+
+    @pytest.mark.asyncio
+    async def test_4xx_records_nothing_and_clears_inflight(self):
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+        m._client.replace_order = AsyncMock(
+            side_effect=Exception("Replace order failed (HTTP 400): Invalid stop price"))
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_modify_rejected.assert_called_once()
+        assert m._pending_modify_trigger_price == {} and m._pending_amend_meta == {}
+        assert m._modify_inflight == {}
+
+    @pytest.mark.asyncio
+    async def test_overlapping_puts_counted_per_coid(self):
+        """Another PUT of the same order is already in flight: this one's finally must
+        not clear it."""
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+        m._modify_inflight = {cmd.client_order_id: 1}
+
+        async def put(**kw):
+            assert m._modify_inflight == {cmd.client_order_id: 2}
+            return {"OrderID": "TS-STOP"}
+
+        m._client.replace_order = AsyncMock(side_effect=put)
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m.generate_order_updated.assert_called_once()  # the in-put assert above did not raise
+        assert m._modify_inflight == {cmd.client_order_id: 1}
+
+    def test_drop_pending_amend_helper(self):
+        coid = ClientOrderId("O-STOP")
+        m = MagicMock()
+        m._pending_modify_trigger_price = {coid: (Price(1.0, 2), None)}
+        m._pending_amend_meta = {coid: ex._AmendMeta(sent=0.0, stamp=0.0, prev=(None, None))}
+        ex._drop_pending_amend(m, coid)
+        assert m._pending_modify_trigger_price == {} and m._pending_amend_meta == {}
 
 
 class TestTokenKeepalive:
@@ -1222,6 +1346,8 @@ class TestDonIsASessionPauseForGtc:
         m._ts_order_id_to_client_order_id = {"TS-1": coid}
         m._order_last_status = {}
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._cancel_verify_pending = {}
         m._verify_pending_cancels = AsyncMock()  # as in _make_check_statuses_mock
         m._cache = MagicMock()
@@ -1300,6 +1426,8 @@ class TestUncachedFillWarning:
         m._uncached_fill_callback = None
         m._order_last_status = {}
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._cancel_verify_pending = {}
         m._verify_pending_cancels = AsyncMock()
         m._cache = MagicMock()
@@ -1513,6 +1641,8 @@ class TestPendingUpdateRecoveryPrices:
         )
         m = _make_exec_mock(cmd)
         m._pending_modify_trigger_price = {}
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
         m._client.replace_order = AsyncMock(
             side_effect=Exception("Replace order failed (HTTP 503): Service Unavailable"))
         await TradeStationExecutionClient._modify_order(m, cmd)

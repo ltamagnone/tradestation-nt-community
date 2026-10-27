@@ -14,6 +14,8 @@ from tradestation_nt_community.execution import TradeStationExecutionClient as C
 async def test_cancel_pops_pending_modify_entry(deliver):
     m = _client()
     m._pending_modify_trigger_price = {ClientOrderId("O-EXIT"): 1.0}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
     await deliver(m, "CAN")
     m.generate_order_canceled.assert_called_once()
     assert ClientOrderId("O-EXIT") not in m._pending_modify_trigger_price

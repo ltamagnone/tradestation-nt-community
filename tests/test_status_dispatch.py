@@ -20,6 +20,8 @@ def _client(tif=TimeInForce.GTC, closed=False, status=None):
     m._ts_order_id_to_client_order_id = {"TS-1": ClientOrderId("O-EXIT")}
     m._order_last_status = {}
     m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
     m._cancel_verify_pending = {}
     m._status_watch = {}
     m._verify_pending_cancels = AsyncMock()
