@@ -372,6 +372,7 @@ def _modify_prices_match(ts_order: dict, trigger_price, price) -> bool:
 _MODIFY_OLD_READS_TO_REJECT = 2      # consecutive non-overlapping reads showing the OLD price
 _MODIFY_REJECT_MIN_AGE_S = 20.0      # ...and at least this long after the failure
 _MODIFY_RECOVERY_DEADLINE_S = 60.0   # from PUT send: old -> reject, neither -> broker prices
+_MODIFY_HARD_DEADLINE_S = 90.0       # from PUT send: decide even a very late failure (NT: ~126 s)
 
 
 def _classify_modify_read(ts_order: dict, requested: tuple, prev: tuple) -> str:
@@ -396,7 +397,8 @@ def _decide_amend(meta: "_AmendMeta", kind: str, read_started: float, now: float
     'updated'       broker has the requested prices
     'wait_old'      broker still has the previous prices; not yet N reads / min age
     'reject'        old after N non-overlapping reads and min age, or old at the deadline
-                    (deadline = 60 s from send, but not before stamp + min age)
+                    (deadline = 60 s from send, but not before stamp + min age,
+                    unless 90 s from send)
     'wait_unknown'  broker shows neither; keep pending (one WARNING, logged by the caller)
     'adopt_broker'  neither at the deadline: make NT match the broker's actual prices
     """
@@ -404,10 +406,13 @@ def _decide_amend(meta: "_AmendMeta", kind: str, read_started: float, now: float
         return "skip"
     if kind == "new":
         return "updated"
-    # The deadline runs from the send but never fires before the failure had its settling
-    # time: a PUT that fails late (retries + timeout) still waits stamp + min age.
-    past_deadline = (now - meta.sent >= _MODIFY_RECOVERY_DEADLINE_S
-                     and now - meta.stamp >= _MODIFY_REJECT_MIN_AGE_S)
+    # The deadline runs from the send but not before the failure had its settling time (a
+    # PUT that fails late still waits stamp + min age), capped by a hard ceiling so even a
+    # very late failure is decided before NT's own resolver fabricates a cancel.
+    since_send = now - meta.sent
+    past_deadline = (since_send >= _MODIFY_RECOVERY_DEADLINE_S
+                     and (now - meta.stamp >= _MODIFY_REJECT_MIN_AGE_S
+                          or since_send >= _MODIFY_HARD_DEADLINE_S))
     if kind == "old":
         if read_started > meta.last_read_done:          # overlapping reads count once
             meta.old_reads += 1
@@ -2179,6 +2184,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 getattr(order, "price", None) if command.price is not None else None)
         sent = _mono()
         _modify_inflight_begin(self, client_order_id)
+        put_sent = False  # set just before the PUT: an earlier exception is a local error
         try:
             ts_order_type = self._convert_order_type(order)
 
@@ -2197,6 +2203,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             else:
                 limit_price = None
 
+            put_sent = True
             response = await self._client.replace_order(
                 order_id=ts_order_id,
                 quantity=str(order.quantity),
@@ -2240,20 +2247,24 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         except Exception as e:
             err = str(e)
-            if "HTTP 4" in err:
+            if "HTTP 4" in err or not put_sent:
                 # 4xx: broker definitively rejected the modify — safe to surface
                 # as a rejection event so NT reverts PENDING_UPDATE and the
-                # strategy can react (retry, cancel, hedge).
+                # strategy can react (retry, cancel, hedge). A local error before the
+                # PUT left (nothing reached the broker) is just as definitive.
                 self._log.error(
-                    f"Modify rejected by broker for {client_order_id} "
-                    f"(requested trigger={command.trigger_price} price={command.price}): {err}"
+                    (f"Modify rejected by broker for {client_order_id} "
+                     if put_sent else
+                     f"Modify of {client_order_id} failed with a local error before the PUT "
+                     f"was sent ")
+                    + f"(requested trigger={command.trigger_price} price={command.price}): {err}"
                 )
                 self.generate_order_modify_rejected(
                     strategy_id=command.strategy_id,
                     instrument_id=command.instrument_id,
                     client_order_id=client_order_id,
                     venue_order_id=VenueOrderId(ts_order_id),
-                    reason=err[:150],
+                    reason=(err[:150] if put_sent else f"local error: {err}"[:150]),
                     ts_event=self._clock.timestamp_ns(),
                 )
                 _drop_pending_amend(self, client_order_id)  # resolved

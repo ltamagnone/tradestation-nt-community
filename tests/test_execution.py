@@ -1140,6 +1140,21 @@ class TestModifyInflight241:
         assert m._modify_inflight == {}
 
     @pytest.mark.asyncio
+    async def test_local_error_before_put_is_rejected_not_ambiguous(self):
+        """An exception raised before replace_order was awaited never reached the broker:
+        reject at once, record no amend."""
+        cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+        m = _race_mock()
+        m._convert_order_type = MagicMock(side_effect=ValueError("unsupported order type"))
+        m._client.replace_order = AsyncMock()
+        await TradeStationExecutionClient._modify_order(m, cmd)
+        m._client.replace_order.assert_not_called()
+        m.generate_order_modify_rejected.assert_called_once()
+        assert "local error" in m.generate_order_modify_rejected.call_args.kwargs["reason"]
+        assert m._pending_modify_trigger_price == {} and m._pending_amend_meta == {}
+        assert m._modify_inflight == {}
+
+    @pytest.mark.asyncio
     async def test_overlapping_puts_counted_per_coid(self):
         """Another PUT of the same order is already in flight: this one's finally must
         not clear it."""
@@ -1650,6 +1665,22 @@ class TestAmendRecovery241:
         assert ex._decide_amend(meta, "old", read_started=80.0, now=80.5) == "wait_old"
         assert ex._decide_amend(meta, "old", read_started=90.5, now=91.0) == "reject"
 
+    def test_decide_hard_ceiling_beats_min_age(self):
+        """A PUT that fails very late (429 sleep + timeout) must still be decided before
+        NT's fabricated OrderCanceled (~126 s): at sent + 90 s the min age is waived."""
+        assert ex._MODIFY_HARD_DEADLINE_S == 90.0
+        meta = ex._AmendMeta(sent=0.0, stamp=85.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=90.5, now=91.0) == "reject"
+        assert meta.old_reads == 1          # below N: the ceiling alone decided
+        meta = ex._AmendMeta(sent=0.0, stamp=85.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "neither", read_started=90.5, now=91.0) == "adopt_broker"
+
+    def test_decide_just_before_hard_ceiling_still_waits(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=70.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=79.5, now=80.0) == "wait_old"
+        meta = ex._AmendMeta(sent=0.0, stamp=85.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=89.0, now=89.5) == "wait_old"
+
     def test_decide_late_failure_neither_waits_then_adopts(self):
         meta = ex._AmendMeta(sent=0.0, stamp=70.0, prev=self.PREV)
         assert ex._decide_amend(meta, "neither", read_started=75.0, now=75.5) == "wait_unknown"
@@ -1732,6 +1763,7 @@ class TestAmendRecovery241:
                                                 "ExecutionPrice": "21000.0"}]}])
         await TradeStationExecutionClient._check_order_statuses(m)
         assert coid not in m._pending_modify_trigger_price   # dropped: no longer open
+        m.generate_order_filled.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_deadline_unusable_broker_price_is_unknown_not_old(self, monkeypatch):
