@@ -339,7 +339,8 @@ def _drop_pending_amend(client, client_order_id) -> None:
 
 
 def _pending_modify_prices(entry) -> tuple:
-    """The (trigger_price, price) a 5xx-pending modify requested. ``entry`` is the stored
+    """The (trigger_price, price) an amend pending after an ambiguous PUT failure (§241)
+    requested. ``entry`` is the stored
     tuple, or a bare value (a trigger price only, the pre-§212 shape), or None."""
     if isinstance(entry, tuple):
         return (entry + (None, None))[:2]
@@ -350,7 +351,7 @@ def _modify_prices_match(ts_order: dict, trigger_price, price) -> bool:
     """§212: True when the broker order carries EVERY price the modify requested —
     StopPrice == trigger_price (when requested) and LimitPrice == price (when requested).
     Nothing requested, or a requested field missing/unparseable at the broker -> False
-    (the recovery then rejects the modify, the safe direction)."""
+    (the recovery classifies the read as 'old' or 'neither', §241)."""
     wanted = [(v, f) for v, f in ((trigger_price, "StopPrice"), (price, "LimitPrice"))
               if v is not None]
     if not wanted:
@@ -363,6 +364,139 @@ def _modify_prices_match(ts_order: dict, trigger_price, price) -> bool:
         except (TypeError, ValueError):
             return False
     return True
+
+
+# §241 amend recovery after an ambiguous PUT failure. NT's own in-flight check queries a
+# PENDING_UPDATE order every ~5-6 s and, after inflight_check_retries (runner: 20), fabricates
+# OrderCanceled (~100-125 s) — so every pending amend is decided by the deadline below.
+_MODIFY_OLD_READS_TO_REJECT = 2      # consecutive non-overlapping reads showing the OLD price
+_MODIFY_REJECT_MIN_AGE_S = 20.0      # ...and at least this long after the failure
+_MODIFY_RECOVERY_DEADLINE_S = 60.0   # from PUT send: old -> reject, neither -> broker prices
+
+
+def _classify_modify_read(ts_order: dict, requested: tuple, prev: tuple) -> str:
+    """§241: 'new' when the broker shows every requested price, 'old' when it shows the
+    previous value of every requested field (previous known), else 'neither' (incl. a
+    STOP_LIMIT with one field moved, a missing/unparseable field, an unknown previous)."""
+    tp, px = requested
+    if _modify_prices_match(ts_order, tp, px):
+        return "new"
+    ptp = prev[0] if tp is not None else None
+    ppx = prev[1] if px is not None else None
+    if ((tp is None or ptp is not None) and (px is None or ppx is not None)
+            and _modify_prices_match(ts_order, ptp, ppx)):
+        return "old"
+    return "neither"
+
+
+def _decide_amend(meta: "_AmendMeta", kind: str, read_started: float, now: float) -> str:
+    """§241: what one broker read means for a pending amend. Pure apart from meta counters.
+
+    'skip'          the read started before the PUT failed: its prices predate the outcome
+    'updated'       broker has the requested prices
+    'wait_old'      broker still has the previous prices; not yet N reads / min age
+    'reject'        old after N non-overlapping reads and min age, or old at the deadline
+    'wait_unknown'  broker shows neither; keep pending (one WARNING, logged by the caller)
+    'adopt_broker'  neither at the deadline: make NT match the broker's actual prices
+    """
+    if read_started <= meta.stamp:
+        return "skip"
+    if kind == "new":
+        return "updated"
+    past_deadline = now - meta.sent >= _MODIFY_RECOVERY_DEADLINE_S
+    if kind == "old":
+        if read_started > meta.last_read_done:          # overlapping reads count once
+            meta.old_reads += 1
+            meta.last_read_done = now
+        if past_deadline or (meta.old_reads >= _MODIFY_OLD_READS_TO_REJECT
+                             and now - meta.stamp >= _MODIFY_REJECT_MIN_AGE_S):
+            return "reject"
+        return "wait_old"
+    meta.old_reads = 0                                   # "consecutive" old reads
+    meta.last_read_done = now
+    return "adopt_broker" if past_deadline else "wait_unknown"
+
+
+def _broker_prices(client, cached_order, ts_order: dict, requested: tuple):
+    """§241: the broker's actual (trigger, price) for the requested fields as NT Prices
+    at the instrument's precision; None when the instrument or a value is unusable."""
+    inst = client._cache.instrument(cached_order.instrument_id)
+    if inst is None:
+        return None
+    out = []
+    for want, field in zip(requested, ("StopPrice", "LimitPrice")):
+        if want is None:
+            out.append(None)
+            continue
+        raw = ts_order.get(field)
+        try:
+            out.append(inst.make_price(float(raw)))
+        except (TypeError, ValueError):
+            return None
+    return tuple(out)
+
+
+def _recover_amend(client, cached_order, client_order_id, ts_order_id: str,
+                   ts_order: dict, read_started: float) -> None:
+    """§241: resolve (or keep) one pending amend from one broker read."""
+    requested = _pending_modify_prices(
+        client._pending_modify_trigger_price.get(client_order_id))
+    meta = client._pending_amend_meta.get(client_order_id)
+    if meta is None:  # defensive: an amend recorded without meta decides from now on
+        meta = _AmendMeta(sent=_mono(), stamp=float("-inf"), prev=(None, None))
+        client._pending_amend_meta[client_order_id] = meta
+    kind = _classify_modify_read(ts_order, requested, meta.prev)
+    now = _mono()
+    decision = _decide_amend(meta, kind, read_started, now)
+    broker = (f"broker StopPrice={ts_order.get('StopPrice')} "
+              f"LimitPrice={ts_order.get('LimitPrice')}")
+    asked = (f"requested trigger={requested[0]} price={requested[1]}, "
+             f"previous trigger={meta.prev[0]} price={meta.prev[1]}")
+    age = f"{now - meta.stamp:.0f}s after the failed PUT"
+    common = dict(strategy_id=cached_order.strategy_id,
+                  instrument_id=cached_order.instrument_id,
+                  client_order_id=client_order_id,
+                  venue_order_id=VenueOrderId(ts_order_id),
+                  ts_event=client._clock.timestamp_ns())
+    if decision == "skip":
+        return
+    if decision == "updated":
+        client.generate_order_updated(quantity=cached_order.quantity, price=requested[1],
+                                      trigger_price=requested[0], **common)
+        _drop_pending_amend(client, client_order_id)
+        client._log.info(f"[MODIFY-RECOVERY] {client_order_id} amend landed: {broker}; "
+                         f"{asked} ({age}) -> OrderUpdated")
+    elif decision == "wait_old":
+        client._log.info(f"[MODIFY-RECOVERY] {client_order_id} broker still shows the "
+                         f"previous price (read {meta.old_reads}/"
+                         f"{_MODIFY_OLD_READS_TO_REJECT}, {age}): {broker}; {asked} - waiting")
+    elif decision == "wait_unknown":
+        if not meta.warned:
+            meta.warned = True
+            client._log.warning(f"[MODIFY-UNKNOWN] {client_order_id} broker shows neither "
+                                f"the requested nor the previous price: {broker}; {asked} "
+                                f"({age}) - kept pending, decided by "
+                                f"{_MODIFY_RECOVERY_DEADLINE_S:.0f}s after send")
+    elif decision == "adopt_broker":
+        adopted = _broker_prices(client, cached_order, ts_order, requested)
+        if adopted is not None:
+            client.generate_order_updated(quantity=cached_order.quantity, price=adopted[1],
+                                          trigger_price=adopted[0], **common)
+            _drop_pending_amend(client, client_order_id)
+            client._log.error(f"[MODIFY-UNKNOWN] {client_order_id} deadline: NT now "
+                              f"carries the broker's prices ({broker}); {asked} "
+                              f"-> OrderUpdated")
+            return
+        decision = "reject"  # unusable broker price: fall back to the safe direction
+    if decision == "reject":
+        client.generate_order_modify_rejected(
+            reason=(f"modify recovery: broker still shows the previous price after an "
+                    f"ambiguous PUT ({broker}; requested trigger={requested[0]} "
+                    f"price={requested[1]})")[:200],
+            **common)
+        _drop_pending_amend(client, client_order_id)
+        client._log.warning(f"[MODIFY-RECOVERY] {client_order_id} amend did not land: "
+                            f"{broker}; {asked} ({age}) -> OrderModifyRejected")
 
 
 def _track_partial(client, ts_order: dict, client_order_id, ts_now: int) -> None:
@@ -1270,13 +1404,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
         if (not terminal and cached is not None
                 and cached.status == OrderStatus.PENDING_UPDATE
                 and client_order_id in self._pending_modify_trigger_price):
-            # I-2: a 5xx-modify is being recovered. Answering ACCEPTED here would move the
-            # order out of PENDING_UPDATE and leave NT on the OLD trigger price. Run the
-            # recovery (compares the broker's StopPrice with the requested one) right now
-            # instead of waiting for the 60 s safety poll, and let NT retry.
+            # I-2: an amend whose PUT failed ambiguously is being recovered (§241).
+            # Answering ACCEPTED here would move the order out of PENDING_UPDATE and leave
+            # NT on the OLD trigger price. Run the recovery (compares the broker's StopPrice
+            # with the requested one) right now instead of waiting for the 60 s safety
+            # poll, and let NT retry.
             self._log.info(
                 f"[INFLIGHT-QUERY] {client_order_id} PENDING_UPDATE with a pending amend - "
-                f"running the 5xx-modify recovery instead of answering"
+                f"running the amend recovery instead of answering"
             )
             try:
                 await self._check_order_statuses()
@@ -2550,6 +2685,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 and not self._status_watch):
             return  # Nothing tracked yet
 
+        read_started = _mono()  # §241: a read started before an amend failed never decides
         try:
             orders = await self._client.get_orders(
                 account_keys=self._account_id,
@@ -2612,16 +2748,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     self._log, status, ts_order_id, client_order_id, cached_order)
                 continue
 
-            # --- PENDING_UPDATE recovery ---
-            # An in-flight amend had a 5xx: the adapter emitted no event, leaving the
-            # order stuck in PENDING_UPDATE. Compare TS's current stop price to the
-            # requested new price to decide whether the modify actually went through.
+            # --- amend recovery (§212/§241) ---
+            # Only after a modify PUT failed ambiguously (5xx / exception). A PUT still in
+            # flight is never "recovered": its own answer decides (the 2026-10-27 FESX race).
             _TS_OPEN_STATUSES = _st.LIVE
             if cached_order.status == OrderStatus.PENDING_UPDATE and has_pending_amend:
                 if status not in _TS_OPEN_STATUSES:
-                    # Order closed/expired at TS (e.g. DAY order at market-close).
-                    # Discard the amend record and fall through to normal CAN/FLL/REJ
-                    # handling so the correct event is emitted.
+                    # Closed/expired at TS (e.g. DAY order at the close): drop the amend and
+                    # fall through so the normal CAN/FLL/REJ event is emitted.
                     _drop_pending_amend(self, client_order_id)
                     self._log.info(
                         f"[PENDING_UPDATE recovery] {client_order_id} no longer open "
@@ -2629,50 +2763,16 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     )
                     # fall through — no continue
                 else:
-                    # Order is still open: compare prices to determine amend outcome.
-                    pending_tp, pending_px = _pending_modify_prices(
-                        self._pending_modify_trigger_price.get(client_order_id))
-                    _drop_pending_amend(self, client_order_id)
-                    try:
-                        _price_match = _modify_prices_match(ts_order, pending_tp, pending_px)
-                        if _price_match:
-                            # TS has the new price — modify succeeded before the 5xx
-                            self.generate_order_updated(
-                                strategy_id=cached_order.strategy_id,
-                                instrument_id=cached_order.instrument_id,
-                                client_order_id=client_order_id,
-                                venue_order_id=VenueOrderId(ts_order_id),
-                                quantity=cached_order.quantity,
-                                price=pending_px,
-                                trigger_price=pending_tp,
-                                ts_event=self._clock.timestamp_ns(),
+                    if client_order_id not in self._modify_inflight:
+                        try:
+                            _recover_amend(self, cached_order, client_order_id, ts_order_id,
+                                           ts_order, read_started)
+                        except Exception as rec_e:
+                            self._log.error(
+                                f"[MODIFY-RECOVERY] comparison failed for "
+                                f"{client_order_id}: {rec_e}"
                             )
-                            self._log.info(
-                                f"[PENDING_UPDATE recovery] modify succeeded for {client_order_id}"
-                            )
-                        else:
-                            # TS still has old price — modify didn't go through; safe to reject
-                            self.generate_order_modify_rejected(
-                                strategy_id=cached_order.strategy_id,
-                                instrument_id=cached_order.instrument_id,
-                                client_order_id=client_order_id,
-                                venue_order_id=VenueOrderId(ts_order_id),
-                                reason=(
-                                    "5xx recovery: TS price(s) unchanged "
-                                    "— treating as rejected"
-                                ),
-                                ts_event=self._clock.timestamp_ns(),
-                            )
-                            self._log.warning(
-                                f"[PENDING_UPDATE recovery] modify failed for "
-                                f"{client_order_id} — rejecting"
-                            )
-                    except Exception as rec_e:
-                        self._log.error(
-                            f"[PENDING_UPDATE recovery] comparison failed for "
-                            f"{client_order_id}: {rec_e}"
-                        )
-                    continue  # recovery handled this order — skip normal status processing
+                    continue  # open order with a pending amend: no other status event
 
             venue_order_id = VenueOrderId(ts_order_id)
             ts_now = self._clock.timestamp_ns()

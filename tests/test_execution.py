@@ -872,6 +872,14 @@ def _make_check_statuses_mock(
     return m
 
 
+def _arm_amend(m, coid, requested, prev, *, sent=-100.0, stamp=-99.0, old_reads=0):
+    """§241: a pending amend as _modify_order records it after an ambiguous PUT failure."""
+    from tradestation_nt_community.execution import _AmendMeta
+    m._pending_modify_trigger_price[coid] = requested
+    m._pending_amend_meta[coid] = _AmendMeta(sent=sent, stamp=stamp, prev=prev,
+                                             old_reads=old_reads)
+
+
 class TestPendingUpdateRecovery:
     """PENDING_UPDATE recovery in _check_order_statuses after a 5xx in _modify_order."""
 
@@ -930,7 +938,7 @@ class TestPendingUpdateRecovery:
         m = _make_check_statuses_mock(
             ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21050.0"}]
         )
-        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
+        _arm_amend(m, coid, (Price(21050.0, 2), None), (Price(21000.0, 2), None))
 
         await TradeStationExecutionClient._check_order_statuses(m)
 
@@ -939,17 +947,20 @@ class TestPendingUpdateRecovery:
         assert coid not in m._pending_modify_trigger_price
 
     @pytest.mark.asyncio
-    async def test_5xx_recovery_modify_failed(self):
-        """TS stop price still old: generate_order_modify_rejected emitted."""
+    async def test_5xx_recovery_modify_failed(self, monkeypatch):
+        """§241: TS still shows the OLD price on the 2nd non-overlapping read, ≥20 s after
+        the failure → OrderModifyRejected (reworded reason, no '5xx')."""
+        import tradestation_nt_community.execution as ex
+        monkeypatch.setattr(ex, "_mono", lambda: 0.0)
         coid = ClientOrderId("O-STOP")
         m = _make_check_statuses_mock(
-            ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21000.0"}]
-        )
-        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
-
+            ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21000.0"}])
+        _arm_amend(m, coid, (Price(21050.0, 2), None), (Price(21000.0, 2), None),
+                   sent=-31.0, stamp=-30.0, old_reads=1)
         await TradeStationExecutionClient._check_order_statuses(m)
-
         m.generate_order_modify_rejected.assert_called_once()
+        reason = m.generate_order_modify_rejected.call_args.kwargs["reason"]
+        assert "5xx" not in reason and reason.startswith("modify recovery:")
         m.generate_order_updated.assert_not_called()
         assert coid not in m._pending_modify_trigger_price
 
@@ -997,7 +1008,7 @@ class TestPendingUpdateRecovery:
         m = _make_check_statuses_mock(
             ts_orders=[{"OrderID": "TS-STOP", "Status": "DON", "StopPrice": "21050.0"}]
         )
-        m._pending_modify_trigger_price[coid] = Price(21050.0, 2)
+        _arm_amend(m, coid, (Price(21050.0, 2), None), (Price(21000.0, 2), None))
 
         await TradeStationExecutionClient._check_order_statuses(m)
 
@@ -1574,6 +1585,152 @@ class TestUncachedFillWarning:
         assert m._log.info.call_count == 0
 
 
+class TestAmendRecovery241:
+    """§241 recovery after an ambiguous PUT failure."""
+
+    REQ = (Price(21050.0, 2), None)
+    PREV = (Price(21000.0, 2), None)
+
+    def _mock(self, stop: str, monkeypatch, now: float = 0.0):
+        monkeypatch.setattr(ex, "_mono", lambda: now)
+        m = _make_check_statuses_mock(
+            ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": stop}])
+        m._modify_inflight = {}
+        m._pending_amend_meta = {}
+        inst = MagicMock()
+        inst.make_price = lambda v: Price(v, 2)
+        m._cache.instrument.return_value = inst
+        return m, ClientOrderId("O-STOP")
+
+    # --- pure helpers ---
+
+    def test_classify(self):
+        c = ex._classify_modify_read
+        assert c({"StopPrice": "21050.0"}, self.REQ, self.PREV) == "new"
+        assert c({"StopPrice": "21000.0"}, self.REQ, self.PREV) == "old"
+        assert c({"StopPrice": "20990.0"}, self.REQ, self.PREV) == "neither"
+        assert c({}, self.REQ, self.PREV) == "neither"
+        assert c({"StopPrice": "21000.0"}, self.REQ, (None, None)) == "neither"  # prev unknown
+
+    def test_decide_skips_read_started_before_failure(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=10.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=9.9, now=40.0) == "skip"
+        assert meta.old_reads == 0
+
+    def test_decide_old_needs_n_reads_and_min_age(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=1.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=2.0, now=2.5) == "wait_old"
+        # N reads ok, but the age is only 7.5 s
+        assert ex._decide_amend(meta, "old", read_started=8.0, now=8.5) == "wait_old"
+        assert meta.old_reads == 2
+        assert ex._decide_amend(meta, "old", read_started=21.5, now=22.0) == "reject"  # age >= 20 s
+
+    def test_decide_overlapping_read_counts_once(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=1.0, prev=self.PREV)
+        ex._decide_amend(meta, "old", read_started=30.0, now=30.5)
+        # a concurrent read that STARTED before the previous counted read was processed
+        assert ex._decide_amend(meta, "old", read_started=30.2, now=30.6) == "wait_old"
+        assert meta.old_reads == 1
+
+    def test_decide_neither_resets_and_adopts_at_deadline(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=1.0, prev=self.PREV, old_reads=1)
+        assert ex._decide_amend(meta, "neither", read_started=5.0, now=5.5) == "wait_unknown"
+        assert meta.old_reads == 0
+        assert ex._decide_amend(meta, "neither", read_started=60.0, now=60.5) == "adopt_broker"
+
+    def test_decide_old_at_deadline_rejects_regardless_of_n(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=45.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=60.0, now=60.5) == "reject"
+
+    def test_deadline_beats_nt_inflight_resolver(self):
+        """NT fabricates OrderCanceled after inflight_check_retries (runner: 20) queries
+        ~5-6 s apart (about 100-125 s). The adapter must decide well before."""
+        assert ex._MODIFY_RECOVERY_DEADLINE_S <= 75.0
+        assert ex._MODIFY_REJECT_MIN_AGE_S < ex._MODIFY_RECOVERY_DEADLINE_S
+        assert ex._MODIFY_OLD_READS_TO_REJECT >= 2
+
+    # --- through _check_order_statuses ---
+
+    @pytest.mark.asyncio
+    async def test_new_price_updates_and_logs_requested_vs_broker(self, monkeypatch):
+        m, coid = self._mock("21050.0", monkeypatch)
+        _arm_amend(m, coid, self.REQ, self.PREV)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_updated.assert_called_once()
+        assert coid not in m._pending_modify_trigger_price and coid not in m._pending_amend_meta
+        msg = " ".join(str(c.args[0]) for c in m._log.info.call_args_list)
+        assert "[MODIFY-RECOVERY]" in msg and "21050" in msg
+
+    @pytest.mark.asyncio
+    async def test_first_old_read_waits(self, monkeypatch):
+        m, coid = self._mock("21000.0", monkeypatch, now=0.0)
+        _arm_amend(m, coid, self.REQ, self.PREV, sent=-3.0, stamp=-2.0)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_modify_rejected.assert_not_called()
+        m.generate_order_updated.assert_not_called()
+        assert m._pending_amend_meta[coid].old_reads == 1
+
+    @pytest.mark.asyncio
+    async def test_neither_warns_once_and_stays_pending(self, monkeypatch):
+        m, coid = self._mock("20990.0", monkeypatch, now=0.0)
+        _arm_amend(m, coid, self.REQ, self.PREV, sent=-3.0, stamp=-2.0)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m._order_last_status["TS-STOP"] = "OPN"
+        await TradeStationExecutionClient._check_order_statuses(m)
+        warns = [c for c in m._log.warning.call_args_list if "[MODIFY-UNKNOWN]" in str(c.args[0])]
+        assert len(warns) == 1
+        assert "20990" in str(warns[0].args[0]) and "21050" in str(warns[0].args[0])
+        m.generate_order_modify_rejected.assert_not_called()
+        m.generate_order_updated.assert_not_called()
+        assert coid in m._pending_modify_trigger_price
+
+    @pytest.mark.asyncio
+    async def test_read_started_before_failure_is_ignored(self, monkeypatch):
+        """The 5xx lands while the poll's GET is in flight: that snapshot predates the
+        outcome and must not count."""
+        clock = [100.0]
+        monkeypatch.setattr(ex, "_mono", lambda: clock[0])
+        m, coid = self._mock("21000.0", monkeypatch, now=100.0)
+        monkeypatch.setattr(ex, "_mono", lambda: clock[0])
+        rows = [{"OrderID": "TS-STOP", "Status": "OPN", "StopPrice": "21000.0"}]
+
+        async def get_orders(**kw):
+            clock[0] = 100.5                     # the PUT fails during the GET
+            _arm_amend(m, coid, self.REQ, self.PREV, sent=99.0, stamp=100.5)
+            return rows
+
+        m._client.get_orders = AsyncMock(side_effect=get_orders)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_modify_rejected.assert_not_called()
+        assert m._pending_amend_meta[coid].old_reads == 0
+
+    @pytest.mark.asyncio
+    async def test_inflight_put_skips_recovery_but_not_fills(self, monkeypatch):
+        m, coid = self._mock("21000.0", monkeypatch)
+        _arm_amend(m, coid, self.REQ, self.PREV, old_reads=5)
+        m._modify_inflight = {coid: 1}
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_modify_rejected.assert_not_called()
+        m.generate_order_updated.assert_not_called()
+        # a fill racing the in-flight modify is still processed
+        m._client.get_orders = AsyncMock(return_value=[{
+            "OrderID": "TS-STOP", "Status": "FLL", "StopPrice": "21000.0",
+            "FilledPrice": "21000.0", "Legs": [{"ExecQuantity": "1",
+                                                "ExecutionPrice": "21000.0"}]}])
+        await TradeStationExecutionClient._check_order_statuses(m)
+        assert coid not in m._pending_modify_trigger_price   # dropped: no longer open
+
+    @pytest.mark.asyncio
+    async def test_deadline_neither_adopts_broker_prices(self, monkeypatch):
+        m, coid = self._mock("20990.0", monkeypatch, now=0.0)
+        _arm_amend(m, coid, self.REQ, self.PREV, sent=-61.0, stamp=-60.0)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_updated.assert_called_once()
+        assert m.generate_order_updated.call_args.kwargs["trigger_price"] == Price(20990.0, 2)
+        errs = [c for c in m._log.error.call_args_list if "[MODIFY-UNKNOWN]" in str(c.args[0])]
+        assert len(errs) == 1
+
+
 # =============================================================================
 # §212: price-aware PENDING_UPDATE recovery for LIMIT / STOP_LIMIT modifies
 # =============================================================================
@@ -1581,55 +1738,70 @@ class TestUncachedFillWarning:
 class TestPendingUpdateRecoveryPrices:
     """A LIMIT modify stores (trigger=None, price); the recovery compares LimitPrice."""
 
-    async def _run(self, ts_order: dict, stored):
+    async def _run(self, ts_order: dict, stored, prev, monkeypatch, old_reads=1,
+                   sent=-31.0):
+        monkeypatch.setattr(ex, "_mono", lambda: 0.0)
         coid = ClientOrderId("O-STOP")
         m = _make_check_statuses_mock(ts_orders=[{"OrderID": "TS-STOP", "Status": "OPN",
                                                   **ts_order}])
-        m._pending_modify_trigger_price[coid] = stored
+        m._cache.instrument.return_value.make_price = lambda v: Price(v, 2)
+        _arm_amend(m, coid, stored, prev, sent=sent, stamp=sent + 1.0, old_reads=old_reads)
         await TradeStationExecutionClient._check_order_statuses(m)
         assert coid not in m._pending_modify_trigger_price
         return m
 
     @pytest.mark.asyncio
-    async def test_limit_modify_recovered_as_updated_when_broker_has_new_limit(self):
-        m = await self._run({"LimitPrice": "101.0"}, (None, Price(101.0, 2)))
+    async def test_limit_modify_recovered_as_updated_when_broker_has_new_limit(
+            self, monkeypatch):
+        m = await self._run({"LimitPrice": "101.0"}, (None, Price(101.0, 2)),
+                            (None, Price(100.0, 2)), monkeypatch)
         m.generate_order_updated.assert_called_once()
         kw = m.generate_order_updated.call_args.kwargs
         assert kw["price"] == Price(101.0, 2) and kw["trigger_price"] is None
         m.generate_order_modify_rejected.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_limit_modify_rejected_when_broker_kept_old_limit(self):
-        m = await self._run({"LimitPrice": "100.0"}, (None, Price(101.0, 2)))
+    async def test_limit_modify_rejected_when_broker_kept_old_limit(self, monkeypatch):
+        m = await self._run({"LimitPrice": "100.0"}, (None, Price(101.0, 2)),
+                            (None, Price(100.0, 2)), monkeypatch)
         m.generate_order_modify_rejected.assert_called_once()
         m.generate_order_updated.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stop_modify_recovery_unchanged(self):
-        m = await self._run({"StopPrice": "99.0"}, (Price(99.0, 2), None))
+    async def test_stop_modify_recovery_unchanged(self, monkeypatch):
+        m = await self._run({"StopPrice": "99.0"}, (Price(99.0, 2), None),
+                            (Price(98.0, 2), None), monkeypatch)
         kw = m.generate_order_updated.call_args.kwargs
         assert kw["trigger_price"] == Price(99.0, 2) and kw["price"] is None
 
     @pytest.mark.asyncio
-    async def test_stop_limit_modify_needs_both_prices(self):
+    async def test_stop_limit_one_field_moved_is_neither_until_deadline(self, monkeypatch):
+        """One field new, one old = 'neither' (§241): at the deadline NT adopts the
+        broker's actual prices instead of guessing."""
         m = await self._run({"StopPrice": "99.0", "LimitPrice": "98.0"},
-                            (Price(99.0, 2), Price(98.5, 2)))
-        m.generate_order_modify_rejected.assert_called_once()
-        m.generate_order_updated.assert_not_called()
+                            (Price(99.0, 2), Price(98.5, 2)),
+                            (Price(98.0, 2), Price(98.0, 2)), monkeypatch, sent=-61.0)
+        m.generate_order_modify_rejected.assert_not_called()
+        kw = m.generate_order_updated.call_args.kwargs
+        assert kw["trigger_price"] == Price(99.0, 2) and kw["price"] == Price(98.0, 2)
 
     @pytest.mark.asyncio
-    async def test_stop_limit_modify_both_match_is_updated(self):
+    async def test_stop_limit_modify_both_match_is_updated(self, monkeypatch):
         m = await self._run({"StopPrice": "99.0", "LimitPrice": "98.5"},
-                            (Price(99.0, 2), Price(98.5, 2)))
+                            (Price(99.0, 2), Price(98.5, 2)),
+                            (Price(98.0, 2), Price(98.0, 2)), monkeypatch)
         kw = m.generate_order_updated.call_args.kwargs
         assert kw["trigger_price"] == Price(99.0, 2) and kw["price"] == Price(98.5, 2)
 
     @pytest.mark.asyncio
-    async def test_limit_price_not_mistaken_for_stop(self):
+    async def test_limit_price_not_mistaken_for_stop(self, monkeypatch):
         """Pre-§212 the stop comparison fell back to LimitPrice: a stop modify must match
-        StopPrice only."""
-        m = await self._run({"LimitPrice": "99.0"}, (Price(99.0, 2), None))
+        StopPrice only. StopPrice missing = 'neither'; at the deadline the unusable
+        broker price falls back to a reject."""
+        m = await self._run({"LimitPrice": "99.0"}, (Price(99.0, 2), None),
+                            (Price(98.0, 2), None), monkeypatch, sent=-61.0)
         m.generate_order_modify_rejected.assert_called_once()
+        m.generate_order_updated.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_modify_order_stores_both_prices(self):
