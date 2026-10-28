@@ -1639,8 +1639,21 @@ class TestAmendRecovery241:
         assert ex._decide_amend(meta, "neither", read_started=60.0, now=60.5) == "adopt_broker"
 
     def test_decide_old_at_deadline_rejects_regardless_of_n(self):
-        meta = ex._AmendMeta(sent=0.0, stamp=45.0, prev=self.PREV)
+        meta = ex._AmendMeta(sent=0.0, stamp=40.0, prev=self.PREV)
         assert ex._decide_amend(meta, "old", read_started=60.0, now=60.5) == "reject"
+
+    def test_decide_late_failure_still_gets_settling_time(self):
+        """§241 I2: a PUT that fails late (stamp = sent+70) is past the 60 s deadline at
+        once, but the deadline branch may not fire before stamp + min age."""
+        meta = ex._AmendMeta(sent=0.0, stamp=70.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "old", read_started=74.5, now=75.0) == "wait_old"
+        assert ex._decide_amend(meta, "old", read_started=80.0, now=80.5) == "wait_old"
+        assert ex._decide_amend(meta, "old", read_started=90.5, now=91.0) == "reject"
+
+    def test_decide_late_failure_neither_waits_then_adopts(self):
+        meta = ex._AmendMeta(sent=0.0, stamp=70.0, prev=self.PREV)
+        assert ex._decide_amend(meta, "neither", read_started=75.0, now=75.5) == "wait_unknown"
+        assert ex._decide_amend(meta, "neither", read_started=90.5, now=91.0) == "adopt_broker"
 
     def test_deadline_beats_nt_inflight_resolver(self):
         """NT fabricates OrderCanceled after inflight_check_retries (runner: 20) queries
@@ -1719,6 +1732,27 @@ class TestAmendRecovery241:
                                                 "ExecutionPrice": "21000.0"}]}])
         await TradeStationExecutionClient._check_order_statuses(m)
         assert coid not in m._pending_modify_trigger_price   # dropped: no longer open
+
+    @pytest.mark.asyncio
+    async def test_deadline_unusable_broker_price_is_unknown_not_old(self, monkeypatch):
+        """§241 I1: at the deadline with no usable broker price the outcome is UNKNOWN:
+        the reject says so (never 'still shows the previous price') and logs the
+        [MODIFY-UNKNOWN] ERROR."""
+        m, coid = self._mock("20990.0", monkeypatch, now=0.0)
+        m._client.get_orders = AsyncMock(return_value=[{"OrderID": "TS-STOP", "Status": "OPN"}])
+        _arm_amend(m, coid, self.REQ, self.PREV, sent=-61.0, stamp=-60.0)
+        await TradeStationExecutionClient._check_order_statuses(m)
+        m.generate_order_updated.assert_not_called()
+        m.generate_order_modify_rejected.assert_called_once()
+        reason = m.generate_order_modify_rejected.call_args.kwargs["reason"]
+        assert reason.startswith(
+            "modify recovery: outcome unknown at deadline, broker price unusable (")
+        assert "previous price" not in reason and "21050" in reason
+        errs = [c for c in m._log.error.call_args_list if "[MODIFY-UNKNOWN]" in str(c.args[0])]
+        assert len(errs) == 1 and "deadline" in str(errs[0].args[0])
+        assert not any("amend did not land" in str(c.args[0])
+                       for c in m._log.warning.call_args_list)
+        assert coid not in m._pending_modify_trigger_price
 
     @pytest.mark.asyncio
     async def test_deadline_neither_adopts_broker_prices(self, monkeypatch):

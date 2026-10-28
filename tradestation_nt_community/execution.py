@@ -396,6 +396,7 @@ def _decide_amend(meta: "_AmendMeta", kind: str, read_started: float, now: float
     'updated'       broker has the requested prices
     'wait_old'      broker still has the previous prices; not yet N reads / min age
     'reject'        old after N non-overlapping reads and min age, or old at the deadline
+                    (deadline = 60 s from send, but not before stamp + min age)
     'wait_unknown'  broker shows neither; keep pending (one WARNING, logged by the caller)
     'adopt_broker'  neither at the deadline: make NT match the broker's actual prices
     """
@@ -403,7 +404,10 @@ def _decide_amend(meta: "_AmendMeta", kind: str, read_started: float, now: float
         return "skip"
     if kind == "new":
         return "updated"
-    past_deadline = now - meta.sent >= _MODIFY_RECOVERY_DEADLINE_S
+    # The deadline runs from the send but never fires before the failure had its settling
+    # time: a PUT that fails late (retries + timeout) still waits stamp + min age.
+    past_deadline = (now - meta.sent >= _MODIFY_RECOVERY_DEADLINE_S
+                     and now - meta.stamp >= _MODIFY_REJECT_MIN_AGE_S)
     if kind == "old":
         if read_started > meta.last_read_done:          # overlapping reads count once
             meta.old_reads += 1
@@ -487,7 +491,17 @@ def _recover_amend(client, cached_order, client_order_id, ts_order_id: str,
                               f"carries the broker's prices ({broker}); {asked} "
                               f"-> OrderUpdated")
             return
-        decision = "reject"  # unusable broker price: fall back to the safe direction
+        # Unusable broker price at the deadline: the outcome is UNKNOWN. Reject (the safe
+        # direction), but say so and never claim the broker shows the previous price.
+        client.generate_order_modify_rejected(
+            reason=(f"modify recovery: outcome unknown at deadline, broker price unusable "
+                    f"({broker}; requested trigger={requested[0]} price={requested[1]}, "
+                    f"previous trigger={meta.prev[0]} price={meta.prev[1]})")[:200],
+            **common)
+        _drop_pending_amend(client, client_order_id)
+        client._log.error(f"[MODIFY-UNKNOWN] {client_order_id} deadline: broker price "
+                          f"unusable ({broker}); {asked} ({age}) -> OrderModifyRejected")
+        return
     if decision == "reject":
         client.generate_order_modify_rejected(
             reason=(f"modify recovery: broker still shows the previous price after an "
