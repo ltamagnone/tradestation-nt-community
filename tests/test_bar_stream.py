@@ -532,7 +532,7 @@ GOLDEN = {
                             "debug:Bar emitted for {BT5}: ts=2026-10-16T16:15:00Z",
                             "info:Bar SSE stream started for {BT5}",
                             ("info:[BAR-GAP-REPLAY] {BT5} ts=2026-10-16T16:10:00Z: closed while "
-                             "the stream was down - replayed from the reconnect seed")]},
+                             "the stream was down - replayed from the reconnect seed IsRealtime=False")]},
 }
 
 

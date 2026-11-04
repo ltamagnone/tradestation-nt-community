@@ -7,6 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from tradestation_nt_community import bar_tags
 from tradestation_nt_community.bar_gate import BarCloseGate
 from tradestation_nt_community.bar_gate import bar_end_ns
 from tradestation_nt_community.bar_gate import ohlcv
@@ -68,6 +69,14 @@ _VERIFY_DELAY_S = 120.0  # [BAR-RELEASE-DIVERGED]: REST read at bar end + this
 _BAR_RELEASE_MODES = ("off", "shadow", "on")
 _TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
+# Late stream bars (strategies §260): a Closed bar with IsRealtime False, or closed more than
+# step + _CLOSE_GRACE_NS after its end, is held at most _LATE_HOLD_S so the bars of one
+# reconnect batch go out together, each tagged in ``bar_tags`` ([BAR-LATE]). The batch is
+# flushed early by an on-time bar, a forming event, a reset or a stop. Intraday stream bars
+# only: polling and DAY bars are never held. An on-time bar is never delayed.
+_LATE_HOLD_S = 0.5  # fixed deadline from the batch's first bar (never extended)
+_LATE_BATCH_MAX = 64  # flushed at once at this size (a seed holds _STREAM_BARSBACK bars)
+
 
 def _intraday_step_ns(bar_type) -> int | None:
     """Bar step in ns for MINUTE/HOUR bars; None for DAY and anything unknown."""
@@ -89,7 +98,9 @@ def _ohlcv_str(event: dict) -> str:
 def _cancel_bar_jobs(client, bar_type) -> None:
     """Cancel a bar type's release timer and backfill (every reset / unsubscribe / reconnect /
     disconnect path). A cancelled backfill rolls its hold back: parked bars never reached a
-    strategy, and the next connection's seed replays them in order."""
+    strategy, and the next connection's seed replays them in order. A held late batch is
+    emitted first: its bars already count as emitted (the watermark is not touched)."""
+    _late_batch_flush(client, bar_type)
     timers = getattr(client, "_release_timers", None)
     if timers is None:  # a minimal fake self (older tests)
         return
@@ -107,6 +118,92 @@ def _cancel_bar_jobs(client, bar_type) -> None:
         task.cancel()
         missing = ",".join(_ts_str(p) for p in periods or [])
         client._log.info(f"[BAR-BACKFILL-CANCELLED] {bar_type} missing=[{missing}] reason=reset")
+
+
+def _late_batch_route(client, raw, bar_type, instrument, step_ns, tag=None) -> bool:
+    """Emit ``raw`` now, or hold it in the bar type's late batch (strategies §260).
+
+    ``step_ns`` None (DAY bars, polling) or a client without the batch state emits at once,
+    as before. A raw that is not late flushes the held batch first, so the order never
+    changes. Returns what ``_emit_released`` returns (the bar parsed); for a held raw that is
+    known now, because it is parsed here.
+    """
+    batches = getattr(client, "_late_batches", None)
+    if batches is None or step_ns is None:
+        return client._emit_released(raw, bar_type, instrument, tag)
+    ts_ns = bar_end_ns(raw.get("TimeStamp", ""))
+    lag_ns = client._clock.timestamp_ns() - ts_ns if ts_ns is not None else 0
+    late = (
+        ts_ns is not None
+        and raw.get("BarStatus") == "Closed"
+        and (raw.get("IsRealtime") is False or lag_ns > step_ns + _CLOSE_GRACE_NS)
+    )
+    if not late or not client._parse_bars([raw], bar_type, instrument):
+        _late_batch_flush(client, bar_type)
+        return client._emit_released(raw, bar_type, instrument, tag)
+    batch = batches.setdefault(bar_type, [])
+    batch.append((raw, instrument, tag, lag_ns))
+    if len(batch) >= _LATE_BATCH_MAX:
+        _late_batch_flush(client, bar_type)
+    elif bar_type not in client._late_timers:  # a fixed deadline: never re-armed by a later bar
+        try:
+            client._late_timers[bar_type] = client._loop.call_later(
+                _LATE_HOLD_S, _late_batch_quiet, client, bar_type
+            )
+        except Exception as e:  # noqa: BLE001 - no timer: never hold the bar
+            client._log.error(f"[BAR-LATE-ERROR] {bar_type} timer failed: {e!r}")
+            _late_batch_flush(client, bar_type)
+    return True
+
+
+def _late_batch_quiet(client, bar_type) -> None:
+    """The hold deadline (event loop timer callback)."""
+    try:
+        client._late_timers.pop(bar_type, None)
+        _late_batch_flush(client, bar_type)
+    except Exception as e:  # noqa: BLE001 - asyncio would swallow it into its own logger
+        client._log.error(f"[BAR-LATE-ERROR] {bar_type} flush failed: {e!r}")
+
+
+def _late_batch_flush(client, bar_type) -> None:
+    """Emit the held late batch, oldest first, each bar tagged and logged before NT gets it.
+
+    Every bar but the newest is ``superseded``. A failing tag or log never stops a bar; a
+    failing emit never stops the rest of the batch.
+    """
+    timers = getattr(client, "_late_timers", None)
+    if timers is None:
+        return
+    handle = timers.pop(bar_type, None)
+    if handle is not None:
+        handle.cancel()
+    batch = client._late_batches.pop(bar_type, None)  # popped first: a re-entry starts anew
+    if not batch:
+        return
+    n = len(batch)
+    for i, (raw, instrument, tag, lag_ns) in enumerate(batch, 1):
+        try:
+            is_rt = raw.get("IsRealtime")
+            bar_tags.tag(
+                bar_type,
+                bar_end_ns(raw.get("TimeStamp", "")),  # == the parsed Bar's ts_event
+                bar_tags.BarTag(
+                    late=True, superseded=i < n, is_realtime=is_rt, lag_s=lag_ns / 1e9,
+                    batch=(i, n),
+                ),
+            )
+            client._log.info(
+                f"[BAR-LATE] {bar_type} ts={raw.get('TimeStamp')} IsRealtime={is_rt} "
+                f"lag_s={lag_ns / 1e9:.3f} batch={i}/{n}"
+            )
+        except Exception as e:  # noqa: BLE001 - a tag or a log line never blocks the bar
+            client._log.error(f"[BAR-LATE-ERROR] {bar_type} tag failed: {e!r}")
+        try:
+            client._emit_released(raw, bar_type, instrument, tag)
+        except Exception as e:  # noqa: BLE001 - the rest of the batch still goes out
+            client._log.error(
+                f"[BAR-LATE-ERROR] {bar_type} emit of ts={raw.get('TimeStamp')} failed: {e!r}"
+            )
 
 
 def _bar_interval_secs(bar_type) -> int | None:
@@ -206,6 +303,9 @@ class TradeStationDataClient(LiveMarketDataClient):
         self._release_fired: dict[BarType, int] = {}  # newest release time already handled
         self._backfill_tasks: dict[BarType, asyncio.Task] = {}
         self._verify_tasks: dict[BarType, set] = {}  # [BAR-RELEASE-DIVERGED] REST reads
+        # Late stream bars held for one reconnect batch, and their hold timers (§260).
+        self._late_batches: dict[BarType, list] = {}
+        self._late_timers: dict[BarType, asyncio.TimerHandle] = {}
 
         # Quote/trade tick state (polling or streaming tasks)
         self._quote_subscriptions: dict[InstrumentId, asyncio.Task] = {}
@@ -254,7 +354,11 @@ class TradeStationDataClient(LiveMarketDataClient):
                     pass
             tasks.clear()
 
-        for bar_type in set(self._release_timers) | set(self._backfill_tasks):
+        for bar_type in (
+            set(self._release_timers)
+            | set(self._backfill_tasks)
+            | set(getattr(self, "_late_batches", {}))
+        ):
             _cancel_bar_jobs(self, bar_type)
         self._release_fired.clear()
         for tasks in list(self._verify_tasks.values()):
@@ -410,6 +514,8 @@ class TradeStationDataClient(LiveMarketDataClient):
 
         except asyncio.CancelledError:
             self._log.info(f"Bar SSE stream stopped for {bar_type}")
+        finally:
+            _late_batch_flush(self, bar_type)  # a stop never loses a held late bar
 
     def _emit_gated(
         self,
@@ -441,6 +547,9 @@ class TradeStationDataClient(LiveMarketDataClient):
         if step_ns is None:
             mode = "off"  # DAY bars and polling: the plain gate
         now_ns = self._clock.timestamp_ns() if mode != "off" else None
+        late_step = _intraday_step_ns(bar_type) if live_stream else None  # §260 late batch
+        if late_step is not None and event.get("BarStatus") != "Closed":
+            _late_batch_flush(self, bar_type)  # a forming event: the batch is complete
         if mode != "off":
             # Before on_event: in mode on the barrier must exist before the later bar is fed.
             try:
@@ -460,7 +569,7 @@ class TradeStationDataClient(LiveMarketDataClient):
                     self._log_snapshot(gate, raw, bar_type, now_ns)
                 except Exception as e:  # noqa: BLE001 - a log line never blocks the bar
                     self._log_release_error(bar_type, "snapshot", e)
-            self._emit_released(raw, bar_type, instrument)
+            _late_batch_route(self, raw, bar_type, instrument, late_step)
         if mode == "off":
             return
         try:
@@ -487,7 +596,8 @@ class TradeStationDataClient(LiveMarketDataClient):
         elif live_stream and raw.get("IsRealtime") is False:
             self._log.info(
                 f"[BAR-GAP-REPLAY] {bar_type} ts={raw.get('TimeStamp')}: closed while the "
-                f"stream was down - replayed from the reconnect seed"
+                f"stream was down - replayed from the reconnect seed "
+                f"IsRealtime={raw.get('IsRealtime')}"
             )
 
     def _emit_released(
@@ -575,7 +685,10 @@ class TradeStationDataClient(LiveMarketDataClient):
                     )
             elif self._bar_release_mode == "on":
                 for raw in gate.release_due(now_ns, _CLOSE_GRACE_NS):
-                    self._emit_released(raw, bar_type, instrument, tag="[BAR-RELEASE]")
+                    _late_batch_route(  # not Closed: never held; flushes a held batch first
+                        self, raw, bar_type, instrument, _intraday_step_ns(bar_type),
+                        "[BAR-RELEASE]",
+                    )
         except Exception as e:  # noqa: BLE001 - asyncio would swallow it into its own logger
             self._log.error(f"Bar release timer failed for {bar_type}: {e!r}")
 
@@ -679,6 +792,8 @@ class TradeStationDataClient(LiveMarketDataClient):
             else (_BACKFILL_DELAY_S, _BACKFILL_DELAY_S + _BACKFILL_RETRY_S)
         )
         completed = False
+        routed = False  # anything handed to the late batch path (flushed at the end)
+        late_step = _intraday_step_ns(bar_type)
         try:
             interval, unit = bar_spec_to_ts_params(bar_type.spec)
             found: dict[int, dict] = {}
@@ -729,12 +844,12 @@ class TradeStationDataClient(LiveMarketDataClient):
                         f"[BAR-BACKFILL-SKIP] {bar_type} ts={_ts_str(p)}: history bar still "
                         f"Open after the last read"
                     )
-                elif (
-                    mode == "on"
-                    and gate.backfill_ok(p)
-                    and self._emit_released(raw, bar_type, instrument, tag="[BAR-BACKFILL]")
-                ):
-                    gate.mark_emitted(p)
+                elif mode == "on" and gate.backfill_ok(p):
+                    routed = True
+                    if _late_batch_route(
+                        self, raw, bar_type, instrument, late_step, "[BAR-BACKFILL]"
+                    ):
+                        gate.mark_emitted(p)
             completed = True
         except asyncio.CancelledError:
             raise
@@ -749,11 +864,16 @@ class TradeStationDataClient(LiveMarketDataClient):
                 else:
                     gate.abort_backfill()
                 for raw, released in gate.release_hold():
+                    routed = True
                     if released:
-                        self._emit_released(raw, bar_type, instrument, tag="[BAR-RELEASE]")
+                        _late_batch_route(
+                            self, raw, bar_type, instrument, late_step, "[BAR-RELEASE]"
+                        )
                     else:
                         self._log_emit_kind(raw, bar_type, True)
-                        self._emit_released(raw, bar_type, instrument)
+                        _late_batch_route(self, raw, bar_type, instrument, late_step)
+                if routed:  # parked and backfilled bars are one batch: no further hold
+                    _late_batch_flush(self, bar_type)
 
     async def _poll_bars(
         self,
