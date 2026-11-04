@@ -5,7 +5,10 @@ consumer (the strategies runner) can look a received ``Bar`` up by ``(bar.bar_ty
 bar.ts_event)``. NT's ``Bar`` has no field for it. A bar is late when TradeStation sent its
 Closed with ``IsRealtime`` False, or more than one step + 10 s after its end. The late bars of
 one reconnect batch are tagged together: every bar except the newest is ``superseded`` (a newer
-bar of the same batch follows at once).
+bar of the same batch follows at once). ALL of them are superseded when the batch is flushed by
+a newer bar of the same type emitted right after it: an on-time Closed bar, or a
+``[BAR-RELEASE]`` of a newer bar (only the newest bar of a burst may place entries). An on-time
+emission drops any stale tag of its own ``(bar_type, ts)``.
 
 On-time bars, polled bars and DAY bars are never tagged: ``lookup`` answers None, and a reader
 must treat None as "not late" (fail-open). Everything runs on the event loop; there is no lock.
@@ -23,7 +26,10 @@ _KEEP = 64  # tags kept per bar type
 @dataclass(frozen=True)
 class BarTag:
     late: bool
-    superseded: bool  # a newer bar of the same late batch was emitted right after this one
+    # A newer bar was emitted right after this one: the next bar of its late batch (all but the
+    # newest), or - for every bar of the batch - a newer on-time Closed bar or [BAR-RELEASE]
+    # of the same type that flushed the batch.
+    superseded: bool
     is_realtime: bool | None  # the Closed event's IsRealtime; None when TradeStation omitted it
     lag_s: float  # wall clock minus bar end when the Closed arrived
     batch: tuple[int, int]  # (position, size), 1-based, oldest first
@@ -49,6 +55,16 @@ def lookup(bar_type, ts_ns) -> BarTag | None:
         return tags.get(int(ts_ns)) if tags else None
     except (TypeError, ValueError):
         return None
+
+
+def drop(bar_type, ts_ns) -> None:
+    """Forget the tag of ``(bar_type, ts_ns)`` if there is one."""
+    try:
+        tags = _store.get(str(bar_type))
+        if tags:
+            tags.pop(int(ts_ns), None)
+    except (TypeError, ValueError):
+        pass
 
 
 def clear() -> None:

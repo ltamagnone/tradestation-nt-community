@@ -254,7 +254,9 @@ async def test_batch_flushes_before_an_on_time_bar():
     assert bar_tags.lookup(BT, _ns("2026-10-16T16:10:00Z")) is None
 
 
-@pytest.mark.parametrize("trigger", ["on_time_closed", "open", "deadline", "reset"])
+@pytest.mark.parametrize(
+    "trigger", ["on_time_closed", "release", "open", "deadline", "reset"]
+)
 async def test_superseded_depends_on_the_flush_trigger(trigger):
     """Controller ruling 2026-11-04: only the newest bar of a burst may place entries."""
     fake = _enable(_fake([], mode="shadow"))
@@ -264,6 +266,9 @@ async def test_superseded_depends_on_the_flush_trigger(trigger):
     assert fake.emitted == []
     if trigger == "on_time_closed":
         _feed(fake, ev("16:15", "Closed"))
+    elif trigger == "release":  # mode on: _on_release_due emits the newer forming 16:15
+        step = data_mod._intraday_step_ns(BT)
+        assert data_mod._late_batch_route(fake, ev("16:15"), BT, None, step, "[BAR-RELEASE]")
     elif trigger == "open":
         _feed(fake, ev("16:15", "Open", False))
     elif trigger == "deadline":
@@ -271,13 +276,34 @@ async def test_superseded_depends_on_the_flush_trigger(trigger):
         h.cb(*h.args)
     else:
         data_mod._cancel_bar_jobs(fake, BT)
-    want = ["16:05", "16:10", "16:15"] if trigger == "on_time_closed" else ["16:05", "16:10"]
+    newer = trigger in ("on_time_closed", "release")
+    want = ["16:05", "16:10", "16:15"] if newer else ["16:05", "16:10"]
     assert fake.emitted == want
     old = bar_tags.lookup(BT, _ns("2026-10-16T16:05:00Z"))
     newest = bar_tags.lookup(BT, _ns("2026-10-16T16:10:00Z"))
     assert old.superseded is True and old.batch == (1, 2) and newest.batch == (2, 2)
-    assert newest.superseded is (trigger == "on_time_closed")
+    assert newest.superseded is newer
     assert bar_tags.lookup(BT, _ns("2026-10-16T16:15:00Z")) is None  # on time: untagged
+
+
+async def test_an_on_time_emission_drops_a_stale_tag_of_its_bar():
+    fake = _enable(_fake([], mode="off"))
+    end = _ns("2026-10-16T16:05:00Z")
+    bar_tags.tag(BT, end, bar_tags.BarTag(True, True, False, 900.0, (1, 2)))  # e.g. old episode
+    bar_tags.tag(BT, end - 300 * S, bar_tags.BarTag(True, False, False, 900.0, (1, 1)))
+    fake.now[0] = end + S // 10
+    _feed(fake, ev("16:05", "Closed"))
+    assert fake.emitted == ["16:05"]
+    assert bar_tags.lookup(BT, end) is None
+    assert bar_tags.lookup(BT, end - 300 * S) is not None  # other bars' tags are kept
+
+
+def test_drop_tolerates_misses_and_bad_input():
+    bar_tags.drop(FX, 1)
+    bar_tags.drop(None, "x")
+    bar_tags.tag(FX, 1, bar_tags.BarTag(True, False, None, 0.0, (1, 1)))
+    bar_tags.drop(FX, 1)
+    assert bar_tags.lookup(FX, 1) is None
 
 
 async def test_an_on_time_bar_without_a_held_batch_tags_nothing():

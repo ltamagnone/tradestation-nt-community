@@ -139,15 +139,30 @@ def _late_batch_route(client, raw, bar_type, instrument, step_ns, tag=None) -> b
         and (raw.get("IsRealtime") is False or lag_ns > step_ns + _CLOSE_GRACE_NS)
     )
     if not late:
-        # An on-time Closed bar that reaches NT is newer than the whole held batch: every
-        # held bar is superseded (operator rule: only the newest bar of a burst may enter).
+        # An on-time Closed bar, or a [BAR-RELEASE] of a newer bar, that reaches NT right
+        # after the held batch is its newest bar: every held bar is superseded (operator
+        # rule: only the newest bar of a burst may place entries).
+        held = batches.get(bar_type)
         newer = (
-            bar_type in batches
+            bool(held)
             and ts_ns is not None
-            and raw.get("BarStatus") == "Closed"
+            and (
+                raw.get("BarStatus") == "Closed"
+                or (
+                    tag == "[BAR-RELEASE]"
+                    and all(
+                        (bar_end_ns(r.get("TimeStamp", "")) or 0) < ts_ns for r, *_ in held
+                    )
+                )
+            )
             and bool(client._parse_bars([raw], bar_type, instrument))
         )
         _late_batch_flush(client, bar_type, newer_follows=newer)
+        if ts_ns is not None:
+            try:
+                bar_tags.drop(bar_type, ts_ns)  # an on-time bar never carries an old late tag
+            except Exception as e:  # noqa: BLE001 - never blocks the bar
+                client._log.error(f"[BAR-LATE-ERROR] {bar_type} tag drop failed: {e!r}")
         return client._emit_released(raw, bar_type, instrument, tag)
     if not client._parse_bars([raw], bar_type, instrument):
         _late_batch_flush(client, bar_type)
@@ -180,7 +195,8 @@ def _late_batch_flush(client, bar_type, newer_follows: bool = False) -> None:
     """Emit the held late batch, oldest first, each bar tagged and logged before NT gets it.
 
     Every bar but the newest is ``superseded``; with ``newer_follows`` (the flush is made by
-    an on-time Closed bar of the same type, emitted right after) every bar is. A forming
+    an on-time Closed bar, or a [BAR-RELEASE] of a newer bar, of the same type, emitted right
+    after) every bar is. A forming
     event, the deadline, a reset or a stop flush with it False. A failing tag or log never
     stops a bar; a failing emit never stops the rest of the batch.
     """
