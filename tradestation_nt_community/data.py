@@ -138,7 +138,18 @@ def _late_batch_route(client, raw, bar_type, instrument, step_ns, tag=None) -> b
         and raw.get("BarStatus") == "Closed"
         and (raw.get("IsRealtime") is False or lag_ns > step_ns + _CLOSE_GRACE_NS)
     )
-    if not late or not client._parse_bars([raw], bar_type, instrument):
+    if not late:
+        # An on-time Closed bar that reaches NT is newer than the whole held batch: every
+        # held bar is superseded (operator rule: only the newest bar of a burst may enter).
+        newer = (
+            bar_type in batches
+            and ts_ns is not None
+            and raw.get("BarStatus") == "Closed"
+            and bool(client._parse_bars([raw], bar_type, instrument))
+        )
+        _late_batch_flush(client, bar_type, newer_follows=newer)
+        return client._emit_released(raw, bar_type, instrument, tag)
+    if not client._parse_bars([raw], bar_type, instrument):
         _late_batch_flush(client, bar_type)
         return client._emit_released(raw, bar_type, instrument, tag)
     batch = batches.setdefault(bar_type, [])
@@ -165,11 +176,13 @@ def _late_batch_quiet(client, bar_type) -> None:
         client._log.error(f"[BAR-LATE-ERROR] {bar_type} flush failed: {e!r}")
 
 
-def _late_batch_flush(client, bar_type) -> None:
+def _late_batch_flush(client, bar_type, newer_follows: bool = False) -> None:
     """Emit the held late batch, oldest first, each bar tagged and logged before NT gets it.
 
-    Every bar but the newest is ``superseded``. A failing tag or log never stops a bar; a
-    failing emit never stops the rest of the batch.
+    Every bar but the newest is ``superseded``; with ``newer_follows`` (the flush is made by
+    an on-time Closed bar of the same type, emitted right after) every bar is. A forming
+    event, the deadline, a reset or a stop flush with it False. A failing tag or log never
+    stops a bar; a failing emit never stops the rest of the batch.
     """
     timers = getattr(client, "_late_timers", None)
     if timers is None:
@@ -188,7 +201,10 @@ def _late_batch_flush(client, bar_type) -> None:
                 bar_type,
                 bar_end_ns(raw.get("TimeStamp", "")),  # == the parsed Bar's ts_event
                 bar_tags.BarTag(
-                    late=True, superseded=i < n, is_realtime=is_rt, lag_s=lag_ns / 1e9,
+                    late=True,
+                    superseded=newer_follows or i < n,
+                    is_realtime=is_rt,
+                    lag_s=lag_ns / 1e9,
                     batch=(i, n),
                 ),
             )

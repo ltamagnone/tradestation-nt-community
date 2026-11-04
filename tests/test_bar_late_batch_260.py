@@ -249,8 +249,42 @@ async def test_batch_flushes_before_an_on_time_bar():
     _feed(fake, ev("16:10", "Closed"))  # on time: the batch goes first, then it, at once
     assert fake.emitted == ["16:05", "16:10"]
     assert _late_timers(fake.timers)[0].cancelled
-    assert bar_tags.lookup(BT, _ns("2026-10-16T16:05:00Z")).batch == (1, 1)
+    t = bar_tags.lookup(BT, _ns("2026-10-16T16:05:00Z"))
+    assert t.batch == (1, 1) and t.superseded is True  # the on-time 16:10 is the newest
     assert bar_tags.lookup(BT, _ns("2026-10-16T16:10:00Z")) is None
+
+
+@pytest.mark.parametrize("trigger", ["on_time_closed", "open", "deadline", "reset"])
+async def test_superseded_depends_on_the_flush_trigger(trigger):
+    """Controller ruling 2026-11-04: only the newest bar of a burst may place entries."""
+    fake = _enable(_fake([], mode="shadow"))
+    _seeded(fake, BT, "2026-10-16T16:00:00Z")
+    fake.now[0] = _ns("2026-10-16T16:15:00.1Z")
+    _feed(fake, ev("16:05", "Closed", False), ev("16:10", "Closed", False))  # one late batch
+    assert fake.emitted == []
+    if trigger == "on_time_closed":
+        _feed(fake, ev("16:15", "Closed"))
+    elif trigger == "open":
+        _feed(fake, ev("16:15", "Open", False))
+    elif trigger == "deadline":
+        (h,) = _late_timers(fake.timers)
+        h.cb(*h.args)
+    else:
+        data_mod._cancel_bar_jobs(fake, BT)
+    want = ["16:05", "16:10", "16:15"] if trigger == "on_time_closed" else ["16:05", "16:10"]
+    assert fake.emitted == want
+    old = bar_tags.lookup(BT, _ns("2026-10-16T16:05:00Z"))
+    newest = bar_tags.lookup(BT, _ns("2026-10-16T16:10:00Z"))
+    assert old.superseded is True and old.batch == (1, 2) and newest.batch == (2, 2)
+    assert newest.superseded is (trigger == "on_time_closed")
+    assert bar_tags.lookup(BT, _ns("2026-10-16T16:15:00Z")) is None  # on time: untagged
+
+
+async def test_an_on_time_bar_without_a_held_batch_tags_nothing():
+    fake = _enable(_fake([], mode="off"))
+    fake.now[0] = _ns("2026-10-16T16:05:00.1Z")
+    _feed(fake, ev("16:05", "Closed"))
+    assert fake.emitted == ["16:05"] and bar_tags._store == {}
 
 
 async def test_a_release_flushes_the_batch_first_and_is_never_held():
