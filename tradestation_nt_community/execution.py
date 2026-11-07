@@ -2683,7 +2683,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # §261c: spacing in SECONDS, independent of the status poll interval:
             # attempt n+1 not before MIN_AGE + 60*n (120/180/240 s), as with the
             # 60 s poll.  Placed after the give-up/delete branches so those are unchanged.
-            if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S + attempts * CANCEL_VERIFY_SPACING_S:
+            if now - first_seen < (
+                self._CANCEL_VERIFY_MIN_AGE_S + attempts * CANCEL_VERIFY_SPACING_S
+            ):
                 continue
             self._log.warning(
                 f"[CANCEL-ZOMBIE] Order {ts_order_id} was reported cancelled but is "
