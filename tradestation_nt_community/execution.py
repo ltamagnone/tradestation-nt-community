@@ -85,6 +85,9 @@ from nautilus_trader.model.orders import StopMarketOrder
 # classify_uncached_fill). Absorbs the 60 s stamp resolution and clock skew.
 _ALIVE_TOLERANCE_S = 60.0
 _ALIVE_STAMP_EVERY_S = 60.0
+# §261c: gap between §111 re-cancel attempts, independent of the status poll interval.
+# Also a capability marker: the runner polls at 30 s only if this exists.
+CANCEL_VERIFY_SPACING_S = 60.0
 _ORDER_MAP_META = "_meta"
 
 # Failures after which the POST may have reached TradeStation: the request was written and
@@ -1427,7 +1430,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # I-2: an amend whose PUT failed ambiguously is being recovered (§241).
             # Answering ACCEPTED here would move the order out of PENDING_UPDATE and leave
             # NT on the OLD trigger price. Run the recovery (compares the broker's StopPrice
-            # with the requested one) right now instead of waiting for the 60 s safety
+            # with the requested one) right now instead of waiting for the status safety
             # poll, and let NT retry.
             self._log.info(
                 f"[INFLIGHT-QUERY] {client_order_id} PENDING_UPDATE with a pending amend - "
@@ -2638,7 +2641,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
             if o.get("Status") in _st.LIVE
         }
         for ts_order_id in list(self._cancel_verify_pending):
-            first_seen, attempts, requested, alerted = self._cancel_verify_pending[ts_order_id]
+            entry = self._cancel_verify_pending.get(ts_order_id)
+            if entry is None:  # an overlapping call already deleted it
+                continue
+            first_seen, attempts, requested, alerted = entry
             if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S:
                 continue
             if ts_order_id not in live:
@@ -2677,7 +2683,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # §261c: spacing in SECONDS, independent of the status poll interval:
             # attempt n+1 not before MIN_AGE + 60*n (120/180/240 s), as with the
             # 60 s poll.  Placed after the give-up/delete branches so those are unchanged.
-            if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S + attempts * 60.0:
+            if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S + attempts * CANCEL_VERIFY_SPACING_S:
                 continue
             self._log.warning(
                 f"[CANCEL-ZOMBIE] Order {ts_order_id} was reported cancelled but is "

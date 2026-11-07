@@ -232,3 +232,15 @@ class TestReCancelSpacingInSeconds:
         )
         assert stub._client.cancel_order.await_count == 1
         assert stub._cancel_verify_pending["961146425"][1] == 1
+
+    async def test_entry_deleted_by_overlapping_call_is_skipped(self):
+        old = time.monotonic() - 300
+        stub = _stub({"A": (old, 0, True, False), "B": (old, 0, True, False)})
+
+        async def cancel_and_drop_other(order_id):
+            stub._cancel_verify_pending.pop("B", None)   # overlapping call deletes B
+        stub._client.cancel_order = AsyncMock(side_effect=cancel_and_drop_other)
+        await TradeStationExecutionClient._verify_pending_cancels(
+            stub, [_open_order("A"), _open_order("B")])
+        assert stub._client.cancel_order.await_count == 1
+        assert "B" not in stub._cancel_verify_pending
