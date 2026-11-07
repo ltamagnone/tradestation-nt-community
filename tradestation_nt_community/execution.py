@@ -1050,6 +1050,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # stamp only after the previous value is read
         self._alive_loaded = False
         self._last_alive_stamp_s = 0.0
+        self._last_status_poll_log_s = 0.0  # [STATUS-POLL] observe line throttle
         self._uncached_fill_callback = None
 
         # Account setup
@@ -2673,17 +2674,25 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 )
                 del self._cancel_verify_pending[ts_order_id]
                 continue
+            # §261c: spacing in SECONDS, independent of the status poll interval:
+            # attempt n+1 not before MIN_AGE + 60*n (120/180/240 s), as with the
+            # 60 s poll.  Placed after the give-up/delete branches so those are unchanged.
+            if now - first_seen < self._CANCEL_VERIFY_MIN_AGE_S + attempts * 60.0:
+                continue
             self._log.warning(
                 f"[CANCEL-ZOMBIE] Order {ts_order_id} was reported cancelled but is "
                 f"still {live[ts_order_id]} at the broker — re-issuing cancel "
                 f"(attempt {attempts + 1}/{self._CANCEL_VERIFY_MAX_ATTEMPTS}, §111)"
             )
+            # Count the attempt BEFORE the await: an overlapping _check_order_statuses
+            # (reconnect catch-up, NT in-flight query) then sees it and the spacing
+            # check above skips it -> at most one re-cancel per window.
+            self._cancel_verify_pending[ts_order_id] = (
+                first_seen, attempts + 1, requested, alerted)
             try:
                 await self._client.cancel_order(order_id=ts_order_id)
             except Exception as e:
                 self._log.warning(f"[CANCEL-ZOMBIE] re-cancel failed for {ts_order_id}: {e}")
-            self._cancel_verify_pending[ts_order_id] = (
-                first_seen, attempts + 1, requested, alerted)
 
     def _prune_closed_last_status(self, orders: list) -> None:
         """M-5: drop ``_order_last_status`` entries of orders that left the broker's list
@@ -2697,6 +2706,23 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     self._order_last_status.pop(ts_id, None)
         except Exception:
             pass  # housekeeping only
+
+    _STATUS_POLL_LOG_EVERY_S = 600.0
+
+    def _log_status_poll(self, n_orders: int, read_ms: float) -> None:
+        """Observe line, at most once per 10 min; never raises.  (ratelimit_remaining
+        is not included: it would need _request to stash the last response headers.)"""
+        try:
+            now = _mono()
+            if now - self._last_status_poll_log_s < self._STATUS_POLL_LOG_EVERY_S:
+                return
+            self._last_status_poll_log_s = now
+            self._log.info(
+                f"[STATUS-POLL] orders={n_orders} read_ms={read_ms:.0f} "
+                f"every={self._status_safety_poll_secs:.0f}s"
+            )
+        except Exception:
+            pass
 
     async def _check_order_statuses(self) -> None:
         """Fetch current orders and emit events for any status changes.
@@ -2719,6 +2745,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Fill poll: failed to fetch orders: {e}")
             return
 
+        self._log_status_poll(len(orders), (_mono() - read_started) * 1000.0)
         await self._verify_pending_cancels(orders)  # §111
         self._recheck_watched_statuses(orders)      # §149
         self._prune_closed_last_status(orders)      # M-5

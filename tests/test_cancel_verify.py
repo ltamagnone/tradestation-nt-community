@@ -177,3 +177,58 @@ class TestRequestedCancelStuck:
         await TradeStationExecutionClient._verify_pending_cancels(
             stub, [_open_order("1", "CAN")])
         assert "1" not in stub._cancel_verify_pending
+
+
+class TestReCancelSpacingInSeconds:
+    """§261c: the status poll runs every 30 s in the live runner, but the §111 re-cancel
+    cadence stays 120/180/240 s (attempt n+1 not before 120 + 60*n s since first seen)."""
+
+    async def _at(self, age, attempts):
+        stub = _stub({"961146425": (time.monotonic() - age, attempts, True, False)})
+        await TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()])
+        return stub
+
+    async def test_first_attempt_not_before_120s(self):
+        stub = await self._at(119, 0)
+        stub._client.cancel_order.assert_not_awaited()
+        stub = await self._at(121, 0)
+        stub._client.cancel_order.assert_awaited_once()
+
+    async def test_second_attempt_not_before_180s(self):
+        stub = await self._at(150, 1)      # a 30 s poll would have fired here
+        stub._client.cancel_order.assert_not_awaited()
+        assert stub._cancel_verify_pending["961146425"][1] == 1
+        stub = await self._at(181, 1)
+        stub._client.cancel_order.assert_awaited_once()
+
+    async def test_third_attempt_not_before_240s(self):
+        stub = await self._at(200, 2)
+        stub._client.cancel_order.assert_not_awaited()
+        stub = await self._at(241, 2)
+        stub._client.cancel_order.assert_awaited_once()
+
+    async def test_gives_up_after_three_even_when_young(self):
+        stub = await self._at(250, 3)      # give-up is not delayed by the spacing
+        assert "961146425" not in stub._cancel_verify_pending
+        stub._client.cancel_order.assert_not_awaited()
+        stub._log.error.assert_called()
+
+    async def test_gone_order_deleted_regardless_of_spacing(self):
+        stub = _stub({"961146425": (time.monotonic() - 125, 2, True, False)})
+        await TradeStationExecutionClient._verify_pending_cancels(
+            stub, [_open_order(status="CAN")])
+        assert "961146425" not in stub._cancel_verify_pending
+
+    async def test_overlapping_polls_send_at_most_one_recancel(self):
+        import asyncio
+        stub = _stub({"961146425": (time.monotonic() - 125, 0, True, False)})
+
+        async def slow_cancel(order_id):
+            await asyncio.sleep(0.01)
+        stub._client.cancel_order = AsyncMock(side_effect=slow_cancel)
+        await asyncio.gather(
+            TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()]),
+            TradeStationExecutionClient._verify_pending_cancels(stub, [_open_order()]),
+        )
+        assert stub._client.cancel_order.await_count == 1
+        assert stub._cancel_verify_pending["961146425"][1] == 1
