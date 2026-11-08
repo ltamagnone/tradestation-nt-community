@@ -120,6 +120,10 @@ class TradeStationExecClientConfig(LiveExecClientConfig, frozen=True, kw_only=Tr
     # this net, missed fills stay invisible until a reconnect (observed 2-3h
     # gaps in production paper trading).  0 disables.
     streaming_status_poll_secs: float = 60.0
+    # §266: one-shot by-id read of a MARKET order this many seconds after its accept,
+    # only when the order stream has not delivered its fill yet (a silently dead stream).
+    # A fill found there is booked and the order stream is reconnected. 0 disables.
+    fast_fill_probe_secs: float = 5.0
     extended_hours: bool = False  # If True, use DYP duration for equity orders (pre/post market)
     order_map_path: str | None = None  # Path to persist order-ID map across restarts (T-2)
     # E2 act mode (a LATER plan): hand reports for own cached orders to NT reconciliation.

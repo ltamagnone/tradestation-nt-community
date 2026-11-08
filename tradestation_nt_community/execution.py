@@ -302,6 +302,11 @@ def _resolve_fill_price(client, ts_order: dict, order, client_order_id) -> "floa
 # (asyncio's loop clock uses it).
 _mono = time.monotonic
 
+# §266 Part A: broker statuses the fast-fill probe books (and that prove the order stream
+# silent when the stream never delivered them). Held codes (WATCH, incl. TSC/SCN/RJR/UCH),
+# Open codes and unknown codes are left to the safety poll.
+_FAST_PROBE_TERMINAL: frozenset[str] = _st.FILLED | _st.REJECTED | (_st.CANCELED - _st.WATCH)
+
 
 @dataclass
 class _AmendMeta:
@@ -948,6 +953,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         order_map_path: str | None = None,
         node_group: str | None = None,
         report_own_orders: bool = False,
+        fast_fill_probe_secs: float = 5.0,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -997,6 +1003,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # so a low-frequency status poll runs alongside it.  0 disables.
         self._status_safety_poll_secs: float = streaming_status_poll_secs
         self._status_safety_poll_task: asyncio.Task | None = None
+        # §266 Part A: fast-fill probe for MARKET orders (see _fast_fill_probe). 0 disables.
+        self._fast_fill_probe_secs: float = float(fast_fill_probe_secs or 0.0)
+        self._fast_fill_probes: dict[ClientOrderId, asyncio.Task] = {}
+        self._last_forced_order_reconnect: float | None = None  # _mono() of the last one
 
         # §111: post-cancel zombie verification — orders this session already
         # reported cancelled, checked against the safety poll's own order fetch.
@@ -1248,6 +1258,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """Disconnect from TradeStation."""
         self._log.info("Disconnecting from TradeStation...")
         self._stamp_alive(force=True)  # §151: graceful stop = exact last-alive time
+        await TradeStationExecutionClient._cancel_fast_fill_probes(self)  # §266: before close
 
         # Stop fill polling and token keepalive
         if self._fill_poll_task:
@@ -1963,6 +1974,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             await TradeStationExecutionClient._cancel_after_ack(
                 self, order.client_order_id, ts_order_id)
+            # §266: never raises, so an accepted order can never reach the reject below.
+            TradeStationExecutionClient._schedule_fast_fill_probe(
+                self, order, ts_order_id)
 
         except Exception as e:
             TradeStationExecutionClient._forget_cancel_after_ack(self, order.client_order_id)
@@ -2912,8 +2926,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         except asyncio.CancelledError:
             self._log.info("Order fill SSE stream stopped")
 
-    async def _process_order_event(self, ts_order: dict) -> None:
-        """Process a single order event (from streaming or polling) and emit NT events."""
+    async def _process_order_event(self, ts_order: dict, source: str = "sse") -> None:
+        """Process a single order event (from streaming or polling) and emit NT events.
+
+        ``source`` is the fill-source label of an FLL (``sse`` from the stream,
+        ``fast-probe`` from the §266 probe)."""
         ts_order_id = ts_order.get("OrderID")
         if not ts_order_id:
             return
@@ -2959,7 +2976,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             try:
                 _, _, reason = _emit_fill_delta(
                     self, ts_order, ts_order_id, client_order_id, cached_order,
-                    venue_order_id, ts_now, "sse", partial=False)
+                    venue_order_id, ts_now, source, partial=False)
             except Exception:
                 self._order_last_status.pop(ts_order_id, None)  # un-advance: poll retries
                 raise
@@ -2972,7 +2989,174 @@ class TradeStationExecutionClient(LiveExecutionClient):
         else:
             _apply_status_tail(
                 self, status, ts_order, ts_order_id, client_order_id,
-                cached_order, venue_order_id, ts_now, stream=True)
+                cached_order, venue_order_id, ts_now, stream=(source == "sse"))
+
+    # -- FAST-FILL PROBE (§266 Part A) --------------------------------------------------
+
+    _FORCED_RECONNECT_MIN_S = 60.0  # §266: at most one forced order-stream reconnect per 60 s
+
+    def _schedule_fast_fill_probe(self, order, ts_order_id) -> None:
+        """§266: schedule the one-shot fast-fill probe for an accepted single MARKET order.
+
+        Streaming mode only (polling mode already reads every 5 s). Runs on the event loop as
+        an asyncio task (never a thread or a LiveClock timer); kept per client order id so
+        ``_disconnect`` cancels it. Never raises: it runs after ``OrderAccepted`` inside
+        ``_submit_order``'s try, whose except would reject a live order.
+        """
+        try:
+            secs = getattr(self, "_fast_fill_probe_secs", 0)
+            if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs <= 0:
+                return
+            if order.order_type != OrderType.MARKET:
+                return
+            if getattr(self, "_stream_client", None) is None:
+                return
+            probes = self._fast_fill_probes
+            coid = order.client_order_id
+            old = probes.pop(coid, None)
+            if old is not None:
+                old.cancel()
+            coro = TradeStationExecutionClient._fast_fill_probe(
+                self, coid, str(ts_order_id), float(secs), _mono())
+            try:
+                task = self._loop.create_task(coro)
+            except BaseException:
+                coro.close()  # never scheduled: no "coroutine was never awaited"
+                raise
+            probes[coid] = task
+
+            def _done(t, c=coid, d=probes):
+                if d.get(c) is t:
+                    d.pop(c, None)
+
+            task.add_done_callback(_done)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._log.error(
+                    f"Fast-fill probe (§266): could not schedule for "
+                    f"{getattr(order, 'client_order_id', '?')}: {e}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _fast_probe_already_seen(self, client_order_id, ts_order_id, status) -> bool:
+        """§266: True when the stream (or the safety poll) already delivered this order's
+        outcome: a terminal status recorded in ``_order_last_status`` (or ``status`` itself)
+        or the NT order closed. No broker call is made then."""
+        last = self._order_last_status.get(ts_order_id)
+        if last is not None and (last in _FAST_PROBE_TERMINAL
+                                 or (status is not None and last == status)):
+            return True
+        cached = self._cache.order(client_order_id)
+        return cached is not None and bool(cached.is_closed)
+
+    async def _fast_fill_probe(self, client_order_id, ts_order_id: str, secs: float,
+                               accepted_mono: float) -> None:
+        """§266 Part A: ``secs`` after a MARKET accept, book a fill the order stream dropped.
+
+        - Outcome already processed (the normal case, stream median <= 424 ms): nothing, no
+          broker call.
+        - Else one ``get_orders_by_id`` read. A read failure or no row = unknown (§217):
+          one WARNING, no event, no reconnect. Open / held / unknown codes: nothing (the
+          safety poll keeps watching).
+        - A terminal status the stream never delivered: fed through ``_process_order_event``
+          (fill-source ``fast-probe``), then ``[ORDER-STREAM-SILENT]``, one catch-up
+          ``_check_order_statuses`` and a forced order-stream reconnect (<= 1 per 60 s).
+
+        One fill only: ``_process_order_event`` checks and advances ``_order_last_status``
+        with no await in between, so whichever of stream / probe / poll comes second is a
+        no-op. Cancellation (disconnect) propagates; any other error is logged, never raised.
+        """
+        try:
+            await asyncio.sleep(secs)
+            if TradeStationExecutionClient._fast_probe_already_seen(
+                    self, client_order_id, ts_order_id, None):
+                return
+            try:
+                rows = await self._client.get_orders_by_id(self._account_id, [ts_order_id])
+            except Exception as e:  # noqa: BLE001 - unknown, never "not filled" (§217)
+                self._log.warning(
+                    f"Fast-fill probe (§266): TS order {ts_order_id} ({client_order_id}) "
+                    f"read failed ({type(e).__name__}: {e}) - state unknown, left to the "
+                    f"status safety poll")
+                return
+            seen_after = _mono() - accepted_mono
+            row = next((r for r in (rows or []) if isinstance(r, dict)
+                        and str(r.get("OrderID", "")) == ts_order_id), None)
+            status = row.get("Status") if row is not None else None
+            if not status:
+                self._log.warning(
+                    f"Fast-fill probe (§266): TS order {ts_order_id} ({client_order_id}) "
+                    f"not found at the broker - state unknown, left to the status safety poll")
+                return
+            if status not in _FAST_PROBE_TERMINAL:
+                self._log.debug(
+                    f"Fast-fill probe (§266): TS order {ts_order_id} ({client_order_id}) "
+                    f"status={status} - not terminal, left to the stream/safety poll")
+                return
+            if TradeStationExecutionClient._fast_probe_already_seen(
+                    self, client_order_id, ts_order_id, status):
+                return  # the stream (or the poll) delivered it while the read was in flight
+            try:
+                await TradeStationExecutionClient._process_order_event(
+                    self, row, source="fast-probe")
+            except Exception as e:  # noqa: BLE001
+                self._log.error(
+                    f"Fast-fill probe (§266): processing {status} for {client_order_id} "
+                    f"(TS {ts_order_id}) failed: {e} - the catch-up poll retries")
+            self._log.warning(
+                f"[ORDER-STREAM-SILENT] TS order {ts_order_id} ({client_order_id}): {status} "
+                f"seen by the fast probe {seen_after:.1f}s after accept, not by the order "
+                f"stream - catch-up poll + stream reconnect")
+            try:
+                await self._check_order_statuses()
+            except Exception as e:  # noqa: BLE001
+                self._log.error(f"Fast-fill probe (§266): catch-up poll failed: {e}")
+            TradeStationExecutionClient._force_order_stream_reconnect(self)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._log.error(
+                    f"Fast-fill probe (§266) for {client_order_id} (TS {ts_order_id}) "
+                    f"failed: {e}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _force_order_stream_reconnect(self) -> None:
+        """§266: ask the order stream to reconnect; at most one forced reconnect per 60 s."""
+        now = _mono()
+        last = self._last_forced_order_reconnect
+        if last is not None and now - last < self._FORCED_RECONNECT_MIN_S:
+            self._log.info(
+                f"Fast-fill probe (§266): order-stream reconnect skipped - one was forced "
+                f"{now - last:.0f}s ago (limit one per {self._FORCED_RECONNECT_MIN_S:.0f}s)")
+            return
+        stream_client = self._stream_client
+        if stream_client is None:
+            return
+        try:
+            ok = stream_client.request_reconnect("orders")
+        except Exception:  # noqa: BLE001 - documented never to raise; belt and braces
+            ok = False
+        if ok:
+            self._last_forced_order_reconnect = now
+        else:
+            self._log.warning(
+                "Fast-fill probe (§266): no active order stream to reconnect - the status "
+                "safety poll stays the backstop")
+
+    async def _cancel_fast_fill_probes(self) -> None:
+        """§266: cancel every pending probe (disconnect/stop); a cancelled probe does
+        nothing - no broker read, no exception."""
+        probes = getattr(self, "_fast_fill_probes", None)
+        if not isinstance(probes, dict) or not probes:
+            return
+        current = asyncio.current_task()
+        tasks = [t for t in probes.values() if t is not current]
+        probes.clear()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- INTERNAL METHODS -----------------------------------------------------------------
 
