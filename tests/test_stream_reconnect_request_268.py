@@ -1,4 +1,4 @@
-"""§266 A: TradeStationStreamClient.request_reconnect lever."""
+"""§268 A: TradeStationStreamClient.request_reconnect lever."""
 import asyncio
 
 import pytest

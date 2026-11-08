@@ -79,7 +79,7 @@ def _control_event(event: dict) -> tuple[str, str] | None:
 
 
 class _ReconnectHandle:
-    """One live reconnectable stream; ``fut`` is armed per connection (§266)."""
+    """One live reconnectable stream; ``fut`` is armed per connection (§268)."""
 
     __slots__ = ("kind", "fut")
 
@@ -93,7 +93,7 @@ def _is_order_stream(url: str) -> bool:
 
 
 async def _lines_or_reconnect(resp, fut: "asyncio.Future", url: str) -> AsyncIterator[str]:
-    """Yield ``resp`` lines until ``fut`` fires (a §266 reconnect request), then end."""
+    """Yield ``resp`` lines until ``fut`` fires (a §268 reconnect request), then end."""
     it = resp.aiter_lines().__aiter__()
     while True:
         nxt = asyncio.ensure_future(it.__anext__())
@@ -113,7 +113,7 @@ async def _lines_or_reconnect(resp, fut: "asyncio.Future", url: str) -> AsyncIte
         # gather(return_exceptions=True) swallows nxt's own CancelledError but re-raises a
         # cancel aimed at THIS task, so a stop arriving here is never lost.
         await asyncio.gather(nxt, return_exceptions=True)
-        _log.warning(f"[STREAM-RECONNECT-REQUESTED] §266 {url}: reconnecting on request")
+        _log.warning(f"[STREAM-RECONNECT-REQUESTED] §268 {url}: reconnecting on request")
         return
 
 
@@ -150,11 +150,11 @@ class TradeStationStreamClient:
         self._reconnect_delay = reconnect_delay_secs
         self._max_delay = reconnect_delay_secs * 8
         self._on_auth_error = on_auth_error
-        # §266: live streams that can be told to reconnect (the account order stream only).
+        # §268: live streams that can be told to reconnect (the account order stream only).
         self._reconnectable: set[_ReconnectHandle] = set()
 
     def request_reconnect(self, kind: str = "orders") -> bool:
-        """Ask the active ``kind`` stream to drop its connection and reconnect (§266).
+        """Ask the active ``kind`` stream to drop its connection and reconnect (§268).
 
         Only ``"orders"`` (the account order stream) exists today. The stream's own
         reconnect path then runs: no extra delay, the ``{"_reconnected": True}`` sentinel
@@ -188,7 +188,7 @@ class TradeStationStreamClient:
     async def _stream(
         self, url: str, params: dict[str, str] | None = None,
     ) -> AsyncIterator[dict]:
-        """Core SSE reader; registers order streams for ``request_reconnect`` (§266)."""
+        """Core SSE reader; registers order streams for ``request_reconnect`` (§268)."""
         handle = _ReconnectHandle("orders") if _is_order_stream(url) else None
         if handle is not None:
             self._reconnectable.add(handle)

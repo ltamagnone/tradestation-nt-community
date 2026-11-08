@@ -302,7 +302,7 @@ def _resolve_fill_price(client, ts_order: dict, order, client_order_id) -> "floa
 # (asyncio's loop clock uses it).
 _mono = time.monotonic
 
-# §266 Part A: broker statuses the fast-fill probe books (and that prove the order stream
+# §268 Part A: broker statuses the fast-fill probe books (and that prove the order stream
 # silent when the stream never delivered them). Held codes (WATCH, incl. TSC/SCN/RJR/UCH),
 # Open codes and unknown codes are left to the safety poll.
 _FAST_PROBE_TERMINAL: frozenset[str] = _st.FILLED | _st.REJECTED | (_st.CANCELED - _st.WATCH)
@@ -591,7 +591,7 @@ _STREAM_TERMINAL_SEEN_MAX = 256
 
 
 def _note_stream_terminal(client, ts_order_id: str, status: str) -> None:
-    """§266: remember that the order stream delivered a terminal status for this order
+    """§268: remember that the order stream delivered a terminal status for this order
     (before processing), so the fast probe can tell "stream silent" from "stream delivered,
     processing failed". Bounded; never raises."""
     try:
@@ -1021,7 +1021,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         # so a low-frequency status poll runs alongside it.  0 disables.
         self._status_safety_poll_secs: float = streaming_status_poll_secs
         self._status_safety_poll_task: asyncio.Task | None = None
-        # §266 Part A: fast-fill probe for MARKET orders (see _fast_fill_probe). 0 disables.
+        # §268 Part A: fast-fill probe for MARKET orders (see _fast_fill_probe). 0 disables.
         self._fast_fill_probe_secs: float = float(fast_fill_probe_secs or 0.0)
         self._fast_fill_probes: dict[ClientOrderId, asyncio.Task] = {}
         self._stream_terminal_seen: dict[str, str] = {}  # ts id -> terminal status the stream delivered
@@ -1116,7 +1116,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         import json as _json, os as _os
         tmp = self._order_map_path + f".{_os.getpid()}.tmp"
         with open(tmp, "w") as _f:
-            _f.write(_json.dumps(data))   # §266 B3: one write, not many small chunks
+            _f.write(_json.dumps(data))   # §268 B3: one write, not many small chunks
         _os.replace(tmp, self._order_map_path)
 
     def _stamp_alive(self, force: bool = False) -> None:
@@ -1181,7 +1181,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 existing[ts_id] = entry
             tmp = self._order_map_path + f".{_os.getpid()}.tmp"
             with open(tmp, "w") as _f:
-                _f.write(_json.dumps(existing))   # §266 B3: one write, not many small chunks
+                _f.write(_json.dumps(existing))   # §268 B3: one write, not many small chunks
             _os.replace(tmp, self._order_map_path)
         except Exception as exc:
             self._log.warning(f"[ORDER-MAP] Failed to persist order map: {exc}")
@@ -1278,9 +1278,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
     async def _disconnect(self) -> None:
         """Disconnect from TradeStation."""
         self._log.info("Disconnecting from TradeStation...")
-        self._disconnecting = True  # §266: no probe may be scheduled after the cancel below
+        self._disconnecting = True  # §268: no probe may be scheduled after the cancel below
         self._stamp_alive(force=True)  # §151: graceful stop = exact last-alive time
-        await TradeStationExecutionClient._cancel_fast_fill_probes(self)  # §266: before close
+        await TradeStationExecutionClient._cancel_fast_fill_probes(self)  # §268: before close
 
         # Stop fill polling and token keepalive
         if self._fill_poll_task:
@@ -1996,7 +1996,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
             )
             await TradeStationExecutionClient._cancel_after_ack(
                 self, order.client_order_id, ts_order_id)
-            # §266: never raises, so an accepted order can never reach the reject below.
+            # §268: never raises, so an accepted order can never reach the reject below.
             TradeStationExecutionClient._schedule_fast_fill_probe(
                 self, order, ts_order_id)
 
@@ -2089,7 +2089,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
                 legs.append((i, order, ts_order_id))
 
-            # §266 B3: one persist per group (was one per leg), still before any accept.
+            # §268 B3: one persist per group (was one per leg), still before any accept.
             if legs:
                 self._persist_order_map()
 
@@ -2952,7 +2952,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         """Process a single order event (from streaming or polling) and emit NT events.
 
         ``source`` is the fill-source label of an FLL (``sse`` from the stream,
-        ``fast-probe`` from the §266 probe)."""
+        ``fast-probe`` from the §268 probe)."""
         ts_order_id = ts_order.get("OrderID")
         if not ts_order_id:
             return
@@ -2964,7 +2964,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         status = ts_order.get("Status", "")
         last_status = self._order_last_status.get(ts_order_id, "")
         if source == "sse" and status in _FAST_PROBE_TERMINAL:
-            _note_stream_terminal(self, ts_order_id, status)  # before processing (§266)
+            _note_stream_terminal(self, ts_order_id, status)  # before processing (§268)
 
         if status == "FPR":
             _own = self._cache.order(client_order_id)
@@ -3015,12 +3015,12 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 self, status, ts_order, ts_order_id, client_order_id,
                 cached_order, venue_order_id, ts_now, stream=(source == "sse"))
 
-    # -- FAST-FILL PROBE (§266 Part A) --------------------------------------------------
+    # -- FAST-FILL PROBE (§268 Part A) --------------------------------------------------
 
-    _FORCED_RECONNECT_MIN_S = 60.0  # §266: at most one forced order-stream reconnect per 60 s
+    _FORCED_RECONNECT_MIN_S = 60.0  # §268: at most one forced order-stream reconnect per 60 s
 
     def _schedule_fast_fill_probe(self, order, ts_order_id) -> None:
-        """§266: schedule the one-shot fast-fill probe for an accepted single MARKET order.
+        """§268: schedule the one-shot fast-fill probe for an accepted single MARKET order.
 
         Streaming mode only (polling mode already reads every 5 s). Runs on the event loop as
         an asyncio task (never a thread or a LiveClock timer); kept per client order id so
@@ -3065,7 +3065,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 pass
 
     def _fast_probe_already_seen(self, client_order_id, ts_order_id, status) -> bool:
-        """§266: True when the stream (or the safety poll) already delivered this order's
+        """§268: True when the stream (or the safety poll) already delivered this order's
         outcome: a terminal status recorded in ``_order_last_status`` (or ``status`` itself)
         or the NT order closed. No broker call is made then."""
         last = self._order_last_status.get(ts_order_id)
@@ -3077,7 +3077,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
     async def _fast_fill_probe(self, client_order_id, ts_order_id: str, secs: float,
                                accepted_mono: float) -> None:
-        """§266 Part A: ``secs`` after a MARKET accept, book a fill the order stream dropped.
+        """§268 Part A: ``secs`` after a MARKET accept, book a fill the order stream dropped.
 
         - Outcome already processed (the normal case, stream median <= 424 ms): nothing, no
           broker call.
@@ -3162,7 +3162,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 pass
 
     def _force_order_stream_reconnect(self) -> None:
-        """§266: ask the order stream to reconnect; at most one forced reconnect per 60 s."""
+        """§268: ask the order stream to reconnect; at most one forced reconnect per 60 s."""
         now = _mono()
         last = self._last_forced_order_reconnect
         if last is not None and now - last < self._FORCED_RECONNECT_MIN_S:
@@ -3185,7 +3185,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 "safety poll stays the backstop")
 
     async def _cancel_fast_fill_probes(self) -> None:
-        """§266: cancel every pending probe (disconnect/stop); a cancelled probe does
+        """§268: cancel every pending probe (disconnect/stop); a cancelled probe does
         nothing - no broker read, no exception."""
         probes = getattr(self, "_fast_fill_probes", None)
         if not isinstance(probes, dict) or not probes:

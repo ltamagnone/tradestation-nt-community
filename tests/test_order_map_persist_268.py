@@ -1,4 +1,4 @@
-"""§266 B3: order-map persist writes via json.dumps (one write) and once per OCO group."""
+"""§268 B3: order-map persist writes via json.dumps (one write) and once per OCO group."""
 from __future__ import annotations
 
 import json

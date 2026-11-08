@@ -1,4 +1,4 @@
-"""§266 Part A: fast-fill probe for MARKET orders.
+"""§268 Part A: fast-fill probe for MARKET orders.
 
 The TS order stream can stay connected while it delivers no order events (11-05: an MNQ
 MARKET fill seen 35 s late, by the safety poll). ``fast_fill_probe_secs`` after a MARKET
