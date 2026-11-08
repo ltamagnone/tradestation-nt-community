@@ -30,6 +30,7 @@ Usage
 
 """
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -77,6 +78,44 @@ def _control_event(event: dict) -> tuple[str, str] | None:
     return None
 
 
+class _ReconnectHandle:
+    """One live reconnectable stream; ``fut`` is armed per connection (§266)."""
+
+    __slots__ = ("kind", "fut")
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.fut: asyncio.Future | None = None
+
+
+def _is_order_stream(url: str) -> bool:
+    return "/brokerage/stream/accounts/" in url and url.rstrip("/").endswith("/orders")
+
+
+async def _lines_or_reconnect(resp, fut: "asyncio.Future", url: str) -> AsyncIterator[str]:
+    """Yield ``resp`` lines until ``fut`` fires (a §266 reconnect request), then end."""
+    it = resp.aiter_lines().__aiter__()
+    while True:
+        nxt = asyncio.ensure_future(it.__anext__())
+        try:
+            await asyncio.wait({nxt, fut}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            nxt.cancel()
+            raise
+        if nxt.done():
+            try:
+                line = nxt.result()
+            except StopAsyncIteration:
+                return
+            yield line
+            continue
+        nxt.cancel()
+        with contextlib.suppress(BaseException):
+            await nxt
+        _log.warning(f"[STREAM-RECONNECT-REQUESTED] §266 {url}: reconnecting on request")
+        return
+
+
 class TradeStationStreamClient:
     """
     Async SSE client for TradeStation streaming endpoints.
@@ -110,6 +149,28 @@ class TradeStationStreamClient:
         self._reconnect_delay = reconnect_delay_secs
         self._max_delay = reconnect_delay_secs * 8
         self._on_auth_error = on_auth_error
+        # §266: live streams that can be told to reconnect (the account order stream only).
+        self._reconnectable: set[_ReconnectHandle] = set()
+
+    def request_reconnect(self, kind: str = "orders") -> bool:
+        """Ask the active ``kind`` stream to drop its connection and reconnect (§266).
+
+        Only ``"orders"`` (the account order stream) exists today. The stream's own
+        reconnect path then runs: no extra delay, the ``{"_reconnected": True}`` sentinel
+        follows on the new connection. Returns False when no such stream is active (or the
+        kind is unknown); never raises. Bar/quote streams are never touched.
+        """
+        try:
+            if kind != "orders":
+                return False
+            handles = [h for h in self._reconnectable if h.kind == kind]
+            for h in handles:
+                fut = h.fut
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
+            return bool(handles)
+        except Exception:
+            return False
 
     def _headers(self, url: str = "") -> dict[str, str]:
         token = self._token_provider()
@@ -123,6 +184,22 @@ class TradeStationStreamClient:
 
     async def _stream(
         self, url: str, params: dict[str, str] | None = None,
+    ) -> AsyncIterator[dict]:
+        """Core SSE reader; registers order streams for ``request_reconnect`` (§266)."""
+        handle = _ReconnectHandle("orders") if _is_order_stream(url) else None
+        if handle is not None:
+            self._reconnectable.add(handle)
+        try:
+            async with contextlib.aclosing(self._stream_inner(url, params, handle)) as inner:
+                async for event in inner:
+                    yield event
+        finally:
+            if handle is not None:
+                self._reconnectable.discard(handle)
+
+    async def _stream_inner(
+        self, url: str, params: dict[str, str] | None,
+        handle: "_ReconnectHandle | None",
     ) -> AsyncIterator[dict]:
         """Core SSE reader — yields parsed JSON dicts, reconnects on error.
 
@@ -177,7 +254,12 @@ class TradeStationStreamClient:
                             yield {"_reconnected": True}
                         first_connect = False
 
-                        async for line in resp.aiter_lines():
+                        if handle is not None:
+                            handle.fut = asyncio.get_running_loop().create_future()
+                            lines = _lines_or_reconnect(resp, handle.fut, url)
+                        else:
+                            lines = resp.aiter_lines()
+                        async for line in lines:
                             line = line.strip()
                             if not line:
                                 continue
