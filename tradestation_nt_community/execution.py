@@ -1086,7 +1086,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
         import json as _json, os as _os
         tmp = self._order_map_path + f".{_os.getpid()}.tmp"
         with open(tmp, "w") as _f:
-            _json.dump(data, _f)
+            _f.write(_json.dumps(data))   # §266 B3: one write, not many small chunks
         _os.replace(tmp, self._order_map_path)
 
     def _stamp_alive(self, force: bool = False) -> None:
@@ -1151,7 +1151,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 existing[ts_id] = entry
             tmp = self._order_map_path + f".{_os.getpid()}.tmp"
             with open(tmp, "w") as _f:
-                _json.dump(existing, _f)
+                _f.write(_json.dumps(existing))   # §266 B3: one write, not many small chunks
             _os.replace(tmp, self._order_map_path)
         except Exception as exc:
             self._log.warning(f"[ORDER-MAP] Failed to persist order map: {exc}")
@@ -2051,8 +2051,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 # Register in tracking dicts
                 self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
-                self._persist_order_map()
                 legs.append((i, order, ts_order_id))
+
+            # §266 B3: one persist per group (was one per leg), still before any accept.
+            if legs:
+                self._persist_order_map()
 
             # Late accept of a group (NT already closed a leg, e.g. in-flight resolved it as
             # REJECTED): a TS cancel of one OCO leg cancels its siblings too, so accepting the
