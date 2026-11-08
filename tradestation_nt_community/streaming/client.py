@@ -110,8 +110,9 @@ async def _lines_or_reconnect(resp, fut: "asyncio.Future", url: str) -> AsyncIte
             yield line
             continue
         nxt.cancel()
-        with contextlib.suppress(BaseException):
-            await nxt
+        # gather(return_exceptions=True) swallows nxt's own CancelledError but re-raises a
+        # cancel aimed at THIS task, so a stop arriving here is never lost.
+        await asyncio.gather(nxt, return_exceptions=True)
         _log.warning(f"[STREAM-RECONNECT-REQUESTED] §266 {url}: reconnecting on request")
         return
 
@@ -157,18 +158,20 @@ class TradeStationStreamClient:
 
         Only ``"orders"`` (the account order stream) exists today. The stream's own
         reconnect path then runs: no extra delay, the ``{"_reconnected": True}`` sentinel
-        follows on the new connection. Returns False when no such stream is active (or the
-        kind is unknown); never raises. Bar/quote streams are never touched.
+        follows on the new connection. Returns False when no connection of that stream is armed
+        (before the first connect, during the consumer's catch-up after a sentinel, request
+        already made) or the kind is unknown; never raises. Bar/quote streams are never touched.
         """
         try:
             if kind != "orders":
                 return False
-            handles = [h for h in self._reconnectable if h.kind == kind]
-            for h in handles:
+            armed = False
+            for h in [h for h in self._reconnectable if h.kind == kind]:
                 fut = h.fut
                 if fut is not None and not fut.done():
                     fut.set_result(None)
-            return bool(handles)
+                    armed = True
+            return armed
         except Exception:
             return False
 

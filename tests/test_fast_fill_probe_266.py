@@ -71,6 +71,8 @@ def _client(by_id=None, poll_rows=None):
     m._log = MagicMock()
     m._fast_fill_probe_secs = DELAY
     m._fast_fill_probes = {}
+    m._stream_terminal_seen = {}
+    m._disconnecting = False
     m._last_forced_order_reconnect = None
     m._FORCED_RECONNECT_MIN_S = C._FORCED_RECONNECT_MIN_S
     m._stream_client = MagicMock()
@@ -368,3 +370,65 @@ async def test_process_order_event_default_label_is_sse():
     m = _client()
     await C._process_order_event(m, row("FLL"))
     assert any("[fill-source=sse]" in s for s in _logs(m._log.info))
+
+
+async def test_stream_delivered_but_unprocessed_is_not_silent(monkeypatch):
+    """Review minor: the stream DID deliver FLL but processing failed -> the probe retries,
+    logs [FAST-PROBE], and neither logs SILENT nor forces a reconnect."""
+    m = _client(by_id=[row("FLL")])
+    orig = ex._emit_fill_delta
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ex, "_emit_fill_delta", flaky)
+    C._schedule_fast_fill_probe(m, _market(), TS_ID)
+    with pytest.raises(RuntimeError):
+        await C._process_order_event(m, row("FLL"))      # stream path: fails, un-advances
+    assert TS_ID not in m._order_last_status
+    await asyncio.gather(*m._fast_fill_probes.values())
+    assert len(_fills(m)) == 1                           # the probe booked it
+    warns = _logs(m._log.warning)
+    assert not any("[ORDER-STREAM-SILENT]" in w for w in warns)
+    assert (f"[FAST-PROBE] TS order {TS_ID} ({COID}): stream delivered FLL but it was not "
+            f"processed - retried via the probe, no stream reconnect") in warns
+    m._stream_client.request_reconnect.assert_not_called()
+    assert TS_ID not in m._stream_terminal_seen          # cleaned with the probe
+
+
+async def test_probe_own_processing_failure_is_not_silent(monkeypatch):
+    m = _client(by_id=[row("FLL")])
+
+    def boom(*a, **k):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(ex, "_emit_fill_delta", boom)
+    await _run_probe(m)
+    assert not any("[ORDER-STREAM-SILENT]" in w for w in _logs(m._log.warning))
+    errs = _logs(m._log.error)
+    assert any(f"[FAST-PROBE] TS order {TS_ID} ({COID}): processing failed: kaput" in e
+               for e in errs)
+    m._stream_client.request_reconnect.assert_not_called()
+    m._check_order_statuses.assert_not_awaited()
+
+
+async def test_probe_not_scheduled_while_disconnecting():
+    m = _client(by_id=[row("FLL")])
+    m._disconnecting = True
+    C._schedule_fast_fill_probe(m, _market(), TS_ID)
+    assert m._fast_fill_probes == {}
+    m._disconnecting = False
+    C._schedule_fast_fill_probe(m, _market(), TS_ID)
+    assert len(m._fast_fill_probes) == 1
+    await C._cancel_fast_fill_probes(m)
+
+
+async def test_disconnect_sets_flag_and_connect_clears_it():
+    import inspect
+    src_d = inspect.getsource(C._disconnect)
+    assert src_d.index("self._disconnecting = True") < src_d.index("_cancel_fast_fill_probes")
+    assert "self._disconnecting = False" in inspect.getsource(C._connect)
