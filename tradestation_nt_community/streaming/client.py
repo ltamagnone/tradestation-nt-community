@@ -236,13 +236,12 @@ class TradeStationStreamClient:
                                 f"{body.decode(errors='replace')[:200]}"
                             )
                             if resp.status_code == 401 and self._on_auth_error:
-                                _log.info("401 on SSE stream — refreshing OAuth token")
+                                _log.info("401 on SSE stream — forcing OAuth token refresh")
                                 try:
                                     await self._on_auth_error()
-                                    delay = self._reconnect_delay
-                                    continue
                                 except Exception as refresh_err:
                                     _log.error(f"Token refresh failed: {refresh_err}")
+                            # Always back off (§4.107): never a zero-delay reconnect after a 401.
                             await asyncio.sleep(delay)
                             delay = min(delay * 2, self._max_delay)
                             continue

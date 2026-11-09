@@ -235,6 +235,10 @@ class TradeStationHttpClient:
         self.token_expiry: datetime | None = None
         self._on_token_rotated: Callable[[str], None] | None = None
         self._auth_lock = asyncio.Lock()
+        # §4.107/4.108: monotonic stamps of the last refresh outcome (None = never).
+        self._last_refresh_ok_mono: float | None = None
+        self._last_refresh_fail_mono: float | None = None
+        self._last_refresh_fail_exc: Exception | None = None
 
         self._max_retries: int = max(1, max_retries)
         self._retry_delay_initial_s: float = retry_delay_initial_ms / 1000.0
@@ -268,13 +272,77 @@ class TradeStationHttpClient:
         """
         self._on_token_rotated = callback
 
+    # A forced refresh (after a 401) is skipped when a refresh succeeded this recently.
+    _FORCE_REFRESH_MIN_INTERVAL_S = 30.0
+    # A failed refresh is shared with every other caller that needs one for this long.
+    _REFRESH_FAILURE_SHARE_S = 5.0
+
+    def _recent_refresh_failure(self) -> Exception | None:
+        """The failure of a refresh < ``_REFRESH_FAILURE_SHARE_S`` ago, else None."""
+        if (
+            self._last_refresh_fail_mono is not None
+            and self._last_refresh_fail_exc is not None
+            and time.monotonic() - self._last_refresh_fail_mono < self._REFRESH_FAILURE_SHARE_S
+        ):
+            return self._last_refresh_fail_exc
+        return None
+
+    async def _refresh_recording(self) -> None:
+        """Refresh; stamp the outcome (monotonic) for the 30 s / 5 s sharing windows."""
+        try:
+            await self._refresh_access_token()
+        except Exception as err:
+            self._last_refresh_fail_mono = time.monotonic()
+            self._last_refresh_fail_exc = err
+            raise
+        self._last_refresh_ok_mono = time.monotonic()
+        self._last_refresh_fail_mono = None
+        self._last_refresh_fail_exc = None
+
     async def _ensure_authenticated(self) -> None:
         async with self._auth_lock:
+            now = datetime.now(tz=timezone.utc)
             if not self._access_token or not self.token_expiry:
-                await self._refresh_access_token()
+                may_keep = False
+            elif now >= self.token_expiry - timedelta(minutes=5):
+                may_keep = now < self.token_expiry
+            else:
                 return
-            if datetime.now(tz=timezone.utc) >= self.token_expiry - timedelta(minutes=5):
-                await self._refresh_access_token()
+            shared = self._recent_refresh_failure()
+            if shared is not None:
+                if may_keep:
+                    return
+                raise shared
+            try:
+                await self._refresh_recording()
+            except Exception as err:
+                if not may_keep:
+                    raise
+                _log.warning(
+                    f"[AUTH] refresh failed, keeping the current token "
+                    f"(expires {self.token_expiry:%Y-%m-%d %H:%M:%S}Z): {err}"
+                )
+
+    async def force_refresh(self) -> None:
+        """Refresh the token now because a request was answered 401 (§4.107).
+
+        Skipped when a refresh succeeded < 30 s ago (N callers hitting 401 together cause
+        ONE refresh). A failure raises: the token was just rejected, nothing to keep.
+        """
+        async with self._auth_lock:
+            ok = self._last_refresh_ok_mono
+            if ok is not None and time.monotonic() - ok < self._FORCE_REFRESH_MIN_INTERVAL_S:
+                return
+            shared = self._recent_refresh_failure()
+            if shared is not None:
+                raise shared
+            _log.info("[AUTH-401] forced token refresh")
+            try:
+                await self._refresh_recording()
+            except Exception as err:
+                _log.warning(f"[AUTH-401] forced token refresh failed: {err}")
+                raise
+            _log.info("[AUTH-401] forced token refresh ok")
 
     async def _refresh_access_token(self) -> None:
         data = {
@@ -325,17 +393,30 @@ class TradeStationHttpClient:
         """
         httpx_fn = getattr(self._httpx, method.lower())
         resp: httpx.Response | None = None
-        for attempt in range(self._max_retries):
+        attempt = 0
+        auth_retried = False
+        while attempt < self._max_retries:
             kwargs["headers"] = await self._get_headers()
             resp = await httpx_fn(url, **kwargs)
+            if resp.status_code == 401 and not auth_retried:
+                # §4.107: TradeStation answers 401 before it processes a request, so one
+                # resend with a fresh token (any method) cannot create a second order.
+                auth_retried = True
+                try:
+                    await self.force_refresh()
+                except Exception as refresh_err:
+                    _log.warning(f"[AUTH-401] refresh failed, returning the 401: {refresh_err}")
+                    return resp
+                continue
             if resp.status_code == 429:
+                attempt += 1
                 retry_after = float(
                     resp.headers.get("Retry-After", self._retry_delay_initial_s)
                 )
                 retry_after = min(retry_after, self._retry_delay_max_s)
                 _log.warning(
                     f"Rate limited (429) on {url} — sleeping {retry_after:.1f}s "
-                    f"(attempt {attempt + 1}/{self._max_retries})"
+                    f"(attempt {attempt}/{self._max_retries})"
                 )
                 await asyncio.sleep(retry_after)
                 continue

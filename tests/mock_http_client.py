@@ -40,6 +40,9 @@ class MockTradeStationHttpClient(TradeStationHttpClient):
     async def _ensure_authenticated(self) -> None:
         pass
 
+    async def force_refresh(self) -> None:
+        pass
+
     async def get_bars(
         self,
         symbol: str,

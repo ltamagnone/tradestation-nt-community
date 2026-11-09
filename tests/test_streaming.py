@@ -523,12 +523,12 @@ class TestAuthErrorRefresh:
                 break
 
         assert len(refresh_calls) == 1, "on_auth_error must be called on 401"
-        assert sleep_calls == [], "Successful refresh must skip backoff sleep"
+        assert sleep_calls == [pytest.approx(0.01)], "401 must always back off (§4.107)"
         assert events[0] == {"Symbol": "GCJ26", "Bid": 3350.5}
 
     @pytest.mark.asyncio
     async def test_401_resets_backoff_after_successful_refresh(self, monkeypatch):
-        """After a successful token refresh, the delay resets to the initial value."""
+        """Repeated 401s back off even when each refresh succeeds (§4.107: no zero-delay loop)."""
         from tradestation_nt_community.streaming import client as streaming_mod
 
         async def mock_refresh():
@@ -560,7 +560,7 @@ class TestAuthErrorRefresh:
             if len(events) >= 1:
                 break
 
-        assert sleep_calls == [], "All 401s with successful refresh skip backoff"
+        assert sleep_calls == [pytest.approx(0.01), pytest.approx(0.02)]
 
     @pytest.mark.asyncio
     async def test_401_without_callback_falls_back_to_backoff(self, monkeypatch):
