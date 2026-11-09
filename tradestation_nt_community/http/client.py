@@ -994,6 +994,7 @@ class TradeStationHttpClient:
         account_keys: str,
         since: str | None = None,
         status: str | None = None,
+        strict: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Get today's and open orders for account(s) (``GET /orders``), every page.
@@ -1017,6 +1018,9 @@ class TradeStationHttpClient:
         status : str, optional
             Filter by order status: ``Open``, ``Filled``, ``Canceled``, ``Rejected``
             (comma-separated allowed). Case-sensitive.
+        strict : bool, default False
+            Raise :class:`BrokerReadError` when still paging after ``_ORDERS_MAX_PAGES``
+            instead of logging ``[ORDERS-PAGE-CAP]`` and returning the truncated list.
 
         Return
         -------
@@ -1024,17 +1028,41 @@ class TradeStationHttpClient:
             Order dictionaries from every page.
 
         """
-        url = f"{self.base_url}/brokerage/accounts/{account_keys}/orders"
         params: dict[str, str] = {"pageSize": str(self._ORDERS_PAGE_SIZE)}
         if status:
             params["status"] = status
+        return await self._paged_orders(
+            f"{self.base_url}/brokerage/accounts/{account_keys}/orders",
+            f"/accounts/{account_keys}/orders", params, strict,
+        )
+
+    async def get_historical_orders(
+        self, account_keys: str, since: str, strict: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get orders before the current trading day (``GET /historicalorders?since=``), every page.
+
+        ``since`` is ``MM-DD-YYYY`` (required by TradeStation). Paged and checked exactly like
+        :meth:`get_orders` (§217 per-page retry, ``BrokerReadError``). ``strict`` defaults to
+        True: still paging after ``_ORDERS_MAX_PAGES`` raises instead of returning a
+        truncated list.
+        """
+        params = {"since": since, "pageSize": str(self._ORDERS_PAGE_SIZE)}
+        return await self._paged_orders(
+            f"{self.base_url}/brokerage/accounts/{account_keys}/historicalorders",
+            f"/accounts/{account_keys}/historicalorders", params, strict,
+        )
+
+    async def _paged_orders(
+        self, url: str, endpoint: str, params: dict[str, str], strict: bool,
+    ) -> list[dict[str, Any]]:
         orders: list[dict[str, Any]] = []
         for page in range(self._ORDERS_MAX_PAGES):
             # Each page is checked and retried on its own (same nextToken): a failed page
             # raises, never returns the truncated list (§217).
             data = await self._read(
                 url, label="Get orders",
-                endpoint=f"GET /accounts/{account_keys}/orders (page {page + 1})",
+                endpoint=f"GET {endpoint} (page {page + 1})",
                 container="Orders", params=params,
             )
             orders.extend(data["Orders"])
@@ -1042,10 +1070,13 @@ class TradeStationHttpClient:
             if not token:
                 return orders
             params = {**params, "nextToken": token}
-        _log.error(
-            f"[ORDERS-PAGE-CAP] /orders still paging after {self._ORDERS_MAX_PAGES} pages "
+        msg = (
+            f"[ORDERS-PAGE-CAP] {endpoint} still paging after {self._ORDERS_MAX_PAGES} pages "
             f"({len(orders)} orders) - the list is truncated"
         )
+        _log.error(msg)
+        if strict:
+            raise BrokerReadError(msg)
         return orders
 
     async def get_orders_by_id(
