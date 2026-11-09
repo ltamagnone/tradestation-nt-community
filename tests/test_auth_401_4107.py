@@ -274,3 +274,39 @@ def test_wiring_uses_force_refresh():
         src = inspect.getsource(mod)
         assert "on_auth_error=self._client.force_refresh" in src
         assert "on_auth_error=self._client._ensure_authenticated" not in src
+
+
+@pytest.mark.asyncio
+async def test_request_401_after_token_already_changed_resends_without_refresh():
+    """Review M4: a 401 for a request sent with a token that another caller has since
+    replaced is resent with the new token, without a further auth POST."""
+    c = _client()
+    c._httpx.post = AsyncMock(return_value=_auth_ok("unused"))
+
+    async def _get(url, **kw):
+        if c._httpx.get.await_count == 1:
+            c._access_token = "rotated-by-other"   # another caller refreshed meanwhile
+            return _mock_resp(401, None)
+        return _mock_resp(200, {"ok": 1})
+
+    c._httpx.get = AsyncMock(side_effect=_get)
+    resp = await c._request("GET", "https://x/y")
+    assert resp.status_code == 200
+    assert c._httpx.post.await_count == 0
+    assert c._httpx.get.await_args_list[1].kwargs["headers"]["Authorization"] == \
+        "Bearer rotated-by-other"
+
+
+@pytest.mark.asyncio
+async def test_request_429_then_401_then_200(monkeypatch):
+    """Review M6: a 429 counts as an attempt, the 401 resend does not."""
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    c = _client()
+    c._max_retries = 2
+    c._httpx.post = AsyncMock(return_value=_auth_ok("fresh"))
+    c._httpx.get = AsyncMock(side_effect=[
+        _mock_resp(429, None), _mock_resp(401, None), _mock_resp(200, {"ok": 1})])
+    resp = await c._request("GET", "https://x/y")
+    assert resp.status_code == 200
+    assert c._httpx.post.await_count == 1
+    assert c._httpx.get.await_count == 3

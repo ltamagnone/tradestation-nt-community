@@ -385,7 +385,7 @@ class TradeStationHttpClient:
         }
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """Send an authenticated request, retrying on HTTP 429.
+        """Send an authenticated request, retrying on HTTP 429; one resend after a 401.
 
         Reads Retry-After on 429 and sleeps accordingly. Also proactively
         sleeps when X-RateLimit-Remaining drops below 5 to avoid hitting
@@ -397,16 +397,21 @@ class TradeStationHttpClient:
         auth_retried = False
         while attempt < self._max_retries:
             kwargs["headers"] = await self._get_headers()
+            sent_token = self._access_token
             resp = await httpx_fn(url, **kwargs)
             if resp.status_code == 401 and not auth_retried:
                 # §4.107: TradeStation answers 401 before it processes a request, so one
-                # resend with a fresh token (any method) cannot create a second order.
+                # resend with a fresh token (any method) cannot create a second order (and a
+                # resend reuses the OrderConfirmID, which TS refuses twice: §207).
                 auth_retried = True
-                try:
-                    await self.force_refresh()
-                except Exception as refresh_err:
-                    _log.warning(f"[AUTH-401] refresh failed, returning the 401: {refresh_err}")
-                    return resp
+                if self._access_token == sent_token:
+                    # Another caller has not refreshed since this request was sent.
+                    try:
+                        await self.force_refresh()
+                    except Exception as refresh_err:
+                        _log.warning(
+                            f"[AUTH-401] refresh failed, returning the 401: {refresh_err}")
+                        return resp
                 continue
             if resp.status_code == 429:
                 attempt += 1

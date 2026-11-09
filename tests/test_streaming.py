@@ -527,7 +527,7 @@ class TestAuthErrorRefresh:
         assert events[0] == {"Symbol": "GCJ26", "Bid": 3350.5}
 
     @pytest.mark.asyncio
-    async def test_401_resets_backoff_after_successful_refresh(self, monkeypatch):
+    async def test_401_backs_off_even_after_successful_refresh(self, monkeypatch):
         """Repeated 401s back off even when each refresh succeeds (§4.107: no zero-delay loop)."""
         from tradestation_nt_community.streaming import client as streaming_mod
 
