@@ -22,6 +22,15 @@ import httpx
 _log = logging.getLogger(__name__)
 
 
+def _header_float(resp: Any, name: str) -> float | None:
+    """A numeric response header, or None when it is missing or not a number (4.109)."""
+    try:
+        raw = resp.headers.get(name)
+        return None if raw is None else float(raw)
+    except Exception:
+        return None
+
+
 class DuplicateOrderConfirmIdException(Exception):
     """
     Raised when TradeStation reports an OrderConfirmID it has already seen.
@@ -81,6 +90,39 @@ class OrderGroupPartialException(OrderRejectedException):
         super().__init__(ts_message)
         self.landed_order_ids = landed_order_ids
         self.body = body  # the raw HTTP-200 response, so the first real case can be classified
+
+
+class OrderResponseAmbiguousException(Exception):
+    """
+    Raised when an order POST was answered HTTP 200/201 but the answer cannot be read:
+    the body is not JSON or not a dict, or a group answer acknowledges no leg and names no
+    error (strategies OPEN_POINTS 4.109).
+
+    TradeStation accepted the request, so the order MAY be live. The execution client
+    treats it like a lost answer: the NT reject reason starts with ``SUBMIT-AMBIGUOUS: ``
+    and the runner resolves it at the broker (strategies LESSONS §235/§239).
+    """
+
+
+class ReplaceBodyErrorException(Exception):
+    """
+    Raised when a replace (``PUT /orders/{id}``) is answered HTTP 200 with an ``Error`` in
+    the body (strategies OPEN_POINTS 4.143). The broker most likely kept the old price; the
+    execution client hands the amend to the §241 recovery, which reads the broker and emits
+    ``OrderUpdated`` (new price at the broker) or ``OrderModifyRejected`` (old price).
+
+    Attributes
+    ----------
+    failures : list[str]
+        The error messages found in the body.
+    body : Any
+        The raw HTTP-200 response body.
+    """
+
+    def __init__(self, order_id: str, failures: list[str], body: Any = None) -> None:
+        super().__init__(f"Replace of {order_id} answered HTTP 200 with an error: {failures}")
+        self.failures = failures
+        self.body = body
 
 
 class SymbolNotFoundException(Exception):
@@ -243,6 +285,8 @@ class TradeStationHttpClient:
         self._max_retries: int = max(1, max_retries)
         self._retry_delay_initial_s: float = retry_delay_initial_ms / 1000.0
         self._retry_delay_max_s: float = retry_delay_max_ms / 1000.0
+        # 4.96: last X-RateLimit-* (remaining, limit, reset, monotonic) - see last_rate_limit
+        self._last_rate_limit: tuple | None = None
 
         # Persistent async HTTP client — reuses TCP connections across requests.
         # Closed in close(); callers should not share instances across event loops.
@@ -299,12 +343,21 @@ class TradeStationHttpClient:
         self._last_refresh_fail_mono = None
         self._last_refresh_fail_exc = None
 
-    async def _ensure_authenticated(self) -> None:
+    # 4.87: a read (GET, the 30 s status poll, the 10-min keepalive) refreshes once 7 min or
+    # less are left; an order write only at 5 min. The poll therefore always refreshes in the
+    # 2-min band before any order could, and an order POST never pays the refresh (unless
+    # every read failed for 2 min).
+    _REFRESH_MARGIN_READ = timedelta(minutes=7)
+    _REFRESH_MARGIN_WRITE = timedelta(minutes=5)
+
+    async def _ensure_authenticated(self, margin: timedelta | None = None) -> None:
+        if margin is None:
+            margin = self._REFRESH_MARGIN_READ
         async with self._auth_lock:
             now = datetime.now(tz=timezone.utc)
             if not self._access_token or not self.token_expiry:
                 may_keep = False
-            elif now >= self.token_expiry - timedelta(minutes=5):
+            elif now >= self.token_expiry - margin:
                 may_keep = now < self.token_expiry
             else:
                 return
@@ -377,8 +430,8 @@ class TradeStationHttpClient:
         _log.debug(f"Auth failed (HTTP {response.status_code}): {response.text[:500]}")
         raise Exception(f"TradeStation authentication failed: HTTP {response.status_code}")
 
-    async def _get_headers(self) -> dict[str, str]:
-        await self._ensure_authenticated()
+    async def _get_headers(self, margin: timedelta | None = None) -> dict[str, str]:
+        await self._ensure_authenticated(margin)
         return {
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",
@@ -392,11 +445,13 @@ class TradeStationHttpClient:
         the wall. Retries up to self._max_retries times total.
         """
         httpx_fn = getattr(self._httpx, method.lower())
+        margin = (self._REFRESH_MARGIN_READ if method.upper() == "GET"
+                  else self._REFRESH_MARGIN_WRITE)
         resp: httpx.Response | None = None
         attempt = 0
         auth_retried = False
         while attempt < self._max_retries:
-            kwargs["headers"] = await self._get_headers()
+            kwargs["headers"] = await self._get_headers(margin)
             sent_token = self._access_token
             resp = await httpx_fn(url, **kwargs)
             if resp.status_code == 401 and not auth_retried:
@@ -413,11 +468,13 @@ class TradeStationHttpClient:
                             f"[AUTH-401] refresh failed, returning the 401: {refresh_err}")
                         return resp
                 continue
+            self._note_rate_limit(resp)
             if resp.status_code == 429:
                 attempt += 1
-                retry_after = float(
-                    resp.headers.get("Retry-After", self._retry_delay_initial_s)
-                )
+                # Retry-After may be an HTTP-date or garbage: then the initial delay.
+                retry_after = _header_float(resp, "Retry-After")
+                if retry_after is None or retry_after < 0:
+                    retry_after = self._retry_delay_initial_s
                 retry_after = min(retry_after, self._retry_delay_max_s)
                 _log.warning(
                     f"Rate limited (429) on {url} — sleeping {retry_after:.1f}s "
@@ -425,17 +482,44 @@ class TradeStationHttpClient:
                 )
                 await asyncio.sleep(retry_after)
                 continue
-            remaining = resp.headers.get("X-RateLimit-Remaining")
-            if remaining is not None and int(remaining) < 5:
-                reset_epoch = int(resp.headers.get("X-RateLimit-Reset", 0))
-                sleep_secs = max(0.1, reset_epoch - time.time()) + 0.1
+            # 4.109: this runs after the answer arrived (an order may be live), so it must
+            # never raise. An unparseable header skips the proactive sleep (a later 429 is
+            # still retried); the sleep is capped like the 429 one.
+            remaining = _header_float(resp, "X-RateLimit-Remaining")
+            if remaining is not None and remaining < 5:
+                reset_epoch = _header_float(resp, "X-RateLimit-Reset") or 0.0
+                sleep_secs = min(max(0.1, reset_epoch - time.time()) + 0.1,
+                                 self._retry_delay_max_s)
                 _log.warning(
-                    f"Rate limit nearly exhausted ({remaining} remaining) — "
+                    f"Rate limit nearly exhausted ({remaining:g} remaining) — "
                     f"sleeping {sleep_secs:.1f}s"
                 )
                 await asyncio.sleep(sleep_secs)
             return resp
         return resp  # type: ignore[return-value]  # exhausted retries
+
+    def _note_rate_limit(self, resp: httpx.Response) -> None:
+        """4.96: keep the X-RateLimit-* headers of the last answer that carried them.
+        Never raises (it runs after an order POST was answered)."""
+        try:
+            remaining = resp.headers.get("X-RateLimit-Remaining")
+            if remaining is None:
+                return
+            self._last_rate_limit = (
+                remaining,
+                resp.headers.get("X-RateLimit-Limit"),
+                resp.headers.get("X-RateLimit-Reset"),
+                time.monotonic(),
+            )
+        except Exception:
+            pass
+
+    @property
+    def last_rate_limit(self) -> tuple | None:
+        """4.96: ``(remaining, limit, reset, monotonic_stamp)`` as raw header strings from
+        the last answer that carried ``X-RateLimit-Remaining``, or None. The client is
+        shared by the data and execution clients: it is whatever request came last."""
+        return getattr(self, "_last_rate_limit", None)
 
     # -- §217 read-side "HTTP 200 != data" ------------------------------------------------
     # Sleeps between the 3 attempts of a READ. Never used for a write (POST/PUT/DELETE):
@@ -881,6 +965,8 @@ class TradeStationHttpClient:
             that is not a duplicate report (e.g. invalid symbol, insufficient margin).
         DuplicateOrderConfirmIdException
             If TS reports the confirm id as already used: the original may be live.
+        OrderResponseAmbiguousException
+            If TS answered 200/201 but the body cannot be read: the order may be live (4.109).
         Exception
             If TS returns a non-200/201 HTTP status.
         """
@@ -906,8 +992,14 @@ class TradeStationHttpClient:
             _log.debug(f"Place order failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Place order failed (HTTP {response.status_code}): {response.text[:200]}")
 
-        response_json = response.json()
-        has_error, is_duplicate, err, msg = self._check_order_body_error(response_json)
+        try:
+            response_json = response.json()
+            has_error, is_duplicate, err, msg = self._check_order_body_error(response_json)
+        except Exception as e:
+            # 4.109: TS accepted the POST; an unreadable answer means the order may be live.
+            raise OrderResponseAmbiguousException(
+                f"Place order answered HTTP {response.status_code} with an unreadable body "
+                f"({type(e).__name__}: {e}): {response.text[:200]}") from e
 
         if not has_error:
             # (a) Normal success — return as-is
@@ -937,6 +1029,8 @@ class TradeStationHttpClient:
         Sends only the spec ``OrderReplaceRequest`` fields - Quantity, LimitPrice, StopPrice.
         ``order_type`` selects which prices apply; it is not sent (the spec allows changing
         OrderType only to Market). Verified on the sim account 2026-10-16 (§207).
+
+        Raises ``ReplaceBodyErrorException`` on HTTP 200 with an ``Error`` body (4.143).
         """
         url = f"{self.base_url}/orderexecution/orders/{order_id}"
         order_data: dict[str, Any] = {"Quantity": quantity}
@@ -952,6 +1046,9 @@ class TradeStationHttpClient:
         failures = self._body_failures(body)
         if failures:
             _log.warning(f"[ORDER-BODY-ERROR] replace {order_id}: HTTP 200 with {failures}")
+            # 4.143: never report a replace the broker refused as done. The execution client
+            # hands it to the §241 recovery (a broker read decides updated / rejected).
+            raise ReplaceBodyErrorException(order_id, failures, body=body)
         return body
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
@@ -1153,6 +1250,9 @@ class TradeStationHttpClient:
             report.
         DuplicateOrderConfirmIdException
             If TS reports the confirm ids as already used: the originals may be live.
+        OrderResponseAmbiguousException
+            If TS answered 200/201 but the body cannot be read, or acknowledges no leg and
+            names no error: legs may be live (4.109).
         Exception
             If TS returns a non-200/201 HTTP status.
         """
@@ -1174,15 +1274,25 @@ class TradeStationHttpClient:
             _log.debug(f"Place order group failed (HTTP {response.status_code}): {response.text[:500]}")
             raise Exception(f"Place order group failed (HTTP {response.status_code}): {response.text[:200]}")
 
-        response_json = response.json()
+        try:
+            response_json = response.json()
+            _has_error, is_duplicate, _err, msg = self._check_order_body_error(response_json)
+            entries = response_json.get("Orders") or []
+            landed = [str(o.get("OrderID")) for o in entries
+                      if isinstance(o, dict) and o.get("OrderID") and not o.get("Error")]
+            # 4.109 review: success needs exactly one dict entry with a string OrderID per
+            # leg; the caller pairs legs with ``Orders`` by position.
+            shape_ok = (isinstance(entries, list) and len(entries) == len(stamped_orders)
+                        and all(isinstance(o, dict) and isinstance(o.get("OrderID"), str)
+                                for o in entries))
+            failures = self._body_failures(response_json)
+        except Exception as e:
+            # 4.109: TS accepted the POST; an unreadable answer means legs may be live.
+            raise OrderResponseAmbiguousException(
+                f"Place order group answered HTTP {response.status_code} with an unreadable "
+                f"body ({type(e).__name__}: {e}): {response.text[:200]}") from e
 
-        _has_error, is_duplicate, _err, msg = self._check_order_body_error(response_json)
-
-        landed = [o.get("OrderID") for o in response_json.get("Orders") or []
-                  if isinstance(o, dict) and o.get("OrderID") and not o.get("Error")]
-        failures = self._body_failures(response_json)
-
-        if not failures and len(landed) == len(stamped_orders):
+        if not failures and shape_ok and len(landed) == len(stamped_orders):
             # (a) Normal success — return as-is
             return response_json
 
@@ -1191,12 +1301,20 @@ class TradeStationHttpClient:
             raise DuplicateOrderConfirmIdException(message=msg, confirm_id=", ".join(confirm_ids))
 
         raw_msg = "; ".join(failures) or (
-            f"{len(landed)} of {len(stamped_orders)} legs acknowledged, no error given")
+            f"{len(landed)} of {len(stamped_orders)} legs acknowledged, no error given"
+            + ("" if shape_ok or not landed else
+               f" (answer lists {len(entries) if isinstance(entries, list) else '?'} "
+               f"entries, not one string OrderID per leg)"))
         if landed:
             # (c) Some legs landed: they cannot be mapped to request legs - caller cancels them
             _log.debug(f"Place order group partially placed: {raw_msg}")
             raise OrderGroupPartialException(raw_msg, landed, body=response_json)
-        # (d) Nothing landed — a real rejection
+        if not failures:
+            # (d) 4.109: HTTP 200, no leg acknowledged and no error named - the answer does
+            # not say what happened, so the legs may be live.
+            raise OrderResponseAmbiguousException(
+                f"Place order group answered HTTP {response.status_code}: {raw_msg}")
+        # (e) Nothing landed — a real rejection
         _log.debug(f"Place order group rejected by TS (body-level): {raw_msg}")
         raise OrderRejectedException(raw_msg)
 

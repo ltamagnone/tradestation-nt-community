@@ -84,8 +84,8 @@ async def test_group_full_success_unchanged(http_client):  # noqa: F811
     assert await http_client.place_order_group("OCO", [LEG, LEG]) == body
 
 
-# Replace/cancel 200 bodies are observe-only: no real error body has ever been captured, and a
-# wrong raise on cancel would emit cancel_rejected for orders the broker did cancel.
+# Cancel 200 bodies are observe-only: a wrong raise on cancel would emit cancel_rejected for
+# orders the broker did cancel. A replace Error body raises since 4.143 (recovery decides).
 SPEC_PUT_OK = {"Message": "Cancel/Replace order sent.", "OrderID": "123456789"}
 SPEC_DELETE_OK = {"Message": "Cancel request sent", "OrderID": "123456789"}
 
@@ -98,11 +98,16 @@ async def test_spec_success_bodies_pass_silently(http_client, caplog):  # noqa: 
     assert "[ORDER-BODY-ERROR]" not in caplog.text
 
 
-async def test_replace_body_error_is_logged_not_raised(http_client, caplog):  # noqa: F811
+async def test_replace_body_error_is_logged_and_raised(http_client, caplog):  # noqa: F811
+    # 4.143 (was observe-only): the [ORDER-BODY-ERROR] line stays, then the replace raises
+    # ReplaceBodyErrorException so the execution client hands it to the §241 recovery.
+    from tradestation_nt_community.http.client import ReplaceBodyErrorException
     body = {"Error": "FAILED", "Message": "Invalid stop price"}
     http_client._httpx.put = AsyncMock(return_value=_mock_resp(200, body))
-    assert await http_client.replace_order("77", "1", "StopMarket", stop_price="1") == body
-    assert "[ORDER-BODY-ERROR]" in caplog.text and "Invalid stop price" in caplog.text
+    with pytest.raises(ReplaceBodyErrorException) as ei:
+        await http_client.replace_order("77", "1", "StopMarket", stop_price="1")
+    assert ei.value.failures == ["Invalid stop price"]
+    assert "[ORDER-BODY-ERROR] replace 77: HTTP 200 with ['Invalid stop price']" in caplog.text
 
 
 async def test_cancel_body_error_is_logged_not_raised(http_client, caplog):  # noqa: F811

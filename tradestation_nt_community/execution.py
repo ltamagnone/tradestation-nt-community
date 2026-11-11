@@ -17,6 +17,8 @@ from tradestation_nt_community.common import order_status as _st
 from tradestation_nt_community.http.client import BrokerReadError
 from tradestation_nt_community.http.client import DuplicateOrderConfirmIdException
 from tradestation_nt_community.http.client import OrderGroupPartialException
+from tradestation_nt_community.http.client import OrderResponseAmbiguousException
+from tradestation_nt_community.http.client import ReplaceBodyErrorException
 from tradestation_nt_community.http.client import TradeStationHttpClient
 from tradestation_nt_community.parsing.execution import convert_order_to_ts_format
 from tradestation_nt_community.parsing.execution import convert_order_type
@@ -89,12 +91,18 @@ _ALIVE_STAMP_EVERY_S = 60.0
 # Also a capability marker: the runner polls at 30 s only if this exists.
 CANCEL_VERIFY_SPACING_S = 60.0
 _ORDER_MAP_META = "_meta"
+# 4.95: _persist_order_map drops entries older than this (unless working / POR exit),
+# at most once per _ORDER_MAP_PRUNE_EVERY_S per process (it runs on the submit path).
+_ORDER_MAP_PRUNE_AGE_S = 7 * 86400
+_ORDER_MAP_PRUNE_EVERY_S = 3600.0
 
 # Failures after which the POST may have reached TradeStation: the request was written and
 # the answer lost. Connect/pool failures mean it was never sent (strategies LESSONS §207).
+# OrderResponseAmbiguousException: answered HTTP 200 but the answer is unreadable or names no
+# order id (4.109). An HTTP 5xx stays a plain reject (operator decision, TS_API_SOAK_WATCH).
 _AMBIGUOUS_SUBMIT_ERRORS = (
     httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError, httpx.ReadError,
-    DuplicateOrderConfirmIdException,
+    DuplicateOrderConfirmIdException, OrderResponseAmbiguousException,
 )
 
 
@@ -1085,6 +1093,13 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._last_alive_stamp_s = 0.0
         self._last_status_poll_log_s = 0.0  # [STATUS-POLL] observe line throttle
         self._uncached_fill_callback = None
+        # 4.95 prune-on-save of the shared order map: the original submit time of every id
+        # this process knows (an id the peer pruned must not come back as "new"), the
+        # runner's POR exit ids, the broker ids of the last successful status poll.
+        self._ts_id_submitted_ts: dict[str, float] = {}
+        self._order_map_keep_ids_callback = None
+        self._last_poll_ts_ids: set[str] | None = None
+        self._last_order_map_prune_s = 0.0
 
         # Account setup
         self._account_id_nautilus = AccountId(f"{self.id}-{account_id}")
@@ -1102,6 +1117,41 @@ class TradeStationExecutionClient(LiveExecutionClient):
         Mirrors ``TradeStationHttpClient.set_token_rotation_callback``.
         """
         self._uncached_fill_callback = callback
+
+    def set_order_map_keep_ids_callback(self, callback) -> None:
+        """4.95: register ``callback() -> iterable of TS order ids`` that the order-map
+        prune must keep whatever their age (the runner passes its POR exit ids). Without a
+        callback, or when it raises, nothing is pruned."""
+        self._order_map_keep_ids_callback = callback
+
+    def _order_map_keep_ids(self) -> set[str] | None:
+        """4.95: ids the prune keeps at any age, or None = do not prune now (a source is
+        missing or failed: keeping too much is the safe direction). Never raises.
+
+        - the runner's POR exit ids (callback; required),
+        - every id the last successful status poll returned (account-wide: also the
+          peer node's working orders; required),
+        - every id of this process whose NT order is still open.
+        """
+        cb = getattr(self, "_order_map_keep_ids_callback", None)
+        poll_ids = getattr(self, "_last_poll_ts_ids", None)
+        if cb is None or not isinstance(poll_ids, (set, frozenset)):
+            return None
+        try:
+            keep = {str(i) for i in (cb() or ()) if i}
+        except Exception as exc:
+            self._log.warning(f"[ORDER-MAP] prune skipped: keep-ids callback failed: {exc}")
+            return None
+        keep |= set(poll_ids)
+        try:
+            for ts_id, coid in list(self._ts_order_id_to_client_order_id.items()):
+                o = self._cache.order(coid)
+                if o is not None and not o.is_closed:
+                    keep.add(str(ts_id))
+        except Exception as exc:
+            self._log.warning(f"[ORDER-MAP] prune skipped: cache read failed: {exc}")
+            return None
+        return keep
 
     def _read_order_map_file(self) -> dict:
         import json as _json
@@ -1156,21 +1206,52 @@ class TradeStationExecutionClient(LiveExecutionClient):
         import json as _json, time as _time, os as _os
         try:
             now_s = _time.time()
+            # 4.95: prune at most once per _ORDER_MAP_PRUNE_EVERY_S; the keep set is built
+            # BEFORE the file is read, so the read-merge-replace window stays as short as
+            # before (no file lock exists: two nodes race exactly as they did).
+            keep = None
+            last_prune = getattr(self, "_last_order_map_prune_s", None)
+            if (isinstance(last_prune, (int, float))
+                    and now_s - last_prune >= _ORDER_MAP_PRUNE_EVERY_S):
+                keep = TradeStationExecutionClient._order_map_keep_ids(self)
+            known_ts = getattr(self, "_ts_id_submitted_ts", None)
+            if not isinstance(known_ts, dict):
+                known_ts = {}
             # Merge with existing file to preserve entries from both directions
             try:
                 with open(self._order_map_path, "r") as _f:
                     existing = _json.load(_f)
+                file_read = isinstance(existing, dict)
             except Exception:
                 existing = {}
+                file_read = False
+            prune_cutoff = now_s - _ORDER_MAP_PRUNE_AGE_S
             # Update with current in-memory entries (add submitted_ts if missing)
             for ts_id, coid in self._ts_order_id_to_client_order_id.items():
+                # 4.95 review: an id older than the prune age that is missing from a file
+                # read fine was pruned (by either node): do not write it back between prunes
+                # unless its NT order is still open. Unreadable file -> write everything.
+                if file_read and ts_id not in existing:
+                    sub = known_ts.get(ts_id)
+                    if isinstance(sub, (int, float)) and sub < prune_cutoff:
+                        try:
+                            o = self._cache.order(coid)
+                            still_open = o is not None and not o.is_closed
+                        except Exception:
+                            still_open = True       # unknown -> keep (safe side)
+                        if not still_open:
+                            continue
                 # §151: merge into the existing entry so per-entry fields written by
                 # either node (``group``) survive; a brand-new entry was submitted by
                 # THIS node, so it gets this node's group.
                 prev = existing.get(ts_id)
                 entry = dict(prev) if isinstance(prev, dict) else {}
                 entry["client_order_id"] = str(coid)
-                entry["submitted_ts"] = entry.get("submitted_ts", now_s)
+                # 4.95: an id missing from the file (the peer pruned it) keeps its ORIGINAL
+                # submit time, so it is pruned again instead of coming back as new.
+                known = known_ts.setdefault(
+                    ts_id, entry.get("submitted_ts", now_s))
+                entry["submitted_ts"] = entry.get("submitted_ts", known)
                 grp = self._ts_id_to_group.get(ts_id)
                 if grp is None and not entry.get("group") and not isinstance(prev, dict):
                     grp = self._node_group
@@ -1179,12 +1260,38 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 if grp and not entry.get("group"):
                     entry["group"] = grp
                 existing[ts_id] = entry
+            if keep is not None:
+                existing = TradeStationExecutionClient._prune_order_map(
+                    self, existing, keep, now_s)
+                self._last_order_map_prune_s = now_s
             tmp = self._order_map_path + f".{_os.getpid()}.tmp"
             with open(tmp, "w") as _f:
                 _f.write(_json.dumps(existing))   # §268 B3: one write, not many small chunks
             _os.replace(tmp, self._order_map_path)
         except Exception as exc:
             self._log.warning(f"[ORDER-MAP] Failed to persist order map: {exc}")
+
+    def _prune_order_map(self, data: dict, keep: set, now_s: float) -> dict:
+        """4.95: drop entries submitted more than _ORDER_MAP_PRUNE_AGE_S ago unless kept.
+        Always kept: every ``_``-prefixed key (``_meta``), any non-dict or entry without a
+        numeric ``submitted_ts`` (unknown age), and ids in ``keep``. A kept entry keeps
+        every field (``group`` tag included)."""
+        cutoff = now_s - _ORDER_MAP_PRUNE_AGE_S
+        out: dict = {}
+        dropped = kept_old = 0
+        for ts_id, entry in data.items():
+            ts = entry.get("submitted_ts") if isinstance(entry, dict) else None
+            old = (not str(ts_id).startswith("_") and isinstance(ts, (int, float))
+                   and not isinstance(ts, bool) and ts < cutoff)
+            if old and str(ts_id) not in keep:
+                dropped += 1
+                continue
+            kept_old += int(old)
+            out[ts_id] = entry
+        if dropped:
+            self._log.info(f"[ORDER-MAP] pruned {dropped} entries older than 7 days "
+                           f"({kept_old} older kept: working or POR exit)")
+        return out
 
     def _load_order_map(self) -> None:
         """Load persisted order map at startup; prune entries older than 7 days."""
@@ -1220,6 +1327,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 continue
             try:
                 coid = ClientOrderId(entry["client_order_id"])
+                if isinstance(entry.get("submitted_ts"), (int, float)):
+                    self._ts_id_submitted_ts[ts_id] = float(entry["submitted_ts"])
                 self._ts_order_id_to_client_order_id[ts_id] = coid
                 self._client_order_id_to_ts_order_id[coid] = ts_id
                 if entry.get("group"):
@@ -1958,11 +2067,20 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 **ts_order_params,
             )
 
-            # Extract order ID from response
-            ts_order_id = response.get("OrderID") or response.get("Orders", [{}])[0].get("OrderID")
-
+            # Extract order ID from response. 4.109: TS answered 200, so a missing id or an
+            # odd shape means the order may be live - ambiguous, never a plain reject.
+            try:
+                ts_order_id = (response.get("OrderID")
+                               or response.get("Orders", [{}])[0].get("OrderID"))
+            except Exception as ex:
+                raise OrderResponseAmbiguousException(
+                    f"OrderID unreadable ({type(ex).__name__}: {ex}): {response!r:.200}"
+                ) from ex
             if not ts_order_id:
-                raise ValueError(f"No OrderID in response: {response}")
+                raise OrderResponseAmbiguousException(f"No OrderID in response: {response}")
+            if not isinstance(ts_order_id, str):
+                raise OrderResponseAmbiguousException(
+                    f"OrderID is not a string ({type(ts_order_id).__name__}): {response!r:.200}")
 
             # Track order IDs
             self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
@@ -2075,15 +2193,23 @@ class TradeStationExecutionClient(LiveExecutionClient):
             # Extract individual order IDs from response
             # TS returns: {"OrderGroupId": "...", "Orders": [{"OrderID": "...", ...}, ...]}
             # The HTTP client raises OrderGroupPartialException unless every leg landed
-            ts_orders = response.get("Orders", [])
+            # 4.109 review: TS answered 200, so an answer that is not one string OrderID per
+            # leg (legs paired by position) means legs may be live - ambiguous, and nothing is
+            # registered before the whole answer is read.
+            try:
+                ts_orders = response.get("Orders", [])
+                ids = [o.get("OrderID") for o in ts_orders]
+            except Exception as ex:
+                raise OrderResponseAmbiguousException(
+                    f"group answer unreadable ({type(ex).__name__}: {ex}): {response!r:.200}"
+                ) from ex
+            if len(ids) != len(orders) or not all(isinstance(t, str) and t for t in ids):
+                raise OrderResponseAmbiguousException(
+                    f"group answer is not one OrderID per leg ({len(orders)} legs): "
+                    f"{response!r:.200}")
 
             legs = []
-            for i, (order, ts_order_resp) in enumerate(zip(orders, ts_orders)):
-                ts_order_id = ts_order_resp.get("OrderID")
-                if not ts_order_id:
-                    self._log.warning(f"No OrderID in group response leg {i}: {ts_order_resp}")
-                    continue
-
+            for i, (order, ts_order_id) in enumerate(zip(orders, ids)):
                 # Register in tracking dicts
                 self._ts_order_id_to_client_order_id[ts_order_id] = order.client_order_id
                 self._client_order_id_to_ts_order_id[order.client_order_id] = ts_order_id
@@ -2290,7 +2416,10 @@ class TradeStationExecutionClient(LiveExecutionClient):
 
         except Exception as e:
             err = str(e)
-            if "HTTP 4" in err or not put_sent:
+            # 4.143: HTTP 200 with an Error body goes to the §241 recovery below (decided by
+            # type: its broker text may itself contain "HTTP 4").
+            body_error = isinstance(e, ReplaceBodyErrorException)
+            if not body_error and ("HTTP 4" in err or not put_sent):
                 # 4xx: broker definitively rejected the modify — safe to surface
                 # as a rejection event so NT reverts PENDING_UPDATE and the
                 # strategy can react (retry, cancel, hedge). A local error before the
@@ -2757,16 +2886,24 @@ class TradeStationExecutionClient(LiveExecutionClient):
     _STATUS_POLL_LOG_EVERY_S = 600.0
 
     def _log_status_poll(self, n_orders: int, read_ms: float) -> None:
-        """Observe line, at most once per 10 min; never raises.  (ratelimit_remaining
-        is not included: it would need _request to stash the last response headers.)"""
+        """Observe line, at most once per 10 min; never raises. 4.96: appends the last
+        X-RateLimit-* the shared HTTP client saw (any request, data or execution) and its
+        age; ``ratelimit=n/a`` when none was seen."""
         try:
             now = _mono()
             if now - self._last_status_poll_log_s < self._STATUS_POLL_LOG_EVERY_S:
                 return
             self._last_status_poll_log_s = now
+            rl = getattr(self._client, "last_rate_limit", None)
+            if isinstance(rl, tuple) and len(rl) == 4:
+                age = time.monotonic() - rl[3]
+                ratelimit = (f"ratelimit_remaining={rl[0]} ratelimit_limit={rl[1]} "
+                             f"ratelimit_reset={rl[2]} ratelimit_age_s={age:.0f}")
+            else:
+                ratelimit = "ratelimit=n/a"
             self._log.info(
                 f"[STATUS-POLL] orders={n_orders} read_ms={read_ms:.0f} "
-                f"every={self._status_safety_poll_secs:.0f}s"
+                f"every={self._status_safety_poll_secs:.0f}s {ratelimit}"
             )
         except Exception:
             pass
@@ -2793,6 +2930,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
             return
 
         self._log_status_poll(len(orders), (_mono() - read_started) * 1000.0)
+        # 4.95: broker ids of this successful read - the order-map prune keeps them
+        self._last_poll_ts_ids = {str(o.get("OrderID")) for o in orders
+                                  if isinstance(o, dict) and o.get("OrderID")}
         await self._verify_pending_cancels(orders)  # §111
         self._recheck_watched_statuses(orders)      # §149
         self._prune_closed_last_status(orders)      # M-5
@@ -2905,8 +3045,9 @@ class TradeStationExecutionClient(LiveExecutionClient):
         calls _get_headers → _ensure_authenticated — the token is never stale.  In
         streaming mode the SSE loop only calls _check_order_statuses on reconnect, so
         without this task the token expires silently after 20 min when no orders are
-        being placed.  Firing every 10 min guarantees _ensure_authenticated sees the
-        token within its 5-min refresh window before expiry.
+        being placed.  Firing every 10 min is a backstop only: with a 7-min read
+        refresh window (4.87) a 10-min period can miss it, so the 30 s status poll (a GET)
+        is what refreshes the token first; this loop keeps it alive when that poll skips.
         """
         try:
             while True:
