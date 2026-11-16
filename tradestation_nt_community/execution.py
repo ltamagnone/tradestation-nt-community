@@ -2345,6 +2345,29 @@ class TradeStationExecutionClient(LiveExecutionClient):
             self._log.error(f"Cannot modify {client_order_id}: not found in cache")
             return
 
+        if client_order_id in self._partial_orders:
+            # 4.172 H-C: TS's replace semantics on a partially filled order are unknown (the
+            # PUT would also re-send the full quantity and may rebind the OrderID). Skip the
+            # PUT; NT already set PENDING_UPDATE, so answer with an OrderUpdated that carries
+            # the order's CURRENT values - that reverts the state without a modify_rejected
+            # (the entry-amend mixin answers a rejection with cancel + resubmit = a second
+            # entry). The strategy simply re-decides next bar, once the FPR order has ended.
+            self._log.warning(
+                f"[SPLIT-GUARD] modify skipped: partially filled at TS {client_order_id} "
+                f"(requested trigger={command.trigger_price} price={command.price})"
+            )
+            self.generate_order_updated(
+                strategy_id=command.strategy_id,
+                instrument_id=command.instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=VenueOrderId(ts_order_id),
+                quantity=order.quantity,
+                price=getattr(order, "price", None),
+                trigger_price=getattr(order, "trigger_price", None),
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
         requested = (command.trigger_price, command.price)
         # §241: what the order carried BEFORE this modify, per field being modified —
         # the recovery's "old price" when the PUT fails ambiguously.

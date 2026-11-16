@@ -232,3 +232,29 @@ async def test_429_http_date_retry_after(http_client, monkeypatch):  # noqa: F81
     http_client._httpx.get = AsyncMock(side_effect=[r429, ok])
     assert (await http_client._request("GET", "https://x/y")) is ok
     assert slept == [http_client._retry_delay_initial_s]
+
+
+# ------------------------------------------------------------- 4.172 H-C modify of a partial
+
+async def test_modify_of_partially_filled_order_is_skipped_without_reject():
+    cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+    m = _make_exec_mock(cmd, ts_order_id="TS-STOP")
+    m._cache.order.return_value.trigger_price = Price(21000.0, 2)
+    m._cache.order.return_value.price = None
+    m._partial_orders = {cmd.client_order_id: (2, 1)}
+    m._client.replace_order = AsyncMock()
+    await C._modify_order(m, cmd)
+    m._client.replace_order.assert_not_called()          # no PUT
+    m.generate_order_modify_rejected.assert_not_called()  # no cancel+resubmit trigger
+    # NT is in PENDING_UPDATE: answered with the CURRENT values, not the requested ones
+    m.generate_order_updated.assert_called_once()
+    assert m.generate_order_updated.call_args.kwargs["trigger_price"] == Price(21000.0, 2)
+
+
+async def test_modify_without_partial_still_puts():
+    cmd = _make_modify_command_with_trigger(trigger_price=21050.0)
+    m = _make_exec_mock(cmd, ts_order_id="TS-STOP")
+    m._partial_orders = {}
+    m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-STOP"})
+    await C._modify_order(m, cmd)
+    m._client.replace_order.assert_called_once()
