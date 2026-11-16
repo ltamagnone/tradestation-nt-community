@@ -242,12 +242,14 @@ async def test_modify_of_partially_filled_order_is_skipped_without_reject():
     m._cache.order.return_value.trigger_price = Price(21000.0, 2)
     m._cache.order.return_value.price = None
     m._partial_orders = {cmd.client_order_id: (2, 1)}
+    m._modify_skip_echo = set()
     m._client.replace_order = AsyncMock()
     await C._modify_order(m, cmd)
     m._client.replace_order.assert_not_called()          # no PUT
     m.generate_order_modify_rejected.assert_not_called()  # no cancel+resubmit trigger
     # NT is in PENDING_UPDATE: answered with the CURRENT values, not the requested ones
     m.generate_order_updated.assert_called_once()
+    assert cmd.client_order_id in m._modify_skip_echo
     assert m.generate_order_updated.call_args.kwargs["trigger_price"] == Price(21000.0, 2)
 
 
@@ -258,3 +260,11 @@ async def test_modify_without_partial_still_puts():
     m._client.replace_order = AsyncMock(return_value={"OrderID": "TS-STOP"})
     await C._modify_order(m, cmd)
     m._client.replace_order.assert_called_once()
+
+
+def test_modify_skip_echo_is_consumed_once():
+    from tradestation_nt_community.execution import TradeStationExecutionClient as T
+    m = MagicMock()
+    m._modify_skip_echo = {"C1"}
+    assert T.consume_modify_skip_echo(m, "C1") is True
+    assert T.consume_modify_skip_echo(m, "C1") is False

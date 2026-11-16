@@ -1053,6 +1053,8 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._cancel_after_ack_sent: dict = {}
         # coid -> (executed qty, since_ns): own orders sitting in FPR (partial, working).
         self._partial_orders: dict = {}
+        # 4.172 H-C: coids whose next OrderUpdated is the echo of a skipped modify (no change)
+        self._modify_skip_echo: set = set()
         # coid -> highest executed qty an NT fill was emitted for (M-7 same-drain dedup).
         self._emitted_exec_hwm: dict = {}
         # coids whose OrderCanceled was already emitted: FLP remainder (M-3), REST cancel
@@ -2356,6 +2358,7 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 f"[SPLIT-GUARD] modify skipped: partially filled at TS {client_order_id} "
                 f"(requested trigger={command.trigger_price} price={command.price})"
             )
+            self._modify_skip_echo.add(client_order_id)
             self.generate_order_updated(
                 strategy_id=command.strategy_id,
                 instrument_id=command.instrument_id,
@@ -2798,6 +2801,14 @@ class TradeStationExecutionClient(LiveExecutionClient):
         ts_id = self._client_order_id_to_ts_order_id.get(client_order_id)
         row = self._cancel_verify_pending.get(ts_id) if ts_id else None
         return bool(row and row[2])
+
+    def consume_modify_skip_echo(self, client_order_id) -> bool:
+        """True once per skipped modify (4.172 H-C): the OrderUpdated just delivered only
+        reverted PENDING_UPDATE and changed nothing, so listeners must not act on it."""
+        if client_order_id in self._modify_skip_echo:
+            self._modify_skip_echo.discard(client_order_id)
+            return True
+        return False
 
     def partial_orders(self) -> dict:
         """Read-only copy of the own orders in FPR: ``{client_order_id: (exec_qty, since_ns)}``."""
