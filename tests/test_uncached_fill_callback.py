@@ -1,13 +1,21 @@
 """§151: uncached-fill classification, callback, order-map group + last-alive stamps."""
 import json
+import time as _time
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import StrategyId
+from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.objects import Quantity
 
 from tradestation_nt_community.execution import (
     TradeStationExecutionClient as C,
+    _emit_fill_delta,
     classify_uncached_fill,
 )
 
@@ -362,3 +370,302 @@ class TestLegacyGroupStamp:
         from tradestation_nt_community.execution import _stamp_group_if_missing
         _stamp_group_if_missing(m, "972944192")
         assert m._ts_id_to_group["972944192"] == "stable"
+
+
+# ---------------------------------------------------------------------------------------------
+# Restart noise (incident 2026-11-17 03:45Z): a fill the previous process delivered seconds
+# before a clean stop lands inside the downtime band (alive_prev - 60 s .. start). The clean
+# stop's forced alive stamp also writes ``_meta.delivered[group]`` = the fills that process
+# emitted AND NT applied; the next process classifies those as ``delivered``.
+
+
+class TestClassifyDeliveredPrev:
+    def test_delivered_prev_overrides_downtime_band(self):
+        assert classify_uncached_fill(ALIVE + 30, START, "stable", "stable", ALIVE,
+                                      delivered_prev=True) == "delivered"
+
+    def test_delivered_prev_ignored_for_live(self):
+        assert classify_uncached_fill(START + 5, START, "stable", "stable", ALIVE,
+                                      delivered_prev=True) == "live"
+
+    def test_no_flag_keeps_downtime(self):
+        assert classify_uncached_fill(ALIVE + 30, START, "stable", "stable", ALIVE) == "downtime"
+        assert classify_uncached_fill(ALIVE + 30, START, "stable", "stable", ALIVE,
+                                      delivered_prev=False) == "downtime"
+
+    def test_delivered_prev_does_not_claim_other_group(self):
+        assert classify_uncached_fill(ALIVE + 30, START, "rolling", "stable", ALIVE,
+                                      delivered_prev=True) == "delivered_other"
+
+
+def _applied(qty):
+    o = MagicMock()
+    o.filled_qty = Quantity.from_str(str(qty))
+    return o
+
+
+def _dstub(path, group, orders=None):
+    """Order-map stub with a cache: ``orders`` coid-str -> filled qty (None = not cached)."""
+    m = _stub(path, group)
+    m._delivered_fills = {}
+    m._previous_delivered = {}
+    orders = orders or {}
+    m._cache = MagicMock()
+    m._cache.order.side_effect = lambda coid: (
+        _applied(orders[str(coid)]) if orders.get(str(coid)) is not None else None)
+    return m
+
+
+class TestDeliveredStamp:
+    def test_forced_stamp_writes_applied_delivered_fills(self, tmp_path):
+        p = tmp_path / "map.json"
+        a = _dstub(p, "stable", {"O-1": 5, "O-2": 2})
+        C._load_order_map(a)
+        a._delivered_fills["T1"] = (Decimal(5), ClientOrderId("O-1"))
+        a._delivered_fills["T2"] = (Decimal(2), ClientOrderId("O-2"))
+        C._stamp_alive(a, force=True)
+        d = json.loads(p.read_text())
+        assert d["_meta"]["delivered"]["stable"] == {"T1": 5.0, "T2": 2.0}
+        assert "stable" in d["_meta"]["alive"]
+
+    def test_periodic_stamp_writes_no_list_and_clears_own_stale_one(self, tmp_path):
+        p = tmp_path / "map.json"
+        p.write_text(json.dumps({"_meta": {"alive": {"stable": 1.0, "rolling": 1.0},
+                                           "delivered": {"stable": {"T0": 1.0},
+                                                         "rolling": {"R0": 3.0}}}}))
+        a = _dstub(p, "stable", {"O-1": 5})
+        C._load_order_map(a)
+        a._delivered_fills["T1"] = (Decimal(5), ClientOrderId("O-1"))
+        C._stamp_alive(a)                     # periodic (not forced)
+        meta = json.loads(p.read_text())["_meta"]
+        assert "stable" not in meta.get("delivered", {})
+        assert meta["delivered"]["rolling"] == {"R0": 3.0}   # the peer's list untouched
+        assert a._previous_delivered["stable"] == {"T0": 1.0}  # in-memory copy kept
+
+    @pytest.mark.parametrize("orders", [{"O-1": 3}, {"O-1": None}])
+    def test_unapplied_or_uncached_fill_not_listed(self, tmp_path, orders):
+        p = tmp_path / "map.json"
+        a = _dstub(p, "stable", orders)
+        C._load_order_map(a)
+        a._delivered_fills["T1"] = (Decimal(5), ClientOrderId("O-1"))
+        C._stamp_alive(a, force=True)
+        assert json.loads(p.read_text())["_meta"]["delivered"]["stable"] == {}
+
+    def test_cap_500_keeps_newest(self, tmp_path):
+        p = tmp_path / "map.json"
+        orders = {f"O-{i}": 1 for i in range(600)}
+        a = _dstub(p, "stable", orders)
+        C._load_order_map(a)
+        for i in range(600):
+            a._delivered_fills[f"T{i}"] = (Decimal(1), ClientOrderId(f"O-{i}"))
+        C._stamp_alive(a, force=True)
+        lst = json.loads(p.read_text())["_meta"]["delivered"]["stable"]
+        assert len(lst) == 500 and "T599" in lst and "T99" not in lst and "T100" in lst
+
+    def test_list_failure_warns_writes_no_list_but_stamps_alive(self, tmp_path):
+        p = tmp_path / "map.json"
+        p.write_text(json.dumps({"_meta": {"delivered": {"stable": {"T0": 1.0}}}}))
+        a = _dstub(p, "stable")
+        C._load_order_map(a)
+        a._cache.order.side_effect = RuntimeError("boom")
+        a._delivered_fills["T1"] = (Decimal(5), ClientOrderId("O-1"))
+        C._stamp_alive(a, force=True)
+        meta = json.loads(p.read_text())["_meta"]
+        assert "stable" in meta["alive"] and "stable" not in meta.get("delivered", {})
+        assert any("delivered" in str(c) for c in a._log.warning.call_args_list)
+
+    def test_load_reads_previous_list_before_overwrite(self, tmp_path):
+        p = tmp_path / "map.json"
+        p.write_text(json.dumps({"_meta": {"alive": {"stable": 1.0},
+                                           "delivered": {"stable": {"T1": 5.0},
+                                                         "rolling": {"R1": 2}}}}))
+        b = _dstub(p, "stable")
+        C._load_order_map(b)
+        C._stamp_alive(b, force=True)          # this instance has delivered nothing
+        assert json.loads(p.read_text())["_meta"]["delivered"]["stable"] == {}
+        assert b._previous_delivered == {"stable": {"T1": 5.0}, "rolling": {"R1": 2.0}}
+
+    def test_emitter_records_delivered_fill(self):
+        m = MagicMock()
+        m._emitted_exec_hwm = {}
+        m._delivered_fills = {}
+        m._cancel_after_ack_sent = {}
+        cached = MagicMock()
+        cached.quantity = Quantity.from_int(5)
+        cached.filled_qty = Quantity.from_int(0)
+        coid = ClientOrderId("O-1")
+        o = {"OrderID": "T1", "Status": "FLL", "FilledPrice": "0.65",
+             "Legs": [{"ExecQuantity": "5", "QuantityOrdered": "5"}]}
+        emitted, _, _ = _emit_fill_delta(m, o, "T1", coid, cached, VenueOrderId("T1"), 7,
+                                         "sse", partial=False)
+        assert emitted and m._delivered_fills == {"T1": (Decimal(5), coid)}
+
+    def test_emitter_tolerates_client_without_the_dict(self):
+        m = MagicMock()          # _delivered_fills is a MagicMock, not a dict
+        m._emitted_exec_hwm = {}
+        m._cancel_after_ack_sent = {}
+        cached = MagicMock()
+        cached.quantity = Quantity.from_int(5)
+        cached.filled_qty = Quantity.from_int(0)
+        o = {"OrderID": "T1", "Status": "FLL", "FilledPrice": "0.65",
+             "Legs": [{"ExecQuantity": "5", "QuantityOrdered": "5"}]}
+        emitted, _, _ = _emit_fill_delta(m, o, "T1", ClientOrderId("O-1"), cached,
+                                         VenueOrderId("T1"), 7, "sse", partial=False)
+        assert emitted
+
+
+class TestDeliveredListUncachedFill:
+    """The next process: an uncached FLL inside the downtime band."""
+
+    def _b(self, prev):
+        m = _client()
+        m._previous_delivered = prev
+        return m
+
+    @pytest.mark.asyncio
+    async def test_listed_fill_is_delivered_no_callback(self):
+        m = self._b({"stable": {"972944192": 2.0}})
+        await C._process_order_event(m, _order(ALIVE + 10))
+        m._uncached_fill_callback.assert_not_called()
+        info = " ".join(str(c) for c in m._log.info.call_args_list)
+        assert "fill predates this session" in info
+        assert "already delivered by the previous process" in info
+        assert "(delivered list)" in info
+        assert not m._log.warning.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_fill_not_in_list_stays_downtime_and_fires(self):
+        m = self._b({"stable": {"111": 2.0}})
+        await C._process_order_event(m, _order(ALIVE + 10))
+        m._uncached_fill_callback.assert_called_once()
+        assert m._uncached_fill_callback.call_args[0][0]["kind"] == "downtime"
+
+    @pytest.mark.asyncio
+    async def test_grown_partial_fires(self):
+        m = self._b({"stable": {"972944192": 2.0}})
+        await C._process_order_event(m, _order(ALIVE + 10, exec_qty="5"))
+        m._uncached_fill_callback.assert_called_once()
+        assert m._uncached_fill_callback.call_args[0][0]["kind"] == "downtime"
+
+    @pytest.mark.asyncio
+    async def test_other_groups_list_ignored(self):
+        m = self._b({"rolling": {"972944192": 2.0}})
+        await C._process_order_event(m, _order(ALIVE + 10))
+        m._uncached_fill_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("prev", [{}, None, "garbage"])
+    async def test_no_list_crash_or_old_process_stays_loud(self, prev):
+        m = self._b(prev)
+        await C._process_order_event(m, _order(ALIVE + 10))
+        m._uncached_fill_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fake_client_without_attribute_stays_loud(self):
+        m = _client()
+        del m._previous_delivered            # e.g. an agent-repo fake client
+        await C._process_order_event(m, _order(ALIVE + 10))
+        m._uncached_fill_callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_live_fill_in_list_still_fires(self):
+        m = self._b({"stable": {"972944192": 2.0}})
+        await C._process_order_event(m, _order(START + 10))
+        assert m._uncached_fill_callback.call_args[0][0]["kind"] == "live"
+
+
+def _node_a(path, cached):
+    """Process A: an own cached exit order at the moment it fills."""
+    m = _dstub(path, "stable", {})
+    m._cache.order.side_effect = None
+    m._cache.order.return_value = cached
+    m._ts_order_id_to_client_order_id = {"979712839": ClientOrderId("O-EXIT-1")}
+    m._client_order_id_to_ts_order_id = {ClientOrderId("O-EXIT-1"): "979712839"}
+    m._ts_id_to_group = {"979712839": "stable"}
+    m._order_last_status = {}
+    m._pending_modify_trigger_price = {}
+    m._modify_inflight = {}
+    m._pending_amend_meta = {}
+    m._cancel_verify_pending = {}
+    m._status_watch = {}
+    m._partial_orders = {}
+    m._emitted_exec_hwm = {}
+    m._emitted_cancel_coids = {}
+    m._cancel_after_ack_sent = {}
+    m._verify_pending_cancels = AsyncMock()
+    m._recheck_watched_statuses = MagicMock()
+    m._clock = MagicMock()
+    m._clock.timestamp_ns.return_value = 0
+    m._uncached_fill_callback = MagicMock()
+    return m
+
+
+class TestIncidentReplay:
+    @pytest.mark.asyncio
+    async def test_fill_seconds_before_clean_stop_is_delivered_next_process(
+            self, tmp_path, monkeypatch):
+        T = 1794887101.0                               # 2026-11-17 03:45:01Z fill
+        p = tmp_path / "map.json"
+        p.write_text(json.dumps({"979712839": {"client_order_id": "O-EXIT-1",
+                                               "submitted_ts": T - 60, "group": "stable"}}))
+        cached = MagicMock()
+        cached.is_closed = False
+        cached.status = OrderStatus.ACCEPTED
+        cached.strategy_id = StrategyId("S-001")
+        cached.instrument_id = InstrumentId.from_str("ADZ25.CME")
+        cached.quantity = Quantity.from_int(5)
+        cached.filled_qty = Quantity.from_int(0)
+        cached.trigger_price = None
+        cached.price = None
+        fll = {"OrderID": "979712839", "Status": "FLL", "ClosedDateTime": _iso(T),
+               "FilledPrice": "0.6512",
+               "Legs": [{"ExecQuantity": "5", "QuantityOrdered": "5"}]}
+
+        now = {"t": T - 3600}
+        monkeypatch.setattr(_time, "time", lambda: now["t"])
+        a = _node_a(p, cached)
+        C._load_order_map(a)
+        now["t"] = T
+        await C._process_order_event(a, dict(fll))
+        assert a.generate_order_filled.call_count == 1
+        cached.filled_qty = Quantity.from_int(5)       # NT applied the fill
+        cached.is_closed = True
+        now["t"] = T + 9                               # SIGTERM -> _disconnect forced stamp
+        C._stamp_alive(a, force=True)
+        meta = json.loads(p.read_text())["_meta"]
+        assert meta["delivered"]["stable"] == {"979712839": 5.0}
+
+        now["t"] = T + 20                              # process B starts
+        b = _client()
+        b._order_map_path = str(p)
+        b._ts_order_id_to_client_order_id = {}
+        b._client_order_id_to_ts_order_id = {}
+        b._ts_id_to_group = {}
+        b._ts_id_submitted_ts = {}
+        b._previous_alive = {}
+        b._previous_delivered = {}
+        b._alive_loaded = False
+        b._instance_started_s = T + 20
+        C._load_order_map(b)
+        assert b._previous_alive["stable"] == pytest.approx(T + 9)
+        await C._process_order_event(b, dict(fll))
+        b._uncached_fill_callback.assert_not_called()
+        info = " ".join(str(c) for c in b._log.info.call_args_list)
+        assert "predates this session" in info and "(delivered list)" in info
+        assert not b._log.warning.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_same_fill_without_list_is_still_downtime(self, tmp_path):
+        """Control: the band alone (crash/SIGKILL, or an old process) stays loud."""
+        T = 1794887101.0
+        b = _client()
+        b._previous_alive = {"stable": T + 9}
+        b._previous_delivered = {}
+        b._instance_started_s = T + 20
+        b._ts_order_id_to_client_order_id = {"979712839": ClientOrderId("O-EXIT-1")}
+        b._ts_id_to_group = {"979712839": "stable"}
+        fll = {"OrderID": "979712839", "Status": "FLL", "ClosedDateTime": _iso(T),
+               "FilledPrice": "0.6512",
+               "Legs": [{"ExecQuantity": "5", "QuantityOrdered": "5"}]}
+        await C._process_order_event(b, fll)
+        assert b._uncached_fill_callback.call_args[0][0]["kind"] == "downtime"

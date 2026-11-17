@@ -87,6 +87,10 @@ from nautilus_trader.model.orders import StopMarketOrder
 # classify_uncached_fill). Absorbs the 60 s stamp resolution and clock skew.
 _ALIVE_TOLERANCE_S = 60.0
 _ALIVE_STAMP_EVERY_S = 60.0
+# Restart noise (2026-11-17): fills this process emitted (ts id -> (exec qty, coid)), FIFO
+# bound; the clean-stop stamp writes at most _DELIVERED_LIST_MAX of them to _meta.delivered.
+_DELIVERED_FILLS_MAX = 2000
+_DELIVERED_LIST_MAX = 500
 # §261c: gap between §111 re-cancel attempts, independent of the status poll interval.
 # Also a capability marker: the runner polls at 30 s only if this exists.
 CANCEL_VERIFY_SPACING_S = 60.0
@@ -126,7 +130,7 @@ def _reject_reason(e: BaseException) -> str:
 
 
 def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
-                           alive_prev_s) -> str:
+                           alive_prev_s, delivered_prev: bool = False) -> str:
     """§151 classification of an FLL/FLP on a mapped TS order absent from the NT cache.
 
     Returns one of:
@@ -140,6 +144,10 @@ def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group
       ``unknown``         anything we cannot place (no/unparseable ClosedDateTime, no
                           group info on the order or this node, no alive stamp): fail loud
 
+    ``delivered_prev``: the previous process of this group listed this fill (at least this
+    executed qty) in its clean-stop ``_meta.delivered`` list, so it emitted the fill and NT
+    applied it -> ``delivered`` even inside the downtime band (restart seconds after a fill).
+
     A fill was delivered only if the process that OWNED the order was alive when it
     filled — the old "predates this instance" test missed the case where the owner was
     down, and the case where the "previous process" was not the owner at all.
@@ -152,6 +160,8 @@ def classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group
         return "delivered_other"
     if closed_s >= instance_started_s:
         return "live"
+    if delivered_prev:
+        return "delivered"
     if alive_prev_s is None:
         return "unknown"
     if closed_s < alive_prev_s - _ALIVE_TOLERANCE_S:
@@ -190,7 +200,8 @@ def _log_fill_after_cancel(log, status, ts_order_id, client_order_id, cached_ord
 
 def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
                        instance_started_s, entry_group=None, node_group=None,
-                       alive_prev_s=None, handed_to_runner=False, tag_group=None) -> str:
+                       alive_prev_s=None, handed_to_runner=False, tag_group=None,
+                       delivered_prev=False) -> str:
     """Log (and classify) an FLL/FLP fill for a mapped TS order absent from the NT cache.
 
     2026-09-29 13:23Z/13:28Z: after a restart the persisted order map is loaded but
@@ -209,7 +220,7 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
         except Exception:
             closed_s = None
     kind = classify_uncached_fill(closed_s, instance_started_s, entry_group, node_group,
-                                  alive_prev_s)
+                                  alive_prev_s, delivered_prev=delivered_prev)
     _tag_note = (f", tagged group {tag_group} (this node {node_group}): hosting "
                  f"decides" if tag_group and node_group and tag_group != node_group
                  else "")
@@ -217,6 +228,7 @@ def _log_uncached_fill(log, ts_order: dict, ts_order_id: str, client_order_id,
         log.info(
             f"[UNCACHED-FILL] TS order {ts_order_id} ({client_order_id}) fill predates "
             f"this session{_tag_note} — already delivered by the previous process"
+            f"{' (delivered list)' if delivered_prev else ''}"
         )
     elif kind == "delivered_other":
         log.info(
@@ -709,6 +721,14 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
         hwm_map[client_order_id] = exec_total
         while len(hwm_map) > 2000:  # bounded backstop; normally cleared on terminal
             hwm_map.pop(next(iter(hwm_map)))
+    # Restart noise: remember the fill for the clean-stop ``_meta.delivered`` list.
+    delivered = getattr(client, "_delivered_fills", None)
+    if isinstance(delivered, dict):
+        key = str(ts_order_id)
+        delivered.pop(key, None)            # re-insert: newest last (FIFO bound below)
+        delivered[key] = (exec_total, client_order_id)
+        while len(delivered) > _DELIVERED_FILLS_MAX:
+            delivered.pop(next(iter(delivered)))
     log.info(
         f"Order filled: {client_order_id} @ {fill_px} qty={qty} [fill-source={source}]",
         LogColor.GREEN,
@@ -855,6 +875,27 @@ def _stamp_group_if_missing(client, ts_order_id) -> None:
         pass
 
 
+def _delivered_by_previous(client, node_group, ts_order: dict, ts_order_id) -> bool:
+    """True when this group's previous process listed this fill in its clean-stop
+    ``_meta.delivered`` list with at least the executed qty TS reports now. Only the own
+    group's list counts. No list (crash/SIGKILL, old process), id not listed, or a partial
+    that grew since -> False (stays loud). Fake clients without the attribute -> False."""
+    try:
+        prev = getattr(client, "_previous_delivered", None)
+        if not isinstance(prev, dict) or not node_group:
+            return False
+        own = prev.get(node_group)
+        if not isinstance(own, dict):
+            return False
+        q = _float_or_none(own.get(str(ts_order_id)))
+        exec_qty = _executed_total(ts_order) if isinstance(ts_order, dict) else None
+        if q is None or exec_qty is None or exec_qty <= 0:
+            return False
+        return Decimal(str(q)) >= exec_qty
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order_id) -> str:
     """Classify + log an uncached fill, then notify the registered callback (§151).
 
@@ -870,6 +911,7 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
     alive_map = getattr(client, "_previous_alive", None)
     alive_prev = (_float_or_none(alive_map.get(node_group))
                   if isinstance(alive_map, dict) and node_group else None)
+    delivered_prev = _delivered_by_previous(client, node_group, ts_order, ts_order_id)
     cb = getattr(client, "_uncached_fill_callback", None)
     if not callable(cb):
         cb = None
@@ -887,6 +929,7 @@ def _handle_uncached_fill(client, ts_order: dict, ts_order_id: str, client_order
         getattr(client, "_instance_started_s", None),
         entry_group=timing_group, node_group=node_group, alive_prev_s=alive_prev,
         handed_to_runner=cb is not None, tag_group=entry_group,
+        delivered_prev=delivered_prev,
     )
     if kind in ("delivered", "delivered_other"):
         return kind
@@ -1090,6 +1133,11 @@ class TradeStationExecutionClient(LiveExecutionClient):
         self._ts_id_to_group: dict[str, str] = {}      # ts_order_id -> submitting group
         # group -> last-alive epoch of the PREVIOUS process
         self._previous_alive: dict[str, float] = {}
+        # Restart noise: ts id -> (exec qty, coid) of every fill THIS process emitted
+        # (bounded FIFO); the clean-stop stamp lists the NT-applied ones in _meta.delivered.
+        self._delivered_fills: dict = {}
+        # group -> {ts id: qty} the PREVIOUS process listed at its clean stop
+        self._previous_delivered: dict[str, dict[str, float]] = {}
         # stamp only after the previous value is read
         self._alive_loaded = False
         self._last_alive_stamp_s = 0.0
@@ -1195,11 +1243,44 @@ class TradeStationExecutionClient(LiveExecutionClient):
                 alive = {}
             alive[self._node_group] = now_s
             meta["alive"] = alive
+            delivered = meta.get("delivered")
+            if not isinstance(delivered, dict):
+                delivered = {}
+            lst = (TradeStationExecutionClient._delivered_list(self) if force else None)
+            if lst is None:
+                # periodic stamp, or the list failed: no list for this group (a stale one
+                # from an earlier process must not outlive this one's crash)
+                delivered.pop(self._node_group, None)
+            else:
+                delivered[self._node_group] = lst
+            meta["delivered"] = delivered
             data[_ORDER_MAP_META] = meta
             self._write_order_map_file(data)
             self._last_alive_stamp_s = now_s
         except Exception as exc:
             self._log.warning(f"[ORDER-MAP] Failed to stamp alive: {exc}")
+
+    def _delivered_list(self) -> "dict[str, float] | None":
+        """Restart noise: ``{ts id: qty}`` of the newest _DELIVERED_LIST_MAX fills this
+        process emitted that NT has APPLIED (cached order ``filled_qty >= qty``). Written by
+        the clean-stop (forced) stamp only. ``None`` (+ WARNING) on any failure: no list
+        means the next process stays loud."""
+        try:
+            fills = getattr(self, "_delivered_fills", None)
+            out: dict[str, float] = {}
+            if not isinstance(fills, dict):
+                return out
+            for ts_id, (qty, coid) in reversed(list(fills.items())):
+                if len(out) >= _DELIVERED_LIST_MAX:
+                    break
+                order = self._cache.order(coid)
+                if order is None or order.filled_qty.as_decimal() < qty:
+                    continue
+                out[str(ts_id)] = float(qty)
+            return dict(reversed(list(out.items())))
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(f"[ORDER-MAP] delivered list not written: {exc}")
+            return None
 
     def _persist_order_map(self) -> None:
         """Persist _ts_order_id_to_client_order_id to disk for cross-restart recovery."""
@@ -1320,6 +1401,17 @@ class TradeStationExecutionClient(LiveExecutionClient):
                     self._previous_alive[str(g)] = float(t)
                 except (TypeError, ValueError):
                     pass
+        # Restart noise: the previous clean stop's delivered fills, read before this
+        # instance's first stamp rewrites them.
+        prev_delivered: dict[str, dict[str, float]] = {}
+        if isinstance(meta, dict) and isinstance(meta.get("delivered"), dict):
+            for g, lst in meta["delivered"].items():
+                if not isinstance(lst, dict):
+                    continue
+                prev_delivered[str(g)] = {
+                    str(k): float(v) for k, v in lst.items()
+                    if _float_or_none(v) is not None}
+        self._previous_delivered = prev_delivered
         self._alive_loaded = True
         for ts_id, entry in raw.items():
             if ts_id == _ORDER_MAP_META or not isinstance(entry, dict):
