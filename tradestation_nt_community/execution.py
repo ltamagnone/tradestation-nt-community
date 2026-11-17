@@ -639,6 +639,19 @@ def _release_if_terminal_closed(client, status: str, client_order_id) -> None:
         _clear_emitted_hwm(client, client_order_id)
 
 
+def _record_delivered_fill(client, ts_order_id, exec_total, client_order_id) -> None:
+    """Restart noise: remember a fill this process emitted (or found already applied by NT)
+    for the clean-stop ``_meta.delivered`` list; that stamp re-checks NT's ``filled_qty``.
+    Newest last, FIFO-bounded. Clients without the dict (fakes) are skipped."""
+    delivered = getattr(client, "_delivered_fills", None)
+    if isinstance(delivered, dict):
+        key = str(ts_order_id)
+        delivered.pop(key, None)            # re-insert: newest last (FIFO bound below)
+        delivered[key] = (exec_total, client_order_id)
+        while len(delivered) > _DELIVERED_FILLS_MAX:
+            delivered.pop(next(iter(delivered)))
+
+
 def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, cached_order,
                      venue_order_id, ts_now: int, source: str, *, partial: bool):
     """F1 + price fallback + F3: emit ONE OrderFilled for the executed quantity not yet
@@ -673,6 +686,8 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
             f"[FILL-DELTA] {client_order_id}: executed {exec_total} already applied "
             f"({already}) - no fill emitted"
         )
+        # NT may have applied it via in-flight report reconciliation: still delivered.
+        _record_delivered_fill(client, ts_order_id, exec_total, client_order_id)
         return False, exec_total, "already_applied"
     px = _resolve_fill_price(client, ts_order, cached_order, client_order_id)
     if px is None:
@@ -721,14 +736,7 @@ def _emit_fill_delta(client, ts_order: dict, ts_order_id: str, client_order_id, 
         hwm_map[client_order_id] = exec_total
         while len(hwm_map) > 2000:  # bounded backstop; normally cleared on terminal
             hwm_map.pop(next(iter(hwm_map)))
-    # Restart noise: remember the fill for the clean-stop ``_meta.delivered`` list.
-    delivered = getattr(client, "_delivered_fills", None)
-    if isinstance(delivered, dict):
-        key = str(ts_order_id)
-        delivered.pop(key, None)            # re-insert: newest last (FIFO bound below)
-        delivered[key] = (exec_total, client_order_id)
-        while len(delivered) > _DELIVERED_FILLS_MAX:
-            delivered.pop(next(iter(delivered)))
+    _record_delivered_fill(client, ts_order_id, exec_total, client_order_id)
     log.info(
         f"Order filled: {client_order_id} @ {fill_px} qty={qty} [fill-source={source}]",
         LogColor.GREEN,

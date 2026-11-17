@@ -500,6 +500,27 @@ class TestDeliveredStamp:
                                          "sse", partial=False)
         assert emitted and m._delivered_fills == {"T1": (Decimal(5), coid)}
 
+    def test_inflight_applied_fill_is_recorded_and_listed(self, tmp_path):
+        """NT applied the fill via in-flight report reconciliation: the later FLL takes the
+        already_applied branch, but the fill is still listed by the clean-stop stamp."""
+        p = tmp_path / "map.json"
+        a = _dstub(p, "stable", {"O-1": 5})
+        C._load_order_map(a)
+        a._emitted_exec_hwm = {}
+        a._cancel_after_ack_sent = {}
+        cached = MagicMock()
+        cached.quantity = Quantity.from_int(5)
+        cached.filled_qty = Quantity.from_int(5)          # already applied by NT
+        coid = ClientOrderId("O-1")
+        o = {"OrderID": "T1", "Status": "FLL", "FilledPrice": "0.65",
+             "Legs": [{"ExecQuantity": "5", "QuantityOrdered": "5"}]}
+        emitted, _, reason = _emit_fill_delta(a, o, "T1", coid, cached, VenueOrderId("T1"),
+                                              7, "sse", partial=False)
+        assert not emitted and reason == "already_applied"
+        assert a._delivered_fills == {"T1": (Decimal(5), coid)}
+        C._stamp_alive(a, force=True)
+        assert json.loads(p.read_text())["_meta"]["delivered"]["stable"] == {"T1": 5.0}
+
     def test_emitter_tolerates_client_without_the_dict(self):
         m = MagicMock()          # _delivered_fills is a MagicMock, not a dict
         m._emitted_exec_hwm = {}
